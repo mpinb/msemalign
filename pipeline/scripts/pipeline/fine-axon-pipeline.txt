@@ -1,0 +1,16 @@
+#name       deps         swarm                                     part            nproc     ngpu   time pack mroll
+# did not implement unequal swarm packing with mroll support from pipeline
+#ifine       ,            run_wafer-fine-init                       p.axon/p.gpu    8/8       0/0    1/1   0   0
+#fine        ifine        run_wafer-fine-all-gpuind                 p.axon/p.gpu    20/5      0/1    0/0   1   4968
+ioutliers    fine        run_wafer_aggregator-fine-outliers-init    p.axon/p.gpu   8/8       0/0    1/1    0   0
+outliers     ioutliers   run_wafer_aggregator-fine-outliers         p.axon/p.gpu   10/5      0/0    0/0   -1   0
+moutliers    outliers    run_wafer_aggregator-fine-outliers         p.axon/p.gpu   20/10     0/0    0/0    0   0
+interp      outliers    run_wafer_aggregator-fine-interp            p.axon/p.gpu   20/10     0/0    0/0    0   0
+filter      interp      run_wafer_aggregator-fine-filter            p.axon/p.gpu   20/10     0/0    0/0    0   0
+ireslice    filter      run_wafer_aggregator-fine-reslice-init      p.axon/p.gpu   20/10     0/0    1/1    0   0
+reslice     ireslice    run_wafer_aggregator-fine-reslice           p.axon/p.gpu   4/2       0/0    3/3    0   0
+recon       reslice     run_wafer_aggregator-fine-reconcile         p.axon         1         0      0/0    0   0
+mrecon      recon       run_wafer_aggregator-fine-reconcile_merge   p.axon/p.gpu   1/1       0/0    0/0    0   0
+iexport     mrecon      run_wafer-fine_export_init                  p.axon/p.gpu   20/10     0/0    1/1    0   0
+export      mrecon      run_wafer-fine_export                       p.axon/p.gpu   16/8      0/0    1/1    1   4992
+dstiffs     export      run_wafer-fine_export_tiffs                 p.axon/p.gpu   20/20     0/0    1/1    0   0

@@ -1,0 +1,9 @@
+#name       deps        swarm                                  part           nproc   ngpu  time  pack mroll
+thumbs      ,           run_wafer-rough_export_thumbnails      p.axon/p.gpu   20/20   0/0   0/0   0    0
+keypoints   thumbs      run_wafer_solver-keypoints             p.axon/p.gpu   1/1     0/0   0/0   0    0
+matches     keypoints   run_wafer_solver-matches               p.gpu          1       1     0     0    0
+mmatches    matches     run_wafer_solver-matches-merge         p.axon/p.gpu   8/8     0/0   0/0   0    0
+solve       mmatches    run_wafer_solver-solve                 p.axon/p.gpu   8/8     0/0   0/0   0    0
+affines0    solve       run_wafer_solver-affines_skip0         p.gpu          6       1     0     0    0
+maffines0   affines0    run_wafer_solver-merge_affines_skip0   p.axon/p.gpu   8/8     0/0   0/0   0    0
+writeseq0   maffines0   run_wafer_aggregator-status_skip0      p.axon/p.gpu   8/8     0/0   0/0   0    0

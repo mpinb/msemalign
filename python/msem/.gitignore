@@ -1,0 +1,7 @@
+#ignore config files
+*.conf
+#ignore profiler files
+*.cprof
+#ignore worker files
+worker-*
+*.lock
