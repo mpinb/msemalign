@@ -5,7 +5,7 @@
 For a high-level introduction, please refer to the following manuscripts: 
 
 [msemalign: A pipeline for serial section multibeam scanning electron microscopy volume alignment](xxx)  
-&nbsp;&nbsp;&nbsp;&nbsp;Describes the section collection and imaging as well as the section order solving.  
+&nbsp;&nbsp;&nbsp;&nbsp;Describes the 2D and 3D alignment of petabyte-scale ssmSEM datasets  
 [GAUSS-EM: Guided accumulation of ultrathin serial sections with a static magnetic field for volume electron microscopy](xxx)  
 &nbsp;&nbsp;&nbsp;&nbsp;Describes the volume sectioning and also the section order solving methodology
 
@@ -16,10 +16,6 @@ The msem package is implemented and actively developed using [scientific python]
 Refer to the [bash install script](python/install.sh) for installing package dependencies in a conda environment using either [miniconda](https://docs.conda.io/en/latest/miniconda.html) or [mambaforge](https://github.com/conda-forge/miniforge#mambaforge).
 
 ## Tutorial
-
-### Raw data
-
-A [zebrafish retina dataset](xxx) containing raw mSEM images (collected using Zeiss Zen) has been made publicly available for use with the tutorial. The raw data total size is approximately 20 TB.
 
 ### Setup parameter files
 
