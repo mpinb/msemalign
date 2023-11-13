@@ -417,6 +417,9 @@ class wafer(region):
         #   and then doing a single image remap using the inverse transformed coordinates (dest -> src mapping).
         self.use_coordinate_based_xforms = use_coordinate_based_xforms
 
+        # for inverting saved transformed control points
+        self.invert_control_points = False
+
     def _initialize_wafer_regions(self, experiment_folders, protocol_folders, region_strs, load_stitched_coords=None,
             dsstep=1, use_thumbnails_ds=0, thumbnail_folders=[], backload_roi_polys=None, init_region_coords=True):
         config = configparser.ConfigParser()
@@ -724,7 +727,7 @@ class wafer(region):
         return igrid_min, igrid_max, ibox_size
 
     def _region_load_xforms(self, ind, slice_image_fn, bg_fill_type, do_bg_fill, region_size, img, bgsel, tm_bw,
-            load_xform_bg, load_xform_tm, roi_points, rel_ds, verbose, doplots):
+            load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, verbose, doplots):
         xdtype = self.coordindate_transformations_dtype
 
         if not self.load_rough_xformed_img:
@@ -747,9 +750,16 @@ class wafer(region):
             if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
 
         # get rotation center and do all xforms for roi points
-        roi_points, target_ctr, rot_region_size = self._xform_roi_points(ind, roi_points, region_size)
+        roi_points, target_ctr, rot_region_size = self._xform_points(ind, roi_points, region_size)
         if not self.load_rough_xformed_img:
             assert( (rot_region_size == np.array(img.size[:2])).all() ) # rotated size not matching PIL
+
+        # apply transformations to the control points that are used for tear stitching
+        if control_points is not None:
+            if self.invert_control_points:
+                control_points = self._inv_xform_points(ind, control_points, region_size, target_ctr)
+            else:
+                control_points, _, _ = self._xform_points(ind, control_points, region_size, target_ctr=target_ctr)
 
         if not self.load_rough_xformed_img:
             if verbose: print('Crop to rough bounding box'); t = time.time()
@@ -905,12 +915,12 @@ class wafer(region):
             if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
         #if self.deformation_points is not None:
 
-        return img, roi_points, img_shape, icrop_min, bgsel, tm_bw
+        return img, roi_points, control_points, img_shape, icrop_min, bgsel, tm_bw
     #def _region_load_xforms(self
 
-    # does the initial "microscrope alignment" on the roi_points
-    #   and gets the target center for the rough bounding box.
-    def _xform_roi_points(self, ind, roi_points, region_size):
+    # for transforming points based on the alignments being applied.
+    # originally this was just for the points defining the roi, but made general for application to any point set.
+    def _xform_points(self, ind, points, region_size, target_ctr=None):
         if not self.load_rough_xformed_img:
             ang_rad = self.region_rotations[ind]; ang_deg = ang_rad/np.pi*180
             do_rotation = (np.abs(ang_deg) > 1e-5)
@@ -936,40 +946,38 @@ class wafer(region):
                     elif iang_deg % 90 == 0:
                         rot_region_size = region_size[::-1]
 
-                if roi_points is not None:
+                if points is not None:
                     # rotate around image center (same as image rotation)
-                    roi_points = np.dot(roi_points - region_size/2, R_backwards.T) + rot_region_size/2
+                    points = np.dot(points - region_size/2, R_backwards.T) + rot_region_size/2
             else:
                 rot_region_size = region_size
-            # optionally translate the image so that it is centered on the zeiss roi polygon.
-            if self.translate_roi_center:
-                if self.translate_roi_center_bbox:
-                    # use center of roi polygon bounding box, typically makes more sense
-                    target_ctr = (roi_points.max(0) + roi_points.min(0))/2
+
+            if target_ctr is None:
+                # optionally translate the image so that it is centered on the zeiss roi polygon.
+                if self.translate_roi_center:
+                    if self.translate_roi_center_bbox:
+                        # use center of roi polygon bounding box, typically makes more sense
+                        target_ctr = (points.max(0) + points.min(0))/2
+                    else:
+                        # use barymetric center of roi polygon
+                        target_ctr = np.array(PolyCentroid(points[:,0], points[:,1]))
                 else:
-                    # use barymetric center of roi polygon
-                    target_ctr = np.array(PolyCentroid(roi_points[:,0], roi_points[:,1]))
-            else:
-                target_ctr = rot_region_size/2
+                    target_ctr = rot_region_size/2
 
-            # incorporate any previous manually defined translations into the target_ctr
-            target_ctr += self.region_translations[ind,:]
-            # xxx - should this be removed? what was the purpose of this update?
-            #   was not able to find anything that is using this after this point,
-            #     and also not good if this was ever called twice
-            #self.region_translations[ind,:] = target_ctr - rot_region_size/2
+                # incorporate any previous manually defined translations into the target_ctr
+                target_ctr += self.region_translations[ind,:]
 
-            if roi_points is not None:
+            if points is not None:
                 igrid_min, igrid_max, _ = self._center_box_pixels(target_ctr, 1)
-                roi_points = roi_points - igrid_min
+                points = points - igrid_min
 
                 if self.region_affines is not None and self.region_affines[ind] is not None:
                     # warp roi points with affine to match image, use inverse affine for the points
                     aff = lin.inv(self.region_affines[ind])
                     # scikit learn puts constant terms on the left, remove augment and flip
                     aff = np.concatenate( (aff[:2,2][:,None], aff[:2,:2], ), axis=1 )
-                    pts = self.poly_degree1.fit_transform(roi_points)
-                    roi_points = np.dot(pts, aff.T)
+                    pts = self.poly_degree1.fit_transform(points)
+                    points = np.dot(pts, aff.T)
         else: # if not self.load_rough_xformed_img:
             target_ctr = None
             rot_region_size = region_size
@@ -981,28 +989,76 @@ class wafer(region):
             # warp the roi points first by interpoating the vectors at the roi points.
             # the transform of the points is the forward mapping, this means just negative of
             #   the inverse mapping used below by map_coordinates.
-            if roi_points is not None:
+            if points is not None:
                 # use inverse distance weighting (IDW) to interpolate the vectors at the roi points.
                 # xxx - need to parameterize any of these?
                 idw_p = 2. # squaring consistently seems to be best choice
                 scl = 1.5
                 min_nbrs = 3
                 nbrs = NearestNeighbors(radius=scl*self.griddist, algorithm='ball_tree').fit(p)
-                dist, nnbrs = nbrs.radius_neighbors(roi_points, return_distance=True)
+                dist, nnbrs = nbrs.radius_neighbors(points, return_distance=True)
                 knbrs = NearestNeighbors(n_neighbors=min_nbrs, algorithm='kd_tree').fit(p)
-                kdist, knnbrs = knbrs.kneighbors(roi_points, return_distance=True)
+                kdist, knnbrs = knbrs.kneighbors(points, return_distance=True)
                 nnbrs_nsel = np.array([x.size < min_nbrs for x in nnbrs])
                 nnbrs = [x if y else z for x,y,z in zip(knnbrs,nnbrs_nsel,nnbrs)]
                 dist = [x if y else z for x,y,z in zip(kdist,nnbrs_nsel,dist)]
-                for i in range(roi_points.shape[0]):
+                for i in range(points.shape[0]):
                     # weight the average by the inverse distance to each point.
                     # this is inverse distance weighting interpolation.
                     W = 1/dist[i]**idw_p
-                    roi_points[i,:] = roi_points[i,:] + (-v[nnbrs[i],:]*W[:,None]).sum(0)/W.sum()
+                    points[i,:] = points[i,:] + (-v[nnbrs[i],:]*W[:,None]).sum(0)/W.sum()
         #if self.deformation_points is not None:
 
-        return roi_points, target_ctr, rot_region_size
-    #def _xform_roi_points(self
+        return points, target_ctr, rot_region_size
+    #def _xform_points(self
+
+    # inverting transformed points back to the original region space coordinates.
+    def _inv_xform_points(self, ind, points, region_size, target_ctr):
+
+        # xxx - currently not supporting inverting the deformations
+
+        # invert the affine transformation (inverse is forward transformation for points).
+        if self.region_affines is not None and self.region_affines[ind] is not None:
+            aff = self.region_affines[ind]
+            # scikit learn puts constant terms on the left, remove augment and flip
+            aff = np.concatenate( (aff[:2,2][:,None], aff[:2,:2], ), axis=1 )
+            pts = self.poly_degree1.fit_transform(points)
+            points = np.dot(pts, aff.T)
+
+        # invert the rough bounding box crop
+        igrid_min, igrid_max, _ = self._center_box_pixels(target_ctr, 1)
+        points = points + igrid_min
+
+        # invert the microscope rotation
+        ang_rad = self.region_rotations[ind]; ang_deg = ang_rad/np.pi*180
+        do_rotation = (np.abs(ang_deg) > 1e-5)
+        if do_rotation:
+            # create the 2D rotation matrix. all rotations are done about the region center (region_size/2).
+            c, s = np.cos(ang_rad), np.sin(ang_rad)
+            R_forwards = np.array([[c, -s], [s, c]]) # forwards for images
+            #R_backwards = np.array([[c, s], [-s, c]]) # backwards for points
+
+            # previously used rotated image to get the size of the rotated image.
+            # can not do this with coords xform, so modify both code paths so that the size
+            #   of the rotated image matches what is expected from PIL. as one would expect,
+            #   the size is determined by the bounding box on the rotated original corners.
+            pts = np.array([[0.,0.], [0.,region_size[1]], region_size, [region_size[0],0.]])
+            rot_pts = np.dot(pts - region_size/2, R_forwards.T) + region_size/2
+            rot_region_size = (np.ceil(rot_pts.max(0)) - np.floor(rot_pts.min(0))).astype(np.int64)
+            # PIL must have special code for 90/180 rotations
+            if float(ang_deg).is_integer():
+                iang_deg = int(ang_deg)
+                if iang_deg % 180 == 0:
+                    rot_region_size = region_size
+                elif iang_deg % 90 == 0:
+                    rot_region_size = region_size[::-1]
+
+            # rotate around image center (same as image rotation)
+            points = np.dot(points - rot_region_size/2, R_forwards.T) + region_size/2
+        # if do_rotation:
+
+        return points
+    #def _inv_xform_points(self
 
     # common coordinate manipulations for deformations in _region_load_xforms and _region_load_coords
     def _region_load_setup_deformations(self, p, v, icrop_min, icrop_min_grid, icoords_size, icoords_size_grid,
@@ -1083,7 +1139,7 @@ class wafer(region):
     #def _region_load_setup_deformations(self,
 
     def _region_load_coords(self, ind, slice_image_fn, bg_fill_type, do_bg_fill, region_size, img, bgsel, tm_bw,
-            load_xform_bg, load_xform_tm, roi_points, rel_ds, verbose, doplots):
+            load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, verbose, doplots):
         # get the size of the output image based on the rough bounding box
         _, _, ibox_size = self._center_box_pixels(np.zeros(2), 1)
         ibox_shape = ibox_size[::-1]
@@ -1152,12 +1208,19 @@ class wafer(region):
 
         if verbose: print('Apply coords microscope translation and rotation'); t = time.time()
         # get rotation center and do all xforms for roi points
-        roi_points, target_ctr, rot_region_size = self._xform_roi_points(ind, roi_points, region_size)
+        roi_points, target_ctr, rot_region_size = self._xform_points(ind, roi_points, region_size)
         igrid_min, igrid_max, _ = self._center_box_pixels(target_ctr, 1)
         # translate the coordinates based on the rough bounding box crop
         if (igrid_min != 0).any():
             if verbose: print('\tapply translation {} {}'.format(igrid_min[0], igrid_min[1]))
             coords += igrid_min[:,None]
+
+        # apply transformations to the control points that are used for tear stitching
+        if control_points is not None:
+            if self.invert_control_points:
+                control_points = self._inv_xform_points(ind, control_points, region_size, target_ctr)
+            else:
+                control_points, _, _ = self._xform_points(ind, control_points, region_size, target_ctr=target_ctr)
 
         # the "microscope" angle rotation (angle of the ROI as reported by limi slice detection software).
         # do not apply rotation at all if angle is very very small or zero.
@@ -1203,7 +1266,7 @@ class wafer(region):
         # apply the transforms to the images
         # xxx - could load images one at a time, but this did not seem worth the hassle
         #   of pulling apart the image(s) loading logic.
-        img, bgsel, tm_bw, _, _, _, _, _ = \
+        img, bgsel, tm_bw, _, _, _, _, _, _ = \
             self._region_load_load_imgs(ind, slice_image_fn, do_bg_fill, True, False, custom_rng, verbose)
 
         # xxx - gah, punted on the tissue mask, one option could be to just keep it stored upsampled,
@@ -1225,7 +1288,7 @@ class wafer(region):
             #     tm_bw = np.zeros(icoords_shape, dtype=tm_bw.dtype)
         if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
 
-        return img, roi_points, ibox_shape, icrop_min, bgsel, tm_bw
+        return img, roi_points, control_points, ibox_shape, icrop_min, bgsel, tm_bw
     #def _region_load_coords(self
 
     # this is mostly meant for "back-transforming" masks that were created from "microscope aligned" images.
@@ -1261,7 +1324,7 @@ class wafer(region):
         if verbose: print('Apply coords microscope translation and rotation'); t = time.time()
 
         # get rotation center and do all xforms for roi points
-        roi_points, target_ctr, rot_region_size = self._xform_roi_points(ind, roi_points, region_size)
+        roi_points, target_ctr, rot_region_size = self._xform_points(ind, roi_points, region_size)
         igrid_min, igrid_max, _ = self._center_box_pixels(target_ctr, dsstep)
         if dsstep > 1:
             pad = (dsstep - region_size % dsstep) % dsstep
@@ -1335,7 +1398,7 @@ class wafer(region):
         if verbose: print('Loading image and/or roi/bg/mask'); t = time.time()
         load_xform_bg = do_bg_fill and load_img
         load_xform_tm = False
-        roi_points = tm_bw = bgsel = img = img_shape = rel_ds = None
+        roi_points = tm_bw = bgsel = img = img_shape = rel_ds = control_points = None
         if self.input_data_type == msem_input_data_types.zen_msem_data or \
                 self.input_data_type == msem_input_data_types.new_msem_data:
             # in the normal workflow the region outputs are always hdf5 files.
@@ -1350,6 +1413,15 @@ class wafer(region):
                 roi_points = self.region_roi_poly[ind]
                 # the rough xforms do not currently support blocking, so need to load/xform the whole slice
                 _nblks = [1,1]; _iblk = [0,0]; _novlp = [0,0]
+
+            # control points are used for tear stitching
+            if self.invert_control_points:
+                control_points, _ = big_img_load(slice_image_fn, dataset='xcontrol_points')
+            else:
+                try:
+                    control_points, _ = big_img_load(slice_image_fn, dataset='control_points')
+                except:
+                    control_points = None
 
             if load_img:
                 # load the pre-montaged region (slice) image.
@@ -1402,7 +1474,7 @@ class wafer(region):
         if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
 
         img_size = np.array(img_shape[::-1])
-        return img, bgsel, tm_bw, load_xform_bg, load_xform_tm, roi_points, rel_ds, img_size
+        return img, bgsel, tm_bw, load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, img_size
     #def _region_load_load_imgs(self
 
     def _get_region_filename(self, ind):
@@ -1435,7 +1507,7 @@ class wafer(region):
         if verbose: print('do background fill {}'.format(do_bg_fill))
 
         load_img = not self.use_coordinate_based_xforms
-        img, bgsel, tm_bw, load_xform_bg, load_xform_tm, roi_points, rel_ds, region_size = \
+        img, bgsel, tm_bw, load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, region_size = \
             self._region_load_load_imgs(ind, slice_image_fn, do_bg_fill, load_img, True, None, verbose)
 
         # the original load method applied transformations directly to the images in the forward direction.
@@ -1443,9 +1515,9 @@ class wafer(region):
         # the new method transforms the output coordinates in reverse back to the region images,
         # called _region_load_coords and it fully supports block processing, including for the rough transformations.
         f_region_load = self._region_load_coords if self.use_coordinate_based_xforms else self._region_load_xforms
-        img, roi_points, img_shape, icrop_min, bgsel, tm_bw = \
+        img, roi_points, control_points, img_shape, icrop_min, bgsel, tm_bw = \
             f_region_load(ind, slice_image_fn, bg_fill_type, do_bg_fill, region_size, img, bgsel, tm_bw,
-                load_xform_bg, load_xform_tm, roi_points, rel_ds, verbose, doplots)
+                load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, verbose, doplots)
 
         if type(img) is Image.Image:
             if not return_pil: img = np.asarray(img) #.copy()
@@ -1457,7 +1529,8 @@ class wafer(region):
             self.tissue_mask_bw[ind] = tm_bw
             self.tissue_mask_bw_rel_ds = rel_ds
 
-        return img, roi_points, img_shape, icrop_min, bgsel
+        return img, roi_points, control_points, img_shape, icrop_min, bgsel
+    # def _region_load(self, ind
 
     # get selects of which grid points are within the roi polygon (if loaded / specified).
     def _get_grid_selects(self, i, grid_points=None, roi_points=None):
@@ -1555,7 +1628,7 @@ class wafer(region):
 
         for i in regions:
             if doload:
-                imgs[i], rois_points[i], img_shape, icrop_min, _ = \
+                imgs[i], rois_points[i], _, img_shape, icrop_min, _ = \
                     self._region_load(i, bg_fill_type=bg_fill_type, return_pil=False)
 
                 # this is an optimization for speed, with high image coverage it's better to preproc all at once.
@@ -1873,7 +1946,8 @@ class wafer(region):
     def export_regions(self, outpaths, suffixes, dssteps=[1], use_solved_order=False, crop_to_grid=False,
             start=0, stop=-1, bg_fill_type='none', do_overlays=False, export_solved_order=None, save_h5=False,
             zero_outside_grid=False, save_roi_points=False, convert_hdf5s=False, order_name_str='order',
-            tissue_masks=False, init_locks=False, is_excluded=False, save_masks_in='', verbose_load=False):
+            tissue_masks=False, init_locks=False, is_excluded=False, save_masks_in='', xform_control_points=False,
+            inv_xform_control_points=False, verbose_load=False):
         stop = (self.solved_order.size if use_solved_order else self.nregions) if stop < 0 else stop
 
         # optionally output at multiple downsamplings, saves time so that image is only loaded once
@@ -1886,6 +1960,8 @@ class wafer(region):
 
         # xxx - currently still allowing both modes, tissue mask saved with regions (new), or as tiffs (old)
         rel_ds = self.tissue_mask_bw_rel_ds if self.tissue_mask_bw_rel_ds > 0 else self.tissue_mask_ds // self.dsstep
+
+        self.invert_control_points = inv_xform_control_points
 
         if self.wafer_verbose:
             print('Writing output tiffs for %d regions' % (stop-start, ))
@@ -1900,6 +1976,10 @@ class wafer(region):
                 print('Saving transformed tissue masks back into regions')
             elif tissue_masks:
                 print('Exporting tissues masks instead of slices')
+            elif inv_xform_control_points:
+                print('Saving inverse transformed control points')
+            elif xform_control_points:
+                print('Saving transformed control points')
             print('\toutpaths: ' + str(outpaths))
             print('\tsuffixes: ' + str(suffixes))
             print('\tdssteps: ' + str(dssteps))
@@ -1933,7 +2013,7 @@ class wafer(region):
 
                 # invert the alignments in which the mask was generated
                 #   in order for it to align with the slice region image.
-                _, _, _, _, _, roi_points, _, region_size = self._region_load_load_imgs(x,
+                _, _, _, _, _, roi_points, _, _, region_size = self._region_load_load_imgs(x,
                         slice_image_fn, False, False, False, None, verbose_load)
                 bw, roi_points, ibox_shape, icrop_min = self._region_load_coords_inv(x,
                         region_size, bw, roi_points, rel_ds, verbose_load, False)
@@ -1947,11 +2027,22 @@ class wafer(region):
                 # this is a special code path, so do not do anything else within the loop.
                 continue
             elif not convert_hdf5s and not init_locks:
-                img, roi_points, img_shape, icrop_min, bgsel = \
+                img, roi_points, control_points, img_shape, icrop_min, bgsel = \
                     self._region_load(x, bg_fill_type=bg_fill_type, verbose=verbose_load)
                 # get the image, rough bounding box and grid centers.
                 img_sz = np.array(img.size, dtype=np.int64); img_ctr = img_sz/2
                 img_shape_blk = img_shape
+
+            if xform_control_points or inv_xform_control_points:
+                slice_image_fn = self._get_region_filename(x) + '.h5'
+                if inv_xform_control_points:
+                    big_img_save(slice_image_fn, control_points, control_points.shape, dataset='control_points',
+                        recreate=True, overwrite_dataset=True)
+                else:
+                    big_img_save(slice_image_fn, control_points, control_points.shape, dataset='xcontrol_points',
+                        recreate=True, overwrite_dataset=True)
+                # this is a special code path, so do not do anything else within the loop.
+                continue
 
             if crop_to_grid and not init_locks:
                 assert(not zero_outside_grid or not self.use_tissue_masks) # xxx - not implemented

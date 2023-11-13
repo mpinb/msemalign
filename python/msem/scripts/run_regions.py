@@ -476,8 +476,10 @@ def compute_histos_job(ind, inds, fns, rois_points, use_tissue_mask, tissue_mask
                         pad = (rel_ds - np.array(bw.shape) % rel_ds) % rel_ds
                         bw = measure.block_reduce(np.pad(bw, ((0,pad[0]), (0,pad[1])), mode='reflect'),
                                 block_size=(rel_ds, rel_ds), func=zimages.blkrdc_func).astype(bw.dtype)
+                        bw_ds = rel_ds * attrs['ds']
                         rel_ds = 1
                     else:
+                        bw_ds = attrs['ds']
                         rel_ds = attrs['ds'] // dsstep
 
                     if tissue_mask_min_size > 0:
@@ -511,8 +513,8 @@ def compute_histos_job(ind, inds, fns, rois_points, use_tissue_mask, tissue_mask
 
                     if not single_block:
                         if verbose: print('full bw tm is {}x{}'.format(bw.shape[1],bw.shape[0]))
-                        # use ds here and not rel_ds because crop is based on original image load before downsampling
-                        rng = [[int(np.floor(x[0]/attrs['ds'])), int(np.ceil(x[1]/attrs['ds']))] for x in blk_rng]
+                        # crop is based on original image load before downsampling
+                        rng = [[int(np.floor(x[0]/bw_ds)), int(np.ceil(x[1]/bw_ds))] for x in blk_rng]
                         bw = bw[rng[0][0]:rng[0][1],rng[1][0]:rng[1][1]]
                     if verbose: print('bw tm blk is {}x{}'.format(bw.shape[1],bw.shape[0]))
 
@@ -675,8 +677,8 @@ for wafer_id in wafer_ids:
             if native:
                 to_native_scale = use_thumbnails_ds / dsstep
                 use_use_thumbnails_ds = 0
-                use_tissue_mask_ds = int(tissue_mask_ds * to_native_scale)
-                use_tear_annotation_ds = int(tear_annotation_ds * to_native_scale)
+                use_tissue_mask_ds = tissue_mask_ds * use_thumbnails_ds
+                use_tear_annotation_ds = tear_annotation_ds * use_thumbnails_ds
             else:
                 to_native_scale = 1./dsstep
                 use_use_thumbnails_ds = use_thumbnails_ds
@@ -862,8 +864,9 @@ for wafer_id in wafer_ids:
                     get_overlap_sum=True, res_nm=res_nm, nblks=nblks, iblk=iblk, novlp_pix=blk_ovlp_pix)
 
             if mfov_id < 1:
-                print('Saving image, background (and empty histogram)'); t = time.time()
-                img_shape=crop_info['noncropped_size'][::-1]
+                img_shape = crop_info['noncropped_size'][::-1]
+                print('Saving image {}x{}, background (and empty histogram)'.format(img_shape[0],img_shape[1]))
+                t = time.time()
                 write_count, f1, f2 = big_img_save(slice_image_fn, image, img_shape, nblks=nblks, iblk=iblk,
                         novlp_pix=blk_ovlp_pix, compression=True, recreate=True, lock=lock, keep_locks=lock, wait=True)
                 big_img_save(slice_image_fn, overlap_sum==0, img_shape, nblks=nblks, iblk=iblk, novlp_pix=blk_ovlp_pix,

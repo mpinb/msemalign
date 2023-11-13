@@ -1,0 +1,13 @@
+#name        deps               swarm                                  part           nproc   ngpu  time  pack  mroll
+align1       ,                  run_regions-align-pass1                p.axon/p.gpu   20/10   0/0   0/0   0     0
+align2       align1             run_regions-align                      p.axon/p.gpu   20/10   0/0   0/0   0     0
+bal-mfov1    ,                  run_regions-balance-mean-mfov          p.axon/p.gpu   20/10   0/0   0/0   0     0
+bal-mfov2    bal-mfov1          run_regions-balance-mean-mfov-pass2    p.axon/p.gpu   20/10   0/0   0/0   0     0
+balance      bal-mfov2,align2   run_regions-balance                    p.axon/p.gpu   3/1     0/0   0/0   0     0
+iexport      balance            run_regions-export-init                p.axon/p.gpu   20/10   0/0   0/0   0     0
+#export       iexport            run_regions-export                     p.axon/p.gpu   8/4     0/0   0/0   0     0
+export       iexport            run_regions-export                     p.axon         30      0     0     1  5010
+histos16     export             run_regions-histos-ds16                p.axon/p.gpu   4/4     0/0   0/0   0     0
+sbalance     histos16           run_regions-slice-balance              p.axon/p.gpu   1/1     0/0   0/0   0     0
+bright       sbalance           run_regions-slice-brightness-adjust    p.axon/p.gpu   10/5    0/0   0/0   0     0
+exporttif    export             run_regions-convert-h5-to-tiff         p.axon/p.gpu   20/10   0/0   0/0   0     0

@@ -6,7 +6,8 @@
 
 echo workflow.bash
 echo   '<dataset_name>-<cluster_name>'
-echo   init downsample region0 region wafer-init rough-order rough order-iter fine
+echo   init downsample region0 region wafer-init tears rough-order rough order-iter fine
+echo   ufine-init ultrafine native-region native-tears native-fine native-ultrafine
 
 ## parameters
 args=("$@")
@@ -32,10 +33,30 @@ if [ "${runtype}" == "downsample" ]; then
 
 # run 4 (oversubscribe) cores per job (cpu limited, io limited).
 # NOTE: there is no pipeline file for this step, use rolling_submit directly.
-create_swarm --all-wafers --no-wafer-id-arg --all-slices --run-script run_downsample_wafer.py --beg-arg region-range --end-arg --id-str downsample --format-str '%a %b 4' --other-flags " --thumbnails-only --nworkers 1 3 1 1 "
+create_swarm --all-wafers --no-wafer-id-arg --all-slices --run-script run_downsample_wafer.py --beg-arg region-range --end-arg --id-str downsample ${reimg} --format-str '%a %b 4' --other-flags " --thumbnails-only --nworkers 1 3 1 1 "
 echo "run 4 (oversubscribe) cores per job (cpu limited, io limited)."
 echo "NOTE: there is no pipeline file for this step, use rolling_submit directly."
 
+fi
+
+
+if [ "${runtype}" == "native-region" ]; then
+  runtype=region0
+  isnative=1
+  native="--native"
+  rebal_dsstep=16
+  histo_dsstep=64
+  reg_nblksx=$((reg_nblksx*4))
+  reg_nblksy=$((reg_nblksy*4))
+  unset histos_ranges
+  sbc_nblksx=4
+  sbc_nblksy=4
+else
+  native=
+  rebal_dsstep=4
+  histo_dsstep=16
+  sbc_nblksx=1
+  sbc_nblksy=1
 fi
 
 
@@ -44,17 +65,17 @@ if [ "${runtype}" == "region0" ]; then
 # alignment first pass
 # MSEM_FFT_TYPE - scipy_fft = 0; numpy_fft = 1; pyfftw_fft = 2; cupy_fft = 3; rcc_xcorr = 4
 # MSEM_FFT_BACKEND - none = 0; mkl = 1; fftw = 2; cupy = 3
-create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str align-pass1 --set-env "MSEM_NUM_THREADS=2 MSEM_FFT_TYPE=0,3 MSEM_FFT_BACKEND=1" --other-flags " --run-type align --no-brightness-balancing --twopass_align_first_pass "
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str align-pass1 ${reimg} --set-env "MSEM_NUM_THREADS=2 MSEM_FFT_TYPE=0,3 MSEM_FFT_BACKEND=1" --other-flags " --run-type align --no-brightness-balancing --twopass_align_first_pass "
 # alignment second pass
-create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str align --set-env "MSEM_NUM_THREADS=3" --other-flags " --run-type align --no-brightness-balancing --save-residuals "
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str align ${reimg} --set-env "MSEM_NUM_THREADS=3" --other-flags " --run-type align --no-brightness-balancing --save-residuals "
 
 # balance mean mfov first pass
-create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str balance-mean-mfov --set-env "MSEM_NUM_THREADS=3" --other-flags " --run-type balance-mean-mfov "
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str balance-mean-mfov ${reimg} --set-env "MSEM_NUM_THREADS=3" --other-flags " --run-type balance-mean-mfov ${native} "
 # balance mean mfov second pass
-create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str balance-mean-mfov-pass2 --set-env "MSEM_NUM_THREADS=3" --other-flags " --run-type balance-mean-mfov --re-brightness-balancing "
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str balance-mean-mfov-pass2 ${reimg} --set-env "MSEM_NUM_THREADS=3" --other-flags " --run-type balance-mean-mfov --re-brightness-balancing ${native} "
 
 # brightness with rebalance
-create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str balance --set-env "MSEM_BLKRDC_TYPE=1 MSEM_NUM_THREADS=${rebal_nw}" --other-flags " --run-type balance --re-brightness-balancing --roi-polygon-scale 0. --dsstep 4 --nworkers ${rebal_nw}"
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str balance ${reimg} --set-env "MSEM_BLKRDC_TYPE=1 MSEM_NUM_THREADS=${rebal_nw}" --other-flags " --run-type balance --re-brightness-balancing --roi-polygon-scale 0. --dsstep ${rebal_dsstep} --nworkers ${rebal_nw} ${native} "
 
 fi
 
@@ -62,44 +83,60 @@ fi
 if [[ "${runtype}" == region* ]]; then
 
 # export init
-create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str export-init --set-env "MSEM_NUM_THREADS=2" --other-flags " --run-type export --block-overlap-um 8 8 --nblocks -${reg_nblksx} -${reg_nblksy} ${noblend} "
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str export-init ${reimg} --set-env "MSEM_NUM_THREADS=2" --other-flags " --run-type export --block-overlap-um 8 8 --nblocks -${reg_nblksx} -${reg_nblksy} ${noblend} ${native} "
 # export
-create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg iblock iblock region_inds --iwafer-iter-arg 2 --id-str export --set-env "MSEM_NUM_THREADS=2" --other-flags " --run-type export --block-overlap-um 8 8 --nblocks ${reg_nblksx} ${reg_nblksy} ${noblend} " --iterate-ranges 0 ${reg_nblksx} 0 ${reg_nblksy}
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg iblock iblock region_inds --iwafer-iter-arg 2 --id-str export ${reimg} --set-env "MSEM_NUM_THREADS=2" --other-flags " --run-type export --block-overlap-um 8 8 --nblocks ${reg_nblksx} ${reg_nblksy} ${noblend} ${native} " --iterate-ranges 0 ${reg_nblksx} 0 ${reg_nblksy}
 
 # downsampled slice histograms
-create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region-inds-rng --iterate-ranges-split 128 128 128 128 128 --id-str histos-ds16 --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type slice-histos --roi-polygon-scale ${roi} --nworkers ${histos_nw} --dsstep 16 ${tm} "
-# # without ranges (for reimages for example)
-# create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str histos-ds16 --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type slice-histos --roi-polygon-scale ${roi} --dsstep 16 ${tm} "
+if [[ -n "$histos_ranges" ]]; then
+# using ranges and nworkers
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region-inds-rng --iterate-ranges-split 128 128 128 128 128 --id-str histos-ds16 --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type slice-histos --roi-polygon-scale ${roi} --nworkers ${histos_nw} --dsstep ${histo_dsstep} ${tm} "
+else
+# without ranges (for reimages for example)
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str histos-ds16 ${reimg} --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type slice-histos --roi-polygon-scale ${roi} --dsstep ${histo_dsstep} ${tm} ${native} --nblocks ${sbc_nblksx} ${sbc_nblksy} "
+fi
 
 # slice brightness balance
-create_swarm --run-script run_regions.py --beg-arg nworkers --id-str slice-balance --set-env "MSEM_NUM_THREADS=32" --other-flags " --all-wafers --run-type slice-balance --dsstep 16 " --iterate-ranges 32 33
+create_swarm --run-script run_regions.py --beg-arg nworkers --id-str slice-balance --set-env "MSEM_NUM_THREADS=32" --other-flags " --all-wafers --run-type slice-balance --dsstep ${histo_dsstep} ${native} " --iterate-ranges 32 33
 
+# slice brightness adjust init
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str brightness-init --set-env "MSEM_NUM_THREADS=1" --other-flags " --run-type slice-brightness-adjust ${native} --nblocks -${sbc_nblksx} -${sbc_nblksy} "
 # slice brightness adjust
-create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str slice-brightness-adjust --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type slice-brightness-adjust "
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg iblock iblock region_inds --iwafer-iter-arg 2 --id-str slice-brightness-adjust ${reimg} --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type slice-brightness-adjust ${native} --nblocks ${sbc_nblksx} ${sbc_nblksy} " --iterate-ranges 0 ${sbc_nblksx} 0 ${sbc_nblksy}
 
 # export tiffs
-create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str convert-h5-to-tiff --set-env "MSEM_NUM_THREADS=2" --other-flags " --run-type convert-h5-to-tiff --dsexports ${dsthumbs} ${noblend} "
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str convert-h5-to-tiff ${reimg} --set-env "MSEM_NUM_THREADS=2" --other-flags " --run-type convert-h5-to-tiff --dsexports ${dsthumbs} ${noblend} "
 # export tiffs masks
-create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str convert-h5-to-tiff-masks --set-env "MSEM_NUM_THREADS=2" --other-flags " --run-type convert-h5-to-tiff --dsexports ${dsthumbs} --tissue-masks "
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str convert-h5-to-tiff-masks ${reimg} --set-env "MSEM_NUM_THREADS=2" --other-flags " --run-type convert-h5-to-tiff --dsexports ${dsthumbs} --tissue-masks "
 
+fi
+
+
+if [[ -n "$isnative" ]]; then
+  runtype=region
 fi
 
 
 if [ "${runtype}" == "region" ]; then
 
 # save masks
-create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region-inds-rng --iterate-ranges-split 128 128 128 128 128 --id-str save_masks --set-env "MSEM_NUM_THREADS=2" --other-flags " --run-type save-masks --save-masks-in ${msk_dir} "
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region-inds-rng --iterate-ranges-split 128 128 128 128 128 --id-str save_masks --set-env "MSEM_NUM_THREADS=2" --other-flags " --run-type save-masks --save-masks-in ${msk_dir} ${native} "
 
 # slice histograms
+if [[ -n "$histos_ranges" ]]; then
 create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region-inds-rng --iterate-ranges-split 128 128 128 128 128 --id-str histos --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type slice-histos --roi-polygon-scale ${roi} --nworkers ${histos_nw} ${tm} "
-# # without ranges (for reimages for example)
-# create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str histos --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type slice-histos --roi-polygon-scale ${roi} 1 ${tm} "
+else
+# without ranges (for reimages for example)
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str histos --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type slice-histos --roi-polygon-scale ${roi} ${tm} ${native} --nblocks ${sbc_nblksx} ${sbc_nblksy} "
+fi
 
 # analyze histograms (for picking out a template)
-create_swarm --run-script plot_regions.py --beg-arg wafer_ids --id-str histo-width --set-env "MSEM_NUM_THREADS=1" --other-flags " --run-type histo-width " --iterate-wafers
+create_swarm --run-script plot_regions.py --beg-arg wafer_ids --id-str histo-width --set-env "MSEM_NUM_THREADS=1" --other-flags " --run-type histo-width ${native} " --iterate-wafers
 
+# slice contrast matching init
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str contrast-init --set-env "MSEM_NUM_THREADS=1" --other-flags " --run-type slice-contrast-match ${heur} ${native} --nblocks -${sbc_nblksx} -${sbc_nblksy} "
 # slice contrast matching
-create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg region_inds --id-str slice-contrast-match --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type slice-contrast-match ${heur} "
+create_swarm --all-wafers --all-slices --run-script run_regions.py --beg-arg iblock iblock region_inds --iwafer-iter-arg 2 --id-str slice-contrast-match --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type slice-contrast-match ${heur} ${native} --nblocks ${sbc_nblksx} ${sbc_nblksy} " --iterate-ranges 0 ${sbc_nblksx} 0 ${sbc_nblksy}
 
 fi
 
@@ -112,6 +149,34 @@ for ((w=1;w<=nwafers;w++)); do
   run_wafer.py --run-type export_rough_dills --w ${w}
 done
 run_wafer.py --run-type update_meta_dill --w 1
+
+fi
+
+
+if [ "${runtype}" == "native-tears" ]; then
+  runtype=tears
+  isnative=1
+  native="--native"
+  #reg_nblksx=$((reg_nblksx*4))
+  #reg_nblksy=$((reg_nblksy*4))
+  reg_nblksx=$((reg_nblksx*2))
+  reg_nblksy=$((reg_nblksy*2))
+else
+  native=
+fi
+
+
+if [ "${runtype}" == "tears" ]; then
+
+# to transform tear stitching control points into microsopce alignment
+create_swarm --all-wafers --all-slices --torn-regions --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str rough_export_ctlpts --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type rough_export --no-order --no-rough-alignment --dsexports ${dsthumbs} ${noblend} --control-points "
+
+# to inverse transform tear stitching control points into region space
+create_swarm --all-wafers --all-slices --torn-regions --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str rough_export_ctlpts --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type rough_export --no-order --no-rough-alignment --dsexports ${dsthumbs} ${noblend} --inv-control-points "
+
+# to apply the tear stitching to the torn regions
+create_swarm --torn-regions --all-slices --run-script run_regions.py --beg-arg region_inds --iwafer-iter-arg 0 --id-str stitch-tears-init --set-env "MSEM_NUM_THREADS=1" --other-flags " --run-type stitch-tears --block-overlap-um ${tear_bovlp} --nblocks -${reg_nblksx} -${reg_nblksy} ${native} "
+create_swarm --torn-regions --all-slices --run-script run_regions.py --beg-arg region_inds iblock iblock --iwafer-iter-arg 0 --id-str stitch-tears --set-env "MSEM_NUM_THREADS=2" --other-flags " --run-type stitch-tears --block-overlap-um ${tear_bovlp} --nblocks ${reg_nblksx} ${reg_nblksy} ${native} " --iterate-ranges 0 ${reg_nblksx} 0 ${reg_nblksy}
 
 fi
 
@@ -183,13 +248,17 @@ create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str ro
 rough_run=${afftype}_${rough_id}_rigid
 create_swarm --all-wafers --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str rough_export --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type rough_export --rough-run-str ${rough_run} --dsexports ${dsthumbs} "
 # to create the rough hdf5 exports (faster turnaround with fine steps)
-#create_swarm --all-wafers --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str rough_h5_export --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type rough_export --rough-run-str ${rough_run} --rough-hdf5 "
+create_swarm --all-wafers --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str rough_h5_export --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type rough_export --rough-run-str ${rough_run} --rough-hdf5 "
 # to export the rough alignment as hdf5 in order to cube at 16 nm
 create_swarm --all-wafers --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str rough_export_h5 --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type rough_export --rough-run-str ${rough_run} --dsexports 1 --export-h5 "
 
 # ordered export but without rough alignment (microscope only)
 # for working on order / hand editing masks
 create_swarm --all-wafers --all-slices --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str rough_export_order --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type rough_export --no-rough-alignment --dsexports ${dsthumbs} ${noblend} "
+if [[ -n "$export_no_rough_ds1" ]]; then
+# for ds1, to be used for tear edits
+create_swarm --all-wafers --all-slices --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str rough_export_order --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type rough_export --no-rough-alignment --dsexports 1 ${noblend} --export-h5 "
+fi
 # export masks
 create_swarm --all-wafers --all-slices --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str rough_export_order_masks --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type rough_export --no-rough-alignment --dsexports ${dsthumbs} --tissue-masks "
 # to save edited masks into regions (where to put this?)
@@ -277,6 +346,19 @@ done
 fi
 
 
+if [ "${runtype}" == "native-fine" ]; then
+  runtype=fine
+  isnative=1
+  native="--native"
+  #efine_nblksx=$((efine_nblksx*4))
+  #efine_nblksy=$((efine_nblksy*4))
+  efine_bovlp="0.064 0.064" # 16 pixels at 4 nm
+else
+  native=
+  efine_bovlp="0.128 0.128" # 8 pixels at 16 nm
+fi
+
+
 if [ "${runtype}" == "fine" ]; then
 
 rough_run=${afftype}_${rough_id}_rigid
@@ -307,26 +389,26 @@ awk 'BEGIN{cnt=0; torepl="CUDA_VISIBLE_DEVICES=";} /CUDA_VISIBLE_DEVICES=/{repl=
 
 # fine outliers
 # init block dills
-create_swarm --run-script run_wafer_aggregator.py --beg-arg iblock --id-str fine-outliers-init --set-env 'MSEM_NUM_THREADS=4' --other-flags " 0 --all-wafers --run-type fine_outliers --run-str-out-rough ${rough_run} --run-str-in ${align_run} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nblocks -${out_nblksx} -${out_nblksy} --block-overlap-um ${out_bovlp} --ransac-repeats 100 --ransac-max 50000 --nworkers 4 ${fine_rng} " --iterate-ranges 0 ${out_nblksx}
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iblock --id-str fine-outliers-init --set-env "MSEM_NUM_THREADS=4" --other-flags " 0 --all-wafers --run-type fine_outliers --run-str-out-rough ${rough_run} --run-str-in ${align_run} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nblocks -${out_nblksx} -${out_nblksy} --block-overlap-um ${out_bovlp} " --iterate-ranges 0 ${out_nblksx}
 # outliers
 np=${nslices}
-create_swarm --run-script run_wafer_aggregator.py --beg-arg iblock iblock iprocess --id-str fine-outliers --set-env 'MSEM_NUM_THREADS=4' --other-flags " --all-wafers --run-type fine_outliers --run-str-out-rough ${rough_run} --run-str-in ${align_run} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nprocesses ${np} --nblocks ${out_nblksx} ${out_nblksy} --block-overlap-um ${out_bovlp} --ransac-repeats 100 --ransac-max 50000 --nworkers 4 ${fine_rng} " --iterate-ranges 0 ${out_nblksx} 0 ${out_nblksy} 0 ${np}
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iblock iblock iprocess --id-str fine-outliers --set-env "MSEM_NUM_THREADS=4" --other-flags " --all-wafers --run-type fine_outliers --run-str-out-rough ${rough_run} --run-str-in ${align_run} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nprocesses ${np} --nblocks ${out_nblksx} ${out_nblksy} --block-overlap-um ${out_bovlp} --ransac-repeats 100 --ransac-max 50000 --nworkers 4 ${fine_rng} " --iterate-ranges 0 ${out_nblksx} 0 ${out_nblksy} 0 ${np}
 # merge
 # NOTE: number of parallel procs for merge does not have to match fine outliers run
 if [ ${out_nblksx} -eq 1 ] && [ ${out_nblksy} -eq 1 ]; then
   np=0
 else
-  np=$((nslices // 5))
+  np=$((nslices / 5))
 fi
-create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str fine-outliers-merge --set-env 'MSEM_NUM_THREADS=4' --other-flags " --all-wafers --run-type fine_outliers --run-str-out-rough ${rough_run} --run-str-in ${align_run} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nprocesses ${np} --nblocks ${out_nblksx} ${out_nblksy} --block-overlap-um ${out_bovlp} --merge ${fine_rng} " --iterate-ranges 0 ${np}
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str fine-outliers-merge --set-env "MSEM_NUM_THREADS=4" --other-flags " --all-wafers --run-type fine_outliers --run-str-out-rough ${rough_run} --run-str-in ${align_run} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nprocesses ${np} --nblocks ${out_nblksx} ${out_nblksy} --block-overlap-um ${out_bovlp} --merge ${fine_rng} " --iterate-ranges 0 ${np}
 
 # fine interpolation
 np=${nslices}
-create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str fine-interp --set-env 'MSEM_NUM_THREADS=2' --other-flags " --all-wafers --run-type fine_interp --run-str-out-rough ${rough_run} --run-str-in ${align_run} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nprocesses ${np} ${fine_rng} " --iterate-ranges 0 ${np}
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str fine-interp --set-env "MSEM_NUM_THREADS=2" --other-flags " --all-wafers --run-type fine_interp --run-str-out-rough ${rough_run} --run-str-in ${align_run} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nprocesses ${np} ${fine_rng} " --iterate-ranges 0 ${np}
 
 # fine affine filtering
 np=${nslices}
-create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str fine-filter --set-env 'MSEM_NUM_THREADS=2' --other-flags " --all-wafers --run-type fine_filter --run-str-out-rough ${rough_run} --run-str-in ${align_run} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nprocesses ${np} " --iterate-ranges 0 ${np}
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str fine-filter --set-env "MSEM_NUM_THREADS=2" --other-flags " --all-wafers --run-type fine_filter --run-str-out-rough ${rough_run} --run-str-in ${align_run} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nprocesses ${np} " --iterate-ranges 0 ${np}
 
 # xxx - maybe remove l2 because settled on fine alignment using affine filter with l2 off?
 
@@ -336,16 +418,17 @@ np=1
 bovlp="0. 0."
 nblksx=1
 nblksy=1
-create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str fine-reslice-init --set-env 'MSEM_NUM_THREADS=8' --other-flags " --all-wafers --run-type fine_reslice --run-str-in ${align_run} --run-str-out-rough ${rough_run} --run-str-out-fine ${fine_out} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nworkers ${nw} --nprocesses ${np} --L2_norm ${fine_l2} --keep-xcorrs --block-overlap-um ${bovlp} --nblocks -${nblksx} -${nblksy} " --iterate-ranges 0 ${np}
+# init
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str fine-reslice-init --set-env "MSEM_NUM_THREADS=8" --other-flags " --all-wafers --run-type fine_reslice --run-str-in ${align_run} --run-str-out-rough ${rough_run} --run-str-out-fine ${fine_out} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nworkers ${nw} --nprocesses ${np} --L2_norm ${fine_l2} --keep-xcorrs --block-overlap-um ${bovlp} --nblocks -${nblksx} -${nblksy} " --iterate-ranges 0 ${np}
 # reslice
-create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str fine-reslice --set-env 'MSEM_NUM_THREADS=8' --other-flags " --all-wafers --run-type fine_reslice --run-str-in ${align_run} --run-str-out-rough ${rough_run} --run-str-out-fine ${fine_out} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nprocesses ${np} --L2_norm ${fine_l2} --keep-xcorrs --block-overlap-um ${bovlp} --nblocks ${nblksx} ${nblksy} " --iterate-ranges 0 ${np}
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str fine-reslice --set-env "MSEM_NUM_THREADS=8" --other-flags " --all-wafers --run-type fine_reslice --run-str-in ${align_run} --run-str-out-rough ${rough_run} --run-str-out-fine ${fine_out} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nprocesses ${np} --L2_norm ${fine_l2} --keep-xcorrs --block-overlap-um ${bovlp} --nblocks ${nblksx} ${nblksy} " --iterate-ranges 0 ${np}
 
 # fine reconcile
 uuid=$(uuidgen)
 # need this option in combination with affine filtering
 #f=
 f=--filtered-fine-deltas
-create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str fine-reconcile --set-env "MSEM_UUID=${uuid} MSEM_NUM_THREADS=$(($ncores / $frec_nw))" --other-flags " --all-wafers --run-type fine --run-str-out-rough ${rough_run} --run-str-in ${align_run} --run-str-out-fine ${fine_out} ${f} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nworkers ${frec_nw} --nprocesses ${frec_np} --L2_norm ${fine_l2} ${fine_rng} " --iterate-ranges 0 ${frec_np}
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str fine-reconcile --set-env "MSEM_UUID=${uuid} MSEM_NUM_THREADS=${frec_tpw}" --other-flags " --all-wafers --run-type fine --run-str-out-rough ${rough_run} --run-str-in ${align_run} --run-str-out-fine ${fine_out} ${f} --verbose --max-skips ${fine_maxskips} --max-crops ${maxcrops} --nworkers ${frec_nw} --nprocesses ${frec_np} --L2_norm ${fine_l2} ${fine_rng} " --iterate-ranges 0 ${frec_np}
 # merge, lightweight but can still take a few mins depending on number of grid points
 # if --filtered-fine-deltas then filtering takes some time, parallelization is with nworkers.
 #   currently no multi-node parallelization support, but runtime still reasonable without this.
@@ -355,14 +438,118 @@ create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str fi
 #rh5=
 #rh5=--rough-hdf5
 rh5=--use-coordinate-based-xforms
-ovlp="0.128 0.128" # 8 pixels at 16 nm, seems plenty safe, probably ok same for all datasets
-#ovlp="0 0" # some edge effects, so do not do this
 # init
-create_swarm --all-wafers --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str fine_export_init --set-env 'MSEM_NUM_THREADS=4' --other-flags " --run-type fine_export --rough-run-str ${rough_run} --fine-run-str ${fine_out} ${rh5} --nblocks -${efine_nblksx} -${efine_nblksy} --block-overlap-um ${ovlp} --crop-to-grid --export-h5 --dsexports 1 "
+create_swarm --all-wafers --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str fine_export_init --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type fine_export --rough-run-str ${rough_run} --fine-run-str ${fine_out} ${rh5} --nblocks -${efine_nblksx} -${efine_nblksy} --block-overlap-um ${efine_bovlp} --crop-to-grid --export-h5 --dsexports 1 ${native} "
 # export
-create_swarm --all-wafers --run-script run_wafer.py --beg-arg iblock iblock export-region-beg --end-arg None None export-region-end --iwafer-iter-arg 2 --id-str fine_export --set-env 'MSEM_NUM_THREADS=4' --other-flags " --run-type fine_export --rough-run-str ${rough_run} --fine-run-str ${fine_out} ${rh5} --nblocks ${efine_nblksx} ${efine_nblksy} --block-overlap-um ${ovlp} --block-overlap-grid-um ${efine_govlp} --crop-to-grid --export-h5 --dsexports 1 " --iterate-ranges 0 ${efine_nblksx} 0 ${efine_nblksy}
+create_swarm --all-wafers --run-script run_wafer.py --beg-arg iblock iblock export-region-beg --end-arg None None export-region-end --iwafer-iter-arg 2 --id-str fine_export --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type fine_export --rough-run-str ${rough_run} --fine-run-str ${fine_out} ${rh5} --nblocks ${efine_nblksx} ${efine_nblksy} --block-overlap-um ${efine_bovlp} --block-overlap-grid-um ${efine_govlp} --crop-to-grid --export-h5 --dsexports 1 ${native} " --iterate-ranges 0 ${efine_nblksx} 0 ${efine_nblksy}
 
 # export downsampled tiffs
-create_swarm --all-wafers --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str fine_export_tiffs --set-env 'MSEM_NUM_THREADS=2' --other-flags " --run-type fine_export --rough-run-str ${rough_run} --fine-run-str ${fine_out} --dsexports ${dsthumbs} --convert-h5-to-tiff "
+create_swarm --all-wafers --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str fine_export_tiffs --set-env "MSEM_NUM_THREADS=2" --other-flags " --run-type fine_export --rough-run-str ${rough_run} --fine-run-str ${fine_out} --dsexports ${dsthumbs} --convert-h5-to-tiff "
+
+fi
+
+
+if [ "${runtype}" == "ufine-init" ]; then
+
+# This exports alignment manifest automatically if it is not present.
+# There should not be any errors.
+create_swarm --help
+
+# only needed once, or to clear temporary items from meta dill or
+#   if you want to change the czi angle or something with reading the manifest angles.
+ufine_nwafers=1 # xxx - may need to split into multiple dirs at some point when nslices > 10kish
+for ((w=1;w<=ufine_nwafers;w++)); do
+  run_wafer.py --run-type export_rough_dills --w ${w}
+done
+run_wafer.py --run-type update_meta_dill --w 1
+
+fi
+
+
+if [ "${runtype}" == "native-ultrafine" ]; then
+  runtype=ultrafine
+  isnative=1
+  native="--native"
+  dstack="--override-stack ${native_stack}"
+  efine_nblksx=$((efine_nblksx*4))
+  efine_nblksy=$((efine_nblksy*4))
+  eufine_bovlp="0.064 0.064" # 16 pixels at 4 nm
+else
+  native=
+  eufine_bovlp="0.128 0.128" # 8 pixels at 16 nm
+  dstack=
+fi
+
+
+if [ "${runtype}" == "ultrafine" ]; then
+
+# ultrafine alignment, pre-create dills, runs quickly
+create_swarm --run-script run_wafer.py --beg-arg wafer_ids --id-str ufine-init --other-flags " --solved-order-ind 0 1 --run-type fine --no-rough-alignment --delta-run-str ${ufine_in} --skip-slices 0 --crops-um-ind 0 " --iterate-wafers
+
+# ultrafine alignment
+waf_reg=--all-wafers
+#waf_reg="--wafer-region-in tear_area_wafer-region-in.txt"
+# IMPORTANT: this is hacky but --rough-hdf5 must be set (basically pretend like it's a rough h5 load)
+# xxx - currently set_num_workers for the mkl scipy fft backend is broken, so do NOT pack the jobs.
+rh5=--rough-hdf5
+blur=
+#blur=--fine-blur-only
+for ((s=0;s<=ufine_maxskips;s++)); do
+# MSEM_FFT_TYPE - scipy_fft = 0; numpy_fft = 1; pyfftw_fft = 2; cupy_fft = 3; rcc_xcorr = 4
+# MSEM_FFT_BACKEND - none = 0; mkl = 1; fftw = 2; cupy = 3
+create_swarm ${waf_reg} --run-script run_wafer.py --base-zero --add-to-range-end $((-s-1)) --beg-arg iblock iblock solved-order-ind --iwafer-iter-arg 2 --cross-wafer-max $((-s-1)) --id-str ufine-skip${s}-crop${uic} --set-env "MSEM_NUM_THREADS=2 MSEM_FFT_TYPE=0,3 MSEM_FFT_BACKEND=1 CUDA_VISIBLE_DEVICES=" --other-flags " --run-type fine --no-rough-alignment --delta-run-str ${ufine_in} --skip-slices ${s} --crops-um-ind ${uic} ${blur} ${utm} ${rh5} --nblocks ${ufine_nblksx} ${ufine_nblksy} --block-overlap-um ${ufine_bovlp} " --iterate-ranges 0 ${ufine_nblksx} 0 ${ufine_nblksy}
+create_swarm ${waf_reg} --run-script run_wafer.py --base-zero --add-to-range-end $((-s-1)) --beg-arg iblock iblock solved-order-ind --iwafer-iter-arg 2 --cross-wafer-max $((-s-1)) --id-str ufine-skip${s}-crop${uic}-invert --set-env "MSEM_NUM_THREADS=2 MSEM_FFT_TYPE=0,3 MSEM_FFT_BACKEND=1 CUDA_VISIBLE_DEVICES=" --other-flags " --run-type fine --no-rough-alignment --delta-run-str ${ufine_in} --skip-slices ${s} --invert-order --crops-um-ind ${uic} ${blur} ${utm} ${rh5} --nblocks ${ufine_nblksx} ${ufine_nblksy} --block-overlap-um ${ufine_bovlp} " --iterate-ranges 0 ${ufine_nblksx} 0 ${ufine_nblksy}
+done
+# concatenate swarms together
+cat $(date '+%Y%m%d')-run_wafer-ufine-skip?-crop${uic}*.swarm > $(date '+%Y%m%d')-run_wafer-ufine-all.swarm
+rm $(date '+%Y%m%d')-run_wafer-ufine-skip?-crop${uic}*.swarm
+# then insert rolling gpu indices, jobs packed per node needs to be a multiple of number of gpus
+awk 'BEGIN{cnt=0; torepl="CUDA_VISIBLE_DEVICES=";} /CUDA_VISIBLE_DEVICES=/{repl="CUDA_VISIBLE_DEVICES="cnt; sub(torepl, repl, $0); cnt=(cnt+1)%'${ngpus}';} {print}' $(date '+%Y%m%d')-run_wafer-ufine-all.swarm > $(date '+%Y%m%d')-run_wafer-ufine-all-gpuind.swarm
+
+# ultrafine outliers
+# init block dills
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iblock --id-str ufine-outliers-init --set-env "MSEM_NUM_THREADS=4" --other-flags " 0 --all-wafers --run-type fine_outliers --run-str-in ${ufine_in} --verbose --max-skips ${ufine_maxskips} --max-crops ${umaxcrops} --nblocks -${uout_nblksx} -${uout_nblksy} --block-overlap-um ${uout_bovlp} " --iterate-ranges 0 ${uout_nblksx}
+# outliers
+np=${nslices}
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iblock iblock iprocess --id-str ufine-outliers --set-env "MSEM_NUM_THREADS=4" --other-flags " --all-wafers --run-type fine_outliers --run-str-in ${ufine_in} --verbose --max-skips ${ufine_maxskips} --max-crops ${umaxcrops} --nprocesses ${np} --nblocks ${uout_nblksx} ${uout_nblksy} --block-overlap-um ${uout_bovlp} --ransac-repeats 100 --ransac-max 10000 --nworkers 4 " --iterate-ranges 0 ${uout_nblksx} 0 ${uout_nblksy} 0 ${np}
+# merge
+# NOTE: number of parallel procs for merge does not have to match fine outliers run
+if [ ${uout_nblksx} -eq 1 ] && [ ${uout_nblksy} -eq 1 ]; then
+  np=0
+else
+  np=$((nslices / 5))
+fi
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str ufine-outliers-merge --set-env "MSEM_NUM_THREADS=4" --other-flags " --all-wafers --run-type fine_outliers --run-str-in ${ufine_in} --verbose --max-skips ${ufine_maxskips} --max-crops ${umaxcrops} --nprocesses ${np} --nblocks ${uout_nblksx} ${uout_nblksy} --block-overlap-um ${uout_bovlp} --merge " --iterate-ranges 0 ${np}
+
+# ultrafine interpolation
+np=${nslices}
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iblock iblock iprocess --id-str ufine-interp --set-env "MSEM_NUM_THREADS=${ufi_nw}" --other-flags " --all-wafers --run-type fine_interp --run-str-in ${ufine_in} --verbose --max-skips ${ufine_maxskips} --max-crops ${umaxcrops} --nprocesses ${np} --nblocks ${ufi_nblksx} ${ufi_nblksy} --nworkers ${ufi_nw} " --iterate-ranges 0 ${ufi_nblksx} 0 ${ufi_nblksy} 0 ${np}
+
+# ultrafine reslice
+kx=
+#kx=--keep-xcorrs
+# init
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str ufine-reslice-init --set-env "MSEM_NUM_THREADS=4" --other-flags " --all-wafers --run-type fine_reslice --run-str-in ${ufine_in} --run-str-out-fine ${ufine_out} --verbose --max-skips ${ufine_maxskips} --max-crops ${umaxcrops} --nworkers ${ufre_nw} --nprocesses ${ufre_np} ${kx} --block-overlap-um ${ufre_bovlp} --nblocks -${ufre_nblksx} -${ufre_nblksy} " --iterate-ranges 0 ${ufre_np}
+# reslice
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iprocess --id-str ufine-reslice --set-env "MSEM_NUM_THREADS=4" --other-flags " --all-wafers --run-type fine_reslice --run-str-in ${ufine_in} --run-str-out-fine ${ufine_out} --verbose --max-skips ${ufine_maxskips} --max-crops ${umaxcrops} --zero-blur --nprocesses ${ufre_np} ${kx} --block-overlap-um ${ufre_bovlp} --nblocks ${ufre_nblksx} ${ufre_nblksy} " --iterate-ranges 0 ${ufre_np}
+
+# ultrafine reconcile
+# NOTE: MSEM_UUID is not necessary for block parallelization (but is for process parallelization)
+# two nprocesses is for support of the reslice load (second one).
+# DO NOT nprocess parallelize here becaues we are using fine_reslice, which does not suport this (no point).
+np="1 ${ufre_np}"
+create_swarm --run-script run_wafer_aggregator.py --beg-arg iblock iblock --id-str ufine-reconcile --set-env "MSEM_NUM_THREADS=${ufrec_tpw}" --other-flags " --all-wafers --run-type fine --run-str-in ${ufine_in} --run-str-out-fine ${ufine_out} --verbose --max-skips ${ufine_maxskips} --max-crops ${umaxcrops} --nworkers ${ufrec_nw} --nprocesses ${np} --L2_norm ${ufine_l2} --block-overlap-um ${ufre_bovlp} --nblocks ${ufre_nblksx} ${ufre_nblksy} --use-fine-reslice " --iterate-ranges 0 ${ufre_nblksx} 0 ${ufre_nblksy}
+# merge, lightweight but can still take a few mins depending on number of grid points
+create_swarm --run-script run_wafer_aggregator.py --beg-arg wafer_ids --id-str ufine-reconcile_merge --set-env "MSEM_NUM_THREADS=4" --other-flags " --all-wafers --run-type fine --run-str-in ${ufine_in} --run-str-out-fine ${ufine_out} --verbose --max-skips ${ufine_maxskips} --max-crops ${umaxcrops} --nprocesses ${np} --merge --block-overlap-um ${ufre_bovlp} --nblocks ${ufre_nblksx} ${ufre_nblksy} " --iterate-ranges 1 2
+
+# ultrafine export
+rh5=--use-coordinate-based-xforms
+# init
+create_swarm --all-wafers --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str ufine_export_init --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type fine_export --no-rough-alignment --fine-run-str ${ufine_out} ${rh5} --nblocks -${eufine_nblksx} -${eufine_nblksy} --block-overlap-um ${eufine_bovlp} --crop-to-grid --export-h5 --dsexports 1 ${native} ${dstack} "
+# export
+create_swarm --all-wafers --run-script run_wafer.py --beg-arg iblock iblock export-region-beg --end-arg None None export-region-end --iwafer-iter-arg 2 --id-str ufine_export --set-env "MSEM_NUM_THREADS=4" --other-flags " --run-type fine_export --no-rough-alignment --fine-run-str ${ufine_out} ${rh5} --nblocks ${eufine_nblksx} ${eufine_nblksy} --block-overlap-um ${eufine_bovlp} --block-overlap-grid-um ${eufine_govlp} --crop-to-grid --export-h5 --dsexports 1 ${native} ${dstack} " --iterate-ranges 0 ${eufine_nblksx} 0 ${eufine_nblksy}
+
+# export downsampled tiffs
+create_swarm --all-wafers --run-script run_wafer.py --beg-arg export-region-beg --end-arg export-region-end --id-str ufine_export_tiffs --set-env "MSEM_NUM_THREADS=2" --other-flags " --run-type fine_export --no-rough-alignment --fine-run-str ${ufine_out} --dsexports ${dsthumbs} --convert-h5-to-tiff "
 
 fi

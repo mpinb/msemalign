@@ -476,6 +476,18 @@ if deltas_plot:
     make_param_plot(load_dict, delta_stat_ctr, ylabel='deltas mean mag', dimstrs=['mag'], figno=8)
     if save_plots: plt.gcf().savefig(os.path.join(outdir,'deltas_ctr_ordered.png'))
 
+    step = 1/16; bins = np.arange(0,1000,step); cbins = bins[:-1] + step/2
+    hist,bins = np.histogram(np.sqrt((load_dict['cum_deltas']**2).sum(2)), bins)
+    plt.figure(9876)
+    plt.plot(cbins/meta_dict['scale_um_to_pix'], hist/hist.sum())
+    #plt.plot(cbins, np.log10(hist/hist.sum()))
+    #plt.plot(cbins, np.log10(np.cumsum(hist)/hist.sum()))
+    # for generating histogram of all deltas.
+    # dump a dill file to be used to generate plots.
+    dill_fn = 'cum_deltas_histos-ufine.dill'
+    d = {'hist':hist, 'cbins':cbins, 'deltas_shape':load_dict['cum_deltas'].shape}
+    with open(dill_fn, 'wb') as f: dill.dump(d, f)
+
     if not save_plots: plt.show()
 
 if fine_outliers_plot:
@@ -569,7 +581,7 @@ if fine_outliers_plot:
         if save_plots: plt.gcf().savefig(os.path.join(outdir,'noutliers_crop{}_diff.png').format(c))
 
     # plot of mean percent outliers with moving average removed
-    cutoff = 0.1
+    cutoff = 0.05
     #sum_crops_percent_inliers_mean_nbrs = percent_inliers_mean_nbrs.sum(1) # why sum over crops?
     sum_crops_percent_inliers_mean_nbrs = percent_inliers_mean_nbrs[:,-1]
     ma = nd.uniform_filter1d(sum_crops_percent_inliers_mean_nbrs, 21, axis=0)
@@ -647,6 +659,7 @@ if fine_xcorrs_plot:
     if nlbls > 0:
         sizes = np.bincount(np.ravel(labels))[1:] # component sizes
         rmv = np.nonzero(sizes < 2)[0] + 1
+        #rmv = np.nonzero(sizes < 1)[0] + 1
         if rmv.size > 0:
             sel = np.isin(labels, rmv)
             bw[sel] = 0

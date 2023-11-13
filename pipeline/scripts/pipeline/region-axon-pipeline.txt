@@ -1,11 +1,11 @@
 #name       deps        swarm                                part           nproc   ngpu  time pack mroll
-# xxx - iexport (h5 init) step needs to limit maxrunning to below 2000
-iexport     ,           run_regions-export-init              p.axon/p.gpu   20/10   0/0   0/0   0   0
-export      iexport     run_regions-export                   p.axon         40      0     0     1   5000
+iexport     ,           run_regions-export-init              p.axon/p.gpu   20/10   0/0   0/0   0     0
+#export      iexport     run_regions-export                   p.axon/p.gpu   8/4     0/0   0/0   0     0
+export      iexport     run_regions-export                   p.axon         30      0     0     1   5010
 # for initial masks from tissue detection
-#masks       export      run_regions-save_masks               p.axon/p.gpu   40/20   0/0   0/0   0   0
+masks       export      run_regions-save_masks               p.axon/p.gpu   40/20   0/0   0/0   0   0
 # for masks edited after microscope alignment
-masks       export      run_wafer-rough_export_save_masks    p.axon/p.gpu   20/10   0/0   0/0   0   0
+#masks       export      run_wafer-rough_export_save_masks    p.axon/p.gpu   20/10   0/0   0/0   0   0
 histos      masks       run_regions-histos                   p.axon/p.gpu   4/4     0/0   0/0   0   0
 widths      histos      plot_regions-histo-width             p.axon/p.gpu   4/4     0/0   0/0   0   0
 # need to choose template(s) at this point

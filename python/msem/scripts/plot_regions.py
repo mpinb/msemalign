@@ -303,6 +303,15 @@ for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
                 md_cdf = np.empty((nregions,2), dtype=np.double); md_cdf.fill(np.nan)
                 md_strs = [None]*nregions
 
+                if wafer_ind == 0:
+                    rh_step = 1/16; rh_bins = np.arange(0,320,rh_step); rh_cbins = rh_bins[:-1] + rh_step/2
+                    rh_cbins = rh_bins[:-1] + (rh_bins[1]-rh_bins[0])/2
+                    rh_counts = np.zeros((rh_cbins.size,2), dtype=np.int64)
+                    rho_counts = np.zeros((rh_cbins.size,2), dtype=np.int64)
+                    rh_mag_counts = np.zeros((rh_cbins.size,), dtype=np.int64)
+                    rho_mag_counts = np.zeros((rh_cbins.size,), dtype=np.int64)
+                    residual_region_cnt = residual_mfov_cnt = residual_inlier_cnt = residual_outlier_cnt = 0
+
             if residuals_plot or median_diff_plot:
                 with open(slice_alignment_dill_fn, 'rb') as f: d = dill.load(f)
 
@@ -711,6 +720,42 @@ for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
                                             (md_ctr - np.nonzero(hist[::-1] > cutoff)[0][0])*md_step])
                         md_cdf[i,1] = hist[md_hist_sely].sum() / hist.sum()
                         md_strs[i] = prefix
+
+                        mfov_ids = [x+1 for x in cregion.mfov_ids]
+                        for mfov_id in cregion.mfov_ids:
+                            mfov_ind = mfov_id-1
+
+                            # individual mfov residuals
+                            residuals = d['mfov_residuals'][mfov_ind]
+                            #residuals_xy = d['mfov_residuals_xy'][mfov_ind]
+                            residuals_triu = d['mfov_residuals_triu'][mfov_ind]
+                            # select comparisons only in one direction
+                            residuals = residuals[residuals_triu,:]
+                            #residuals_xy = residuals_xy[residuals_triu,:]
+                            #residuals_xy -= residuals_xy.mean(0)
+
+                            residuals_orig = d['mfov_residuals_orig'][mfov_ind]
+                            residuals_orig = residuals_orig[residuals_triu,:]
+
+                            isel=(residuals == residuals_orig).all(1)
+                            osel=(residuals != residuals_orig).any(1)
+                            hist,bins = np.histogram(residuals[isel,0], rh_bins); rh_counts[:,0] += hist
+                            hist,bins = np.histogram(residuals[isel,1], rh_bins); rh_counts[:,1] += hist
+                            #hist,bins = np.histogram(residuals_orig[osel,0], rh_bins); rho_counts[:,0] += hist
+                            #hist,bins = np.histogram(residuals_orig[osel,1], rh_bins); rho_counts[:,1] += hist
+                            hist,bins = np.histogram(residuals[osel,0], rh_bins); rho_counts[:,0] += hist
+                            hist,bins = np.histogram(residuals[osel,1], rh_bins); rho_counts[:,1] += hist
+                            tmp = np.sqrt((residuals[isel,:]**2).sum(1))
+                            hist,bins = np.histogram(tmp, rh_bins); rh_mag_counts += hist
+                            tmp = np.sqrt((residuals[osel,:]**2).sum(1))
+                            hist,bins = np.histogram(tmp, rh_bins); rho_mag_counts += hist
+
+                            residual_inlier_cnt += isel.sum()
+                            residual_outlier_cnt += osel.sum()
+                            residual_mfov_cnt += 1
+                        #for mfov_id in cregion.mfov_ids:
+                        residual_region_cnt += 1
+
                 #if d['mfov_deltas'] is not None:
 
                 if not save_plots and residuals_plot: plt.show()
@@ -816,6 +861,36 @@ for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
     #if histo_width_plot:
 
 #for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
+
+if median_diff_plot:
+    # for generating histograms of all 2D stitching residuals.
+    # the iteration over all regions is somewhat slow, so dump a dill file instead to be used to generate plots.
+    #plt.figure(9876)
+    #plt.plot(rh_cbins, rh_counts[:,0]/rh_counts[:,0].sum())
+    #plt.plot(rh_cbins, rh_counts[:,1]/rh_counts[:,1].sum())
+    #plt.plot(rh_cbins, rho_counts[:,0]/rho_counts[:,0].sum())
+    #plt.plot(rh_cbins, rho_counts[:,1]/rho_counts[:,1].sum())
+    #plt.plot(rh_cbins, rh_mag_counts/rh_mag_counts.sum())
+    #plt.plot(rh_cbins, rho_mag_counts/rho_mag_counts.sum())
+    #plt.gca().set_xlabel('residual')
+    #plt.gca().set_ylabel('pdf')
+    #plt.gca().legend(['inlier x', 'inlier y', 'outlier x', 'outlier y', 'inlier mag', 'outlier mag'])
+    #ccbins = rh_cbins * 16
+    #plt.figure(9877)
+    #plt.plot(ccbins, rh_mag_counts/rh_mag_counts.sum())
+    #plt.plot(ccbins, rho_mag_counts/rho_mag_counts.sum())
+    #plt.figure(9878)
+    #plt.plot(rh_cbins, np.log10(rh_counts[:,0]/rh_counts[:,0].sum()))
+    #plt.plot(rh_cbins, np.log10(rh_counts[:,1]/rh_counts[:,1].sum()))
+    #plt.plot(rh_cbins, np.log10(rho_counts[:,0]/rho_counts[:,0].sum()))
+    #plt.plot(rh_cbins, np.log10(rho_counts[:,1]/rho_counts[:,1].sum()))
+    #plt.show()
+    dill_fn = 'residual_histos-2D_stitching.dill'
+    d = {'rh_cbins':rh_cbins, 'rh_counts':rh_counts, 'rho_counts':rho_counts, 'rh_mag_counts':rh_mag_counts,
+         'rho_mag_counts':rho_mag_counts, 'residual_region_cnt':residual_region_cnt,
+         'residual_mfov_cnt':residual_mfov_cnt, 'residual_inlier_cnt':residual_inlier_cnt,
+         'residual_outlier_cnt':residual_outlier_cnt,}
+    with open(dill_fn, 'wb') as f: dill.dump(d, f)
 
 if brightness_plot:
     make_param_plot(adjusts, wafers_nimgs)

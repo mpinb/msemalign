@@ -728,6 +728,9 @@ def template_match_rotate_images(templates, imgs, rotation_step, rotation_range,
             else: # if use_fft == FFT_types.rcc_xcorr:
                 ctx_managers = create_scipy_fft_context_manager(use_gpu, use_fft, use_fft_backend,
                         _template_match_nthreads)
+                # xxx - setting the threads at least for mkl broke, was working, after some updates broken
+                #   it will use all the cores on the node if packing. it will only use the cores allocated
+                #   if not packing. this is the only workaround for now.
                 with ExitStack() as stack:
                     for mgr in ctx_managers: stack.enter_context(mgr)
 

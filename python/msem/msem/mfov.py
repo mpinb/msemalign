@@ -1,6 +1,6 @@
 """mfov.py
 
-Class representation and alignment / stitching procedure for single Zeiss 
+Class representation and alignment / stitching procedure for single Zeiss
   multi-SEM fields of view (MFoVs).
 
 Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior

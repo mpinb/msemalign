@@ -119,6 +119,10 @@ parser.add_argument('--tissue-masks', dest='tissue_masks', action='store_true',
                     help='use the tissue masks')
 parser.add_argument('--save-masks-in', nargs=1, type=str, default=[''],
                     help='input path for the tissue masks')
+parser.add_argument('--control-points', dest='control_points', action='store_true',
+                    help='transform any stored control points (tear stitching)')
+parser.add_argument('--inv-control-points', dest='inv_control_points', action='store_true',
+                    help='inverse transform stored transformed control points (tear stitching)')
 parser.add_argument('--use-coordinate-based-xforms', dest='use_coordinate_based_xforms', action='store_true',
                     help='use coordinate xforms instead of image xforms when loading regions')
 parser.add_argument('--crop-to-grid', dest='crop_to_grid', action='store_true',
@@ -289,6 +293,12 @@ tissue_masks = args['tissue_masks']
 # arguments for saving downsampled masks into the region hdf5 files.
 # this is for processing masks that have been saved in some alignment step after the regions.
 save_masks_in = args['save_masks_in'][0]
+
+# specify to transform any control points stored along with the regions.
+control_points = args['control_points']
+
+# specify to inverse transform any transformed control points stored along with the regions.
+inv_control_points = args['inv_control_points']
 
 # this enables the new mode that allows for full block processing of the rough alignment.
 # all the transformations are then based on the coordinates. the image transformation is
@@ -471,7 +481,8 @@ roi_polygon_translations = np.concatenate([np.array(roi_polygon_translations[x])
     for x in wafer_ids], axis=0)
 
 # whether there are fixed tear saved regions for this dataset / wafer
-wafer_tears = (torn_regions is not None and len(torn_regions[wafer_ids[0]]) > 0)
+_wafer_tears = (torn_regions is not None and len(torn_regions[wafer_ids[0]]) > 0)
+wafer_tears = (_wafer_tears and not control_points and not inv_control_points)
 
 # xxx - this block is a particular !@^# show
 load_stitched_coords = True
@@ -882,7 +893,8 @@ if rough_export_run:
             do_overlays=_do_overlays, crop_to_grid=_crop_to_grid, zero_outside_grid=_zero_outside,
             save_roi_points=_save_roi_points, start=export_region_beg, stop=export_region_end,
             order_name_str=order_name_str, tissue_masks=tissue_masks, is_excluded=is_excluded,
-            save_masks_in=save_masks_in, verbose_load=native)
+            save_masks_in=save_masks_in, xform_control_points=control_points,
+            inv_xform_control_points=inv_control_points, verbose_load=native)
 
 # load the previous fine alignment results for exporting aligned tiffs
 if fine_export_run and not init_locks:

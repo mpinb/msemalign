@@ -1,24 +1,24 @@
 #name       deps        swarm                                  part           nproc   ngpu  time pack mroll
-thumbs      ,           run_wafer-rough_export_thumbnails      p.axon/p.gpu   20/20   0/0   0/0   0    0
-keypoints   thumbs      run_wafer_solver-keypoints             p.axon/p.gpu   1/1     0/0   0/0   0    0
+thumbs      ,           run_wafer-rough_export_thumbnails      p.axon/p.gpu   20/10   0/0   0/0   0    0
+keypoints   thumbs      run_wafer_solver-keypoints             p.axon         1       0     0     1    0
 
-affines0    keypoints   run_wafer_solver-affines_skip0         p.gpu          5       1     0     0    0 #ds4
-#affines0    keypoints   run_wafer_solver-affines_skip0         p.gpu          6       1     0     0    0 #ds8
+affines0    keypoints   run_wafer_solver-affines_skip0         p.gpu          5       1     0     1    0 #ds4
+#affines0    keypoints   run_wafer_solver-affines_skip0         p.gpu          6       1     0     1    0 #ds8
 maffines0   affines0    run_wafer_solver-merge_affines_skip0   p.axon/p.gpu   8/8     0/0   0/0   0    0
 writeseq0   maffines0   run_wafer_aggregator-status_skip0      p.axon/p.gpu   8/8     0/0   0/0   0    0
-oexport     ,           run_wafer-rough_export_order           p.axon/p.gpu   20/20   0/0   0/0   0    0
-moexport    ,           run_wafer-rough_export_order_masks     p.axon/p.gpu   20/20   0/0   0/0   0    0
+oexport     ,           run_wafer-rough_export_order           p.axon/p.gpu   20/10   0/0   0/0   0    0
+moexport    ,           run_wafer-rough_export_order_masks     p.axon/p.gpu   20/10   0/0   0/0   0    0
 
-affines     keypoints   run_wafer_solver-affines_all_skips     p.gpu          5       1     0     0    0 #ds4
-#affines     keypoints   run_wafer_solver-affines_all_skips     p.gpu          6       1     0     0    0 #ds8
+affines     keypoints   run_wafer_solver-affines_all_skips     p.gpu          5       1     0     1    0 #ds4
+#affines     keypoints   run_wafer_solver-affines_all_skips     p.gpu          6       1     0     1    0 #ds8
 maffines    affines     run_wafer_solver-merge_affines_skips   p.axon/p.gpu   8/8     0/0   0/0   0    0
 writeseq    maffines    run_wafer_aggregator-status            p.axon/p.gpu   8/8     0/0   0/0   0    0
-xaffines    maffines    run_wafer_solver-affines_xwafer        p.gpu          5       1     0     0    0 #ds4
-#xaffines    maffines    run_wafer_solver-affines_xwafer        p.gpu          6       1     0     0    0 #ds8
+xaffines    maffines    run_wafer_solver-affines_xwafer        p.gpu          5       1     0     1    0 #ds4
+#xaffines    maffines    run_wafer_solver-affines_xwafer        p.gpu          6       1     0     1    0 #ds8
 recon       xaffines    run_wafer_aggregator-rough             p.axon/p.gpu   1/1     0/0   0/0   0    0
 mrecon      recon       run_wafer_aggregator-rough-merge       p.axon/p.gpu   1/1     0/0   0/0   0    0
-export      mrecon      run_wafer-rough_export                 p.axon/p.gpu   20/20   0/0   0/0   0    0
+export      mrecon      run_wafer-rough_export                 p.axon/p.gpu   20/10   0/0   0/0   0    0
 # this is for the inputs to the fine alignment (without coords-based xforms)
-#h5export    mrecon      run_wafer-rough_h5_export              p.axon/p.gpu   20/20   0/0   0/0   0    0
+#h5export    mrecon      run_wafer-rough_h5_export              p.axon/p.gpu   20/10   0/0   0/0   0    0
 # this is for h5 outputs that can be cubed
-exporth5    mrecon      run_wafer-rough_export_h5              p.axon/p.gpu   20/20   0/0   0/0   0    0
+exporth5    mrecon      run_wafer-rough_export_h5              p.axon/p.gpu   20/10   0/0   0/0   0    0

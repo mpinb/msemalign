@@ -9,7 +9,7 @@
 #   on the experimental side, they are promising for better validation during acquisition.
 # xxx - seperate further into sections of "probably need to adjust" knobs, vs relatively static knobs
 #   (file name format strings for example are relatively static).
-print('def_common_params: 2019 ZF_retina - 3 wafers')
+print('def_common_params: 2019 ZF_retina - ultrafine alignment')
 
 import os
 import sys
@@ -18,7 +18,7 @@ import numpy as np
 # <<< hacky method for common function definitions for def_common_params
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir)))
 from def_common_params_common import cget_paths, csave_region_strs_to_meta, cload_region_strs_from_meta
-from def_common_params_common import init_region_info, cglob_regions_exclude, cimport_exclude_regions
+from def_common_params_common import init_region_info
 def get_paths(wafer_id):
     return cget_paths(wafer_id, root_raw, root_align, root_thumb, raw_folders_all, align_folders_all, region_strs_all,
             experiment_subfolder, index_protocol_folders, proc_subdirs, meta_subdirs)
@@ -27,20 +27,15 @@ def save_region_strs_to_meta(wafer_id):
         reimage_beg_inds, fullres_dir, manifest_suffixes)
 def load_region_strs_from_meta(wafer_id, fn=None):
     return cload_region_strs_from_meta(wafer_id, fn)
-def glob_regions_exclude(wafer_id, inds, exclude_inds):
-    return cglob_regions_exclude(wafer_id, inds, exclude_inds, root_raw, raw_folders_all, experiment_subfolder)
-def import_exclude_regions():
-    return cimport_exclude_regions(exclude_txt_fn_str, all_wafer_ids,
-        root_align, experiment_subfolder, align_folders_all)
 # hacky method for common function definitions for def_common_params >>>
 
 # <<< path and filename parameters
 
 # root directories, change depending on run location
-root_raw = '/axon/axon_fs/cne-mSEM-data'
-root_thumb = '/axon/scratch/pwatkins/mSEM-data-thumbnails/ds4'
-root_align = '/axon/scratch/pwatkins/mSEM-proc'
-root_czi = root_raw
+root_raw = ''
+root_thumb = ''
+root_align = '/axon/scratch/pwatkins/mSEM-proc/stacks'
+root_czi = ''
 
 # override or specify the voxel resolution
 # for the new image acquisition format, need to specify
@@ -57,24 +52,24 @@ nimages_per_mfov = 91
 #   are to be used in the alignment.
 # NOTE: this means that the logical wafer numbers may not match the experimental wafer numbers.
 # from the viewpoint of this module, wafer_ids always goes from 1 to number of wafers, inclusive.
-total_nwafers = 3 # change this appropriately for each dataset
+total_nwafers = 1 # change this appropriately for each dataset
 all_wafer_ids = range(1,total_nwafers+1) # change at your own risk, may not work if unordered
 
 # set this to true to run alignment based on (legacy) Zeiss Zen acquistion.
 # False is for the new custom msem acquisition software.
-legacy_zen_format = True
+legacy_zen_format = False
 
 # common shared experimental directory subfolder
-experiment_subfolder = '2019/briggman/2019-10-17-ZF_retinaa_test'
+experiment_subfolder = '2019-10-17-ZF_retinaa_test-UF'
 
 # store the processed images into single folder per wafer
 # NOTE: these are for the processed images, so makes more sense for them to be in numerical order.
 #   name could really be anything for each one tho, just defines top level directory for the processed images.
 # index 0 defines meta folder, shared alignment folder for all wafers
-align_folders_all = ['meta'] + ["wafer{:02d}".format(x) for x in range(1,total_nwafers+1)]
+align_folders_all = ['meta'] + ['fine-icrop0-l2_0._ds1']
 
 # defined folders underneath of shared folder
-meta_subdirs = ['debug_plots', 'debug_plots/sift', 'order_plots', 'region_plots']
+meta_subdirs = ['debug_plots', 'order_plots', 'region_plots']
 
 # for easier import if module is only using the alignment (or meta) folders
 alignment_folders = [os.path.join(root_align, experiment_subfolder, x) for x in align_folders_all]
@@ -95,18 +90,7 @@ noblend_subfolder = 'noblend'
 
 # regions for a single wafer can be stored in multiple experimental folders (yay!)
 # these lists are indexed by wafer id, not wafer index
-raw_folders_all = [
-        None, # index 0 (zeiss does not define a wafer 0, placeholder)
-        ['ZF-retina-test-ribbon_20191017_12-27-02',                  # wafer 3 part 1
-         'ZF-retina-test-ribbon_20191017_22-33-07',                  # wafer 3 part 2
-         'ZF-retina-test-ribbon_20191030_17-31-25',],                # wafer 3 reimage
-        ['ribbon1/2019-10-20-ZF-test-ribbon1_20191021_02-24-13',     # wafer 1
-         'ribbon1/2019-10-20-ZF-test-ribbon1_20191022_23-35-03',],   # wafer 1 reimage
-        ['ribbon2/2019-10-18-ZF_test_ribbon2_20191018_18-20-37',     # wafer 2
-         'ribbon2/2019-10-18-ZF_test_ribbon2_20191019_10-31-11',     # wafer 2 reimage 1
-         'ribbon2/2019-10-18-ZF_test_ribbon2_20191019_10-37-04',],   # wafer 2 reimage 2
-        ]
-
+raw_folders_all = [None] + [[] for x in range(total_nwafers)]
 # NOTE: this array is not necessary at all for the new acquisition format.
 # this is a workaround for what is most likely a Zeiss bug. if an error occurs on the first slice imaged
 #   in an experiment folder, then the ICS2Stage matrix is not saved at all for that experimental folder.
@@ -115,13 +99,7 @@ raw_folders_all = [
 #   the same and the one from another "part" can be loaded.
 # this array indicates which experimental folder to load the protocol.txt from to find the ICS2Stage matrix.
 #   default of -1 means from the same experimental folder. array is parallel to raw_folders_all
-#index_protocol_folders = [None] + [[-1 for x in range(len(raw_folders_all[y]))] for y in range(1,total_nwafers+1)]
-index_protocol_folders = [
-        None,
-        [-1, 0, -1,],   # wafer 3
-        [-1, -1,],      # wafer 1
-        [-1, -1, -1,],  # wafer 2
-        ]
+index_protocol_folders = [None] + [[-1 for x in range(len(raw_folders_all[y]))] for y in range(1,total_nwafers+1)]
 
 # use the fullres directory to determine if this is the new acquisition data format
 fullres_dir = 'fullres'
@@ -131,7 +109,7 @@ fullres_dir = 'fullres'
 manifest_suffixes = [None]*(total_nwafers + 1)
 
 # extension used for loading from image stacks
-stack_ext = '.tiff'
+stack_ext = '.h5'
 
 # for the new imaging format, start value (base 1, inclusive) in the imageing order for each round of reimaging.
 # NOTE: indexed by wafer_id (not index)
@@ -147,74 +125,26 @@ proc_subdirs = [
 
 # NOTE: czifiles are not used in the new acquisition format.
 # index czifiles by wafer_id
-czipath = os.path.join(root_czi, experiment_subfolder)
-czifiles = [
-    None, # index 0 (typically there is no wafer 0, placeholder)
-    'limi-overview-ribbon1a-with-roi.czi',
-    'limi-overview-ribbon3-with-roi.czi',
-    'limi-overview-ribbon2-with-roi.czi',
-    ]
-czfiles = [
-    None, # index 0 (typically there is no wafer 0, placeholder)
-    'ZF_Retina_test_RIBBON1_ROIs.cz',
-    'ZF_Retina_test_RIBBON3_ROIs.cz',
-    'ZF_Retina_test_RIBBON2_ROIs.cz',
-    ]
-
-# need to "manually" define the region manifest for the legacy Zen acqisition format
-def generate_manifest():
-    # number of regions per wafer: [739, 959, 894] = 2592 slices
-    _region_strs_all = [
-        None, # index 0 (zeiss does not define a wafer 0, placeholder)
-        # wafer 3 slice 526 was imaged twice and the other overlaps are only reimages,
-        #   so only exclude part 1 from part 2 (and not part 2 from part 1).
-        #[['S%dR%d' % (x,x) for x in _glob_regions_exclude(3,[0],[1,2])], # wafer 3 part 1
-        [['S%dR%d' % (x,x) for x in glob_regions_exclude(1,[0],[2])], # wafer 3 part 1
-         ['S%dR%d' % (x,x) for x in glob_regions_exclude(1,[1],[0,2])], # wafer 3 part 2
-        ## to also use the duplicate of 526 (compare manually after regions aligned)
-        #['S%dR%d' % (x,x) for x in _glob_regions_exclude(3,[1],[2])], # wafer 3 part 2
-        ['S314R314', 'S511R511', 'S732R732']], # wafer 3 reimage
-        [['S%dR%d' % (x,x) for x in range(1,960) if x not in [952,958]], # wafer 1
-         ['S952R952', 'S958R958',]], # wafer 1 reimage
-        [['S%dR%d' % (x,x) for x in range(1,895) if x not in [125,556,858]], # wafer 2
-         ['S125R125', 'S858R858',], # wafer 2 reimage 1
-         ['S556R556',]], # wafer 2 reimage 2
-    ]
-    return _region_strs_all
-
-# region order and exclude strings for filesnames, needed for importing excludes
-order_txt_fn_str = os.path.join('rough_alignment', 'wafer{:02d}_region_solved_order.txt')
-exclude_txt_fn_str = os.path.join('rough_alignment', 'wafer{:02d}_region_excludes.txt')
+czipath = os.path.join(root_czi, experiment_subfolder, 'limi-overview')
+# use None if not using czifiles (also czfiles)
+czifiles = [None]*(total_nwafers + 1)
+czfiles = [None]*(total_nwafers + 1)
 
 # this is to specify regions to exclude completely from the alignment.
 # NOTE: indexed by wafer_id (not index)
 # NOTE: with the new region_str system, these are 1-based region indices, NOT slice numbers
 #exclude_regions = None # for not excluding any additional regions
 exclude_regions = [[] for x in range(total_nwafers+1)]
-# original (previous alignment)
-#exclude_regions = [[], # no wafer 0, leave blank
-#                   [373,528,538,546,], # wafer 3
-#                   [47,171,671,950,], # wafer 1
-#                   [1,80,553,557,581,759,888,889,892,893,], # wafer 2
-#                  ]
-# new re-ordering after initial bad matches removed
-#exclude_regions = [[], # no wafer 0, leave blank
-#                   [ 528, 630,], # wafer 1
-#                   [  47, 941, 950,], # wafer 2
-#                   [  14,  80, 201, 581, 880, 886,], # wafer 3
-#                  ]
-# NOTE: for the "re-ordering" test, all of the initial excludes were sucessfully inserted
-# for the order solver sensitivity test, and for the manually edited re-ordering
-exclude_regions = import_exclude_regions()
 
 region_strs_all = [None]*(total_nwafers + 1)
 region_rotations_all = [None]*(total_nwafers + 1)
 region_reimage_index = [None]*(total_nwafers + 1)
 region_manifest_cnts = [None]*(total_nwafers + 1)
 region_include_cnts = [None]*(total_nwafers + 1)
-init_region_info(all_wafer_ids, root_raw, get_paths, raw_folders_all, alignment_folders, legacy_zen_format,
-    reimage_beg_inds, fullres_dir, manifest_suffixes, stack_ext, region_strs_all, region_rotations_all,
-    region_reimage_index, region_manifest_cnts, region_include_cnts, exclude_regions, generate_manifest)
+init_region_info(all_wafer_ids, root_raw, get_paths, raw_folders_all, alignment_folders,
+    legacy_zen_format, reimage_beg_inds, fullres_dir, manifest_suffixes, stack_ext,
+    region_strs_all, region_rotations_all, region_reimage_index, region_manifest_cnts,
+    region_include_cnts, exclude_regions)
 
 # path and filename parameters >>>
 
@@ -224,17 +154,17 @@ init_region_info(all_wafer_ids, root_raw, get_paths, raw_folders_all, alignment_
 # NOTE: czifiles are not used for the new acquisition format.
 
 # different for different datasets whether scenes or ribbons were used, both indexed by wafer_id
-czifile_scenes = [0, 3, 1, 2]
+czifile_scenes = [0] + [1]*total_nwafers # all scene 1, default or if using czfiles
 # which ribbon to load from the czifile, index by wafer_id, use zeros if ribbons not used
 czifile_ribbons = [0]*(total_nwafers + 1) # no ribbons used in this dataset
 
+# NOTE: these are still used in the new acquisition format.
+#   they are applied on top of the ROI rotations / centroid.
 # base rotation to add to the czifile rotations.
 # defined per wafer because the template from the section mapper can change between wafers.
-#czifile_rotations = [None] + [0.]*total_nwafers
-czifile_rotations = [None, -11.14, 0., 13.28]
+czifile_rotations = [None] + [0.]*total_nwafers
 # base translation to add to the translation defined by centering the roi polygon, per wafer.
-#roi_polygon_translations = [None] + [[0.,0.]]*total_nwafers
-roi_polygon_translations = [None, [-725.,235.], [0.,0.], [580.,150.]]
+roi_polygon_translations = [None] + [[0.,0.]]*total_nwafers
 
 # use the polygons from the czifile instead of the ROIs.
 # this should almost always be False, except for compatibility with some datasets
@@ -252,22 +182,24 @@ dsstep = 1
 
 # this loads the zeiss thumbnails as the images to use instead of the full-resolution images.
 # specify here what the downsampling factor of the thumbnails is.
+# for image / h5 stacks use this for the downsampling level of the input that the UF is run at.
+#   this allows the same native hooks to easily be used when exporting the UF at the original resolution.
 #use_thumbnails_ds = 0 # to load the native resolution (do not use thumbnails)
 use_thumbnails_ds = 4
 
 # amount to downsample for exporting thumbnails used by the solver (order and rough alignment).
 # this is the downsampling (on top of the downsampling used for the alignment) for the SIFT points,
 #   i.e. for the order solving and rough alignment.
-dsthumbnail = 4
+dsthumbnail = 1
 
 # this suffix is used by wafer for the montaged region ending and ext
 #   and also by wafer_solver for the downsampled solver image inputs.
-thumbnail_suffix = '_stitched_grid_thumbnail.tiff'
+thumbnail_suffix = '.h5'
 
 # series of fine alignemnt croppings to use. the purpose is to start at small crop values and run larger ones
 #   only for points that were identified as outliers by wafer_aggregator.
 # this is an optimization that should save considerable compute time.
-crops_um = [[32., 32.],]
+crops_um = [[12.8, 12.8], ]
 
 # for the fine alignment, specify slice index transitions at which to apply the blurring method
 slice_blur_z_indices = [] # to disable
@@ -293,7 +225,7 @@ wafer_region_prefix_str = 'wafer{:02d}_{}'
 slice_balance_fn_str = 'wafer{:02d}_region_brightness.txt'
 
 # suffix to use for saving / loading the montaged region images
-region_suffix = '_stitched'
+region_suffix = ''
 
 # set cutoff for discarding deltas that are out of expected range, specify in nm relative to "tiled" deltas.
 # there are two delta cutoffs, for horizontal adjacencies and for vertical/diagonal adjacencies (inner arrays).
@@ -416,8 +348,8 @@ brightness_balancing_degree = 2
 # this is overriden if brightness_balancing_chunksize is not None
 brightness_balancing_nchunks = 1
 # set chunksize to calculate nchunks instead based on desired chunksize
-brightness_balancing_chunksize = None # to disable
-#brightness_balancing_chunksize = 5000
+#brightness_balancing_chunksize = None # to disable
+brightness_balancing_chunksize = 5000
 
 # for mode brightness_balance_slices_whole how many neighboring slices in the solved order to use (before and after).
 # specify 1 or less to use the old mode that does all pairwise comparisons.
@@ -455,22 +387,17 @@ blending_mode_feathering_dist_um = 3.072
 
 # approximate min overlap distance between tiles (in feathering def_blending_mode only), specify seperately for x/y
 # NOTE: in practice this seems best set 1-2x the actual overlap, depending on the dataset.
-# max overlap um 0.428052 0.510812 for ZF retina test
-blending_mode_feathering_min_overlap_dist_um = [0.528, 0.624]
+#0.419644 0.445244 actual max overlap for ZF Hindges
+blending_mode_feathering_min_overlap_dist_um = [0.528, 0.560]
 
 # another method for fixing tears is to try to do it with the slices individually,
 #   so that they are fixed in the region images before the rough alignment.
 # NOTE: indexed by wafer_id (not index)
 # NOTE: with the new region_str system, these are 1-based region indices, NOT slice numbers
-#torn_regions = None # to disable tear fixing in individual slices / regions
-torn_regions = [[], # no wafer 0, leave blank
-    [], # wafer 1
-    [231,], # wafer 2
-    [709,], # wafer 3
-    ]
+torn_regions = None # to disable tear fixing in individual slices / regions
 
 # downsampling level of the tear annotation relative to the regions
-tear_annotation_ds = 8
+tear_annotation_ds = 16
 
 # grid density to use for correspondence points (um), beyond this (pixel dense) uses griddata
 tear_grid_density = 0.512
@@ -484,24 +411,25 @@ tear_grid_density = 0.512
 # filled in below to make actual filenames using wafer_id(s)
 delta_dill_fn_str = os.path.join('alignment', '{}', 'wafer{:02d}_region_iorder{:05d}.dill')
 limi_dill_fn_str = os.path.join('rough_alignment', 'wafer{:02d}_limi_info.dill')
+order_txt_fn_str = os.path.join('rough_alignment', 'wafer{:02d}_region_solved_order.txt')
 
 # how the beginning part of the wafer string is formatted. used in most output filenames.
 wafer_format_str = 'wafer{:02d}_'
 
 # optionally translates the loaded region images so that they are centered on their zeiss roi polygon.
 # for "newer" datasets where polygons were NOT done manually, recommend True.
-translate_roi_center = True
+translate_roi_center = False
 
 # degree range about the starting rotation for delta template match
 #delta_rotation_range = [0.,0.] # to disable the fine delta rotations
-delta_rotation_range = [-15.,15.]
+delta_rotation_range = [-5.,5.]
 
 # degree steps for delta template match
-delta_rotation_step = 3
+delta_rotation_step = 5
 
 # amount to crop in microns to use as the template for slice to slice template matching.
 # this number can not be too large (not above maybe 20 um?) because shear/scale causes bad fits for large areas.
-template_crop_um=[4.8,4.8]
+template_crop_um=[3.2,3.2]
 
 # this is a method that prevents having to customize grid points for an roi shape, and more particularly
 #   allows different shaped rois for the same experiment.
@@ -511,19 +439,18 @@ roi_polygon_scale = 1.1 # used with fine alignment
 
 # these are for the parameters of the hex grid where the max/min specify the rough bounding box.
 # parameters are number of x points, number of y points and point spacing in microns.
-#rough_bounding_box_xy_spc = [18, 22, 25]
-rough_bounding_box_xy_spc = [15, 18, 25]
+rough_bounding_box_xy_spc = [np.array([-172,-173.208]), np.array([172,173.208]), 0]
 
 # these are for the parameters of the hex grid to define the rough alignment grid.
 # parameters are number of x points, number of y points and point spacing in microns.
-#rough_grid_xy_spc = [35, 43, 12.5]
-rough_grid_xy_spc = [29, 35, 12.5]
+# fine grid is 344.0 x 346.4 um
+# x conservative tissue border 16 on left, much larger on right = -32 um
+# y conservative tissue border 23 on top, 33 on bottom, use 23 = -46 um
+rough_grid_xy_spc = [158, 175, 2.]
 
 # these are for the parameters of the hex grid to define the fine alignment grid.
 # parameters are number of x points, number of y points and point spacing in microns.
-#fine_grid_xy_spc = [33, 41, 12]
-#fine_grid_xy_spc = [27, 33, 12]
-fine_grid_xy_spc = [22, 26, 16]
+fine_grid_xy_spc = rough_grid_xy_spc
 
 # these are optional wafer indexed parameters for the rough bounding box
 #   that allow a different rough bounding box are to be exported for the order solving only.
@@ -557,18 +484,12 @@ thumbnail_subfolders_order = [x + '_solve_order' for x in thumbnail_subfolders]
 debug_plots_subfolder = 'debug_plots'
 
 # for importing masks that define the tissue borders in each slice
-tissue_mask_path = None # to disable the tissue mask, also new mode where masks are saved to region hdf5s
-#tissue_mask_fn_str = '' # uses same name as the thumbnail exports
-tissue_mask_fn_str = 'z{:05d}.tif' # if masks were generated from a stack indexed by z
-tissue_mask_ds = 8
-# these are only applied when using the masks (not when saving)
+tissue_mask_path = None # to disable the tissue mask
+tissue_mask_fn_str = '' # uses same name as the thumbnail exports
+tissue_mask_ds = 64
 tissue_mask_min_edge_um = 30
 tissue_mask_min_hole_edge_um = 20
 tissue_mask_bwdist_um = 0
-# for no manipluation
-#tissue_mask_min_edge_um = 0
-#tissue_mask_min_hole_edge_um = 0
-#tissue_mask_bwdist_um = 0
 
 # <<< parameters for image matching
 
@@ -596,9 +517,8 @@ affine_rigid_type = 3 # rigid nonuniform scale
 
 # minimum number of features fit to ransac transform to not reject match.
 # also used as threshold for minimum percent matches during image matching.
-#min_feature_matches = 8 # recommend small value when running matches with ransac
-#min_feature_matches = 12 # recommend slightly larger but still low whilst order solving
-min_feature_matches = 256 # should be higher for the final solved ordering
+#min_feature_matches = 32
+min_feature_matches = 16 # after order solving, some bad jumps in wafer2
 
 # for the thumbnail affine fitting (ransac parameter)
 # IMPORTANT: do NOT use a different value for percent matches with ransac,
@@ -669,7 +589,7 @@ rough_rigid_dill_fn_str = os.path.join('rough_alignment', 'wafer{:02d}_rough_ali
 
 # distance cutoff between rough_alignment_grid points and original solved affine-fitted points,
 #   in order to select which rough_alignment_grid points to use with which to fit reconciled affine.
-rough_distance_cutoff_um = 40
+rough_distance_cutoff_um = 60
 
 # this is the minimum size of the adjacency graph connected compents for the fine solver.
 #   i.e. the mimimum number of non-outlier slices required to not discard the solver component.
@@ -686,7 +606,8 @@ interp_inliers = 5
 
 # for the interpolation, how many nearest neighbors to use when interpolating.
 # this is essentially required for memory / runtime for very large grids.
-interp_inlier_nneighbors = 0 # to disable, use all inliers in the slice to interpolate
+#interp_inlier_nneighbors = 0 # to disable, use all inliers in the slice to interpolate
+interp_inlier_nneighbors = 3169 # hex grid of diameter 65 (so 64 um across in x with 1 um grid spacing)
 
 # apply these relative weightings to the reconcilers that decrease the contribution
 #   of the comparison to the final alignment as a function of distance to the neighbor.
@@ -714,7 +635,9 @@ fine_smoothing_weight = 1. # means 2d smoothing has equal weight as z-comparison
 fine_smoothing_neighbors = [0,0] # how many pairwise neighbors, [center vertex, others]
 
 # a different method for 2D smoothness that uses an "affine-filter" on the deltas.
-fine_filtering_shape_um = [57., 57.] # slightly larger than 4x5 hex arranged grid at 16 spacing
+# mistakenly used huge filter size relative to 12 um spacing on first run
+#fine_filtering_shape_um = [114., 114.] # slightly larger than 8x9 hex arranged grid at 16 spacing
+fine_filtering_shape_um = [61., 61.] # slightly larger than 6x6 hex arranged grid at 12 spacing
 
 # whether to remove the bias from the solver by using linear regression (instead of mean)
 #rough_regression_remove_bias = False # recommend False, not useful for rigid affine, full still overfits
@@ -735,7 +658,7 @@ z_neighbors_radius = [360, 120] # == 721 neighboring slices, about 25 um at 35 n
 outlier_affine_degree = 2
 
 # residual threshold for the ransac affine fit
-fine_residual_threshold_um = 12.
+fine_residual_threshold_um = 1.6
 
 # minimum number of non-outlying or excluded neighbors to keep as inlier
 inlier_min_neighbors = 0 # to disable
@@ -757,17 +680,17 @@ min_percent_inliers_C_cutoff = 0.3
 # any negative value here indicates to search for the closest deltas in the neighborhood,
 #   not just the closest points. this can help at discontinuous points (e.g., big splits in the slices).
 # hexagonal ring diameter [3,5,7,9,11,13] == points [7,19,37,61,91,127]
-ninlier_neighhbors_cmp = [-8, 37]
+ninlier_neighhbors_cmp = [-11, 91]
 
 # zscore to include "outlier deltas" with a lesser weight
 # if value is less than zero it indicates a residual threshold for the residual (vs median nbhd vector).
 #ok_outlier_zscore = 0. # to disable ok outliers, recommended off until final crop
-ok_outlier_zscore = -8.
+ok_outlier_zscore = -0.512
 
 # zscore to do final rejection of some bad inliers, but include in solver with an even lesser weight
 # if value is less than zero it indicates a residual threshold for the residual (vs median nbhd vector).
 #not_ok_inlier_zscore = 0. # to disable final inlier rejection, recommended off until final crop
-not_ok_inlier_zscore = -1.5
+not_ok_inlier_zscore = -0.064
 
 # another option to flag outliers that are within this distance of inliers.
 # this can save compute time in that only these grid points will be rerun at the next crop size.
@@ -782,7 +705,8 @@ fine_nearby_points_um = None # to disable
 
 # the number of nonoverlap block points that must be included in a block to not count the whole
 #   block as an outlier block.
-merge_inliers_blk_cutoff = 0 # to disable
+#merge_inliers_blk_cutoff = 0 # to disable
+merge_inliers_blk_cutoff = 13
 
 # minimum component size for block outliers, removes small clusters that are typically outside of the tissue.
 merge_inliers_min_comp = 0 # to disable
