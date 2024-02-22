@@ -4,9 +4,9 @@
 
 For a high-level introduction, please refer to the following manuscripts: 
 
-[msemalign: A pipeline for serial section multibeam scanning electron microscopy volume alignment](xxx)  
+[msemalign: A pipeline for serial section multibeam scanning electron microscopy volume alignment](https://doi.org/10.3389/fnins.2023.1281098)  
 &nbsp;&nbsp;&nbsp;&nbsp;Describes the 2D and 3D alignment of petabyte-scale ssmSEM datasets  
-[GAUSS-EM: Guided accumulation of ultrathin serial sections with a static magnetic field for volume electron microscopy](xxx)  
+[GAUSS-EM: Guided accumulation of ultrathin serial sections with a static magnetic field for volume electron microscopy](https://doi.org/10.1101/2023.11.13.566828 )  
 &nbsp;&nbsp;&nbsp;&nbsp;Describes the volume sectioning and also the section order solving methodology
 
 ## Installation / Dependencies
