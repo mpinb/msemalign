@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import os
+os.system('date')
+
 """run_wafer_aggregator.py
 
 Top level command-line interface for aggregating the alignments computed
@@ -25,6 +28,7 @@ import os
 import sys
 import argparse
 import time
+os.system('date')
 
 from msem import wafer_aggregator
 from msem.utils import make_hex_points, dill_lock_and_load, dill_lock_and_dump
@@ -34,7 +38,7 @@ from msem.utils import l2_and_delaunay_distance_select, big_img_save
 from def_common_params import get_paths, crops_um, all_wafer_ids, exclude_regions
 from def_common_params import fine_dill_fn_str, delta_dill_fn_str, meta_dill_fn_str
 from def_common_params import rough_dill_fn_str, rough_rigid_dill_fn_str
-from def_common_params import rough_affine_dill_fn_str, rough_rigid_affine_dill_fn_str
+from def_common_params import rough_affine_dill_fn_str #, rough_rigid_affine_dill_fn_str
 from def_common_params import rough_distance_cutoff_um, fine_min_valid_slice_comparisons, outlier_affine_degree
 from def_common_params import fine_residual_threshold_um, inlier_min_neighbors, inlier_min_component_size_edge_um
 from def_common_params import C_hard_cutoff, min_percent_inliers_C_cutoff, ninlier_neighhbors_cmp
@@ -48,18 +52,21 @@ from def_common_params import merge_inliers_blk_cutoff, merge_inliers_min_comp, 
 from def_common_params import fine_interp_weight, fine_interp_neighbor_dist_scale, slice_blur_z_indices
 from def_common_params import interp_inliers, interp_inlier_nneighbors, affine_rigid_type
 from def_common_params import rough_regression_remove_bias, fine_regression_remove_bias, z_neighbors_radius
+from def_common_params import debug_plots_subfolder
+os.system('date')
 
 # <<< turn on stack trace for warnings
-import traceback
-import warnings
-
-def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
-    log = file if hasattr(file,'write') else sys.stderr
-    traceback.print_stack(file=log)
-    log.write(warnings.formatwarning(message, category, filename, lineno, line))
-
-warnings.showwarning = warn_with_traceback
-#warnings.simplefilter("always")
+#import traceback
+#import warnings
+##import sys
+#
+#def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
+#    log = file if hasattr(file,'write') else sys.stderr
+#    traceback.print_stack(file=log)
+#    log.write(warnings.formatwarning(message, category, filename, lineno, line))
+#
+#warnings.showwarning = warn_with_traceback
+#warnings.simplefilter('error', UserWarning) # have the warning throw an exception
 # turn on stack trace for warnings >>>
 
 
@@ -71,7 +78,8 @@ parser.add_argument('--wafer_ids', nargs='+', type=int, default=[1],
 parser.add_argument('--all-wafers', dest='all_wafers', action='store_true',
                     help='instead of specifying wafer id(s), include all wafers for dataset')
 parser.add_argument('--run-type', nargs=1, type=str, default=['rough'],
-                    choices=['fine', 'fine_outliers', 'fine_filter', 'fine_affine_raw', 'fine_affine', 'fine_interp',
+                    # choices=['fine', 'fine_outliers', 'fine_filter', 'fine_affine_raw', 'fine_affine', 'fine_interp',
+                    choices=['fine', 'fine_outliers', 'fine_filter', 'fine_to_rough', 'fine_interp',
                              'fine_reslice', 'rough', 'rough_merge', 'rough_status'],
                     help='the type of run to choose')
 parser.add_argument('--run-str-in', nargs='+', type=str, default=['none'],
@@ -100,6 +108,8 @@ parser.add_argument('--L2_norm', nargs=1, type=float, default=[0.0],
                     help='L2 norm to use for reconciler, use 0. for off')
 parser.add_argument('--plot-deltas-debug', action='store_true',
                     help='show debug quiver plots of deltas before and after replacing points')
+parser.add_argument('--save-deltas-debug', action='store_true',
+                    help='save debug quiver plots of deltas before and after replacing points')
 parser.add_argument('--save-rough-sequences', nargs=1, type=str, default=[''],
                     help='for rough_status file to save only the clean sequences')
 parser.add_argument('--percent-matches-topn', nargs=1, type=int, default=[0],
@@ -156,6 +166,9 @@ reconcile_L2_norm = args['L2_norm'][0]
 
 # for debug, show quiver plots of the deltas
 plot_deltas = args['plot_deltas_debug']
+
+# for debug, save quiver plots of the deltas
+save_plot_deltas = args['save_deltas_debug']
 
 # this is an identifier so that multiple rough/fine alignemnts can be exported / loaded easily.
 run_str_in = args['run_str_in'][0]
@@ -229,10 +242,10 @@ fine_interp = run_type == 'fine_interp'
 fine_filter = run_type == 'fine_filter'
 
 # specify to fit fine deltas with affines in and export as input to rough recon
-fine_affine_raw = run_type == 'fine_affine_raw'
+fine_to_rough = run_type == 'fine_to_rough'
 
-# specify to fit solved fine deltas with affines and export to rough affine
-fine_affine = run_type == 'fine_affine'
+# # specify to fit solved fine deltas with affines and export to rough affine
+# fine_affine = run_type == 'fine_affine'
 
 # mode that writes out deltas computed for reconcile to h5 file(s).
 # this is an optimization so that they can be loaded as blocks without loading all of them.
@@ -250,8 +263,10 @@ rough_reconcile_merge = run_type == 'rough_merge'
 # set defaults differently depending on fine or rough alignemnt
 any_rough = (print_rough_status or rough_reconcile)
 fine_accumulate = fine_accumulate or fine_reslice # fine reslice is a special mode for accumulate
-any_fine = (fine_accumulate or fine_outliers or fine_interp or fine_affine or fine_filter)
-rerough = ((any_rough or fine_affine) and len(run_strs_in) > 1)
+# any_fine = (fine_accumulate or fine_outliers or fine_interp or fine_affine or fine_filter)
+# rerough = ((any_rough or fine_affine) and len(run_strs_in) > 1)
+any_fine = (fine_accumulate or fine_outliers or fine_interp or fine_filter)
+rerough = (any_rough and len(run_strs_in) > 1)
 
 run_str_out = run_str_out_rough if any_rough else run_str_out_fine
 
@@ -273,14 +288,14 @@ print('Aggregating wafers:'); print(wafer_ids)
 
 ## fixed parameters not exposed in def_common_params
 
-# meta files contain the data across all wafers
-if fine_affine:
-    agg_dill_fn_str = 'accum_meta_rough' + '.' + run_str_out + '.dill'
-    agg_rigid_dill_fn_str = 'accum_meta_rough' + '.' + run_str_out + '_rigid.dill'
-    agg_dill_in_fn_str = 'accum_meta_' + run_type.split('_')[0] + '.' + run_str_in + '.dill'
-else:
-    agg_dill_fn_str = 'accum_meta_' + run_type.split('_')[0] + '.' + run_str_out + '.dill'
-    agg_rigid_dill_fn_str = 'accum_meta_' + run_type.split('_')[0] + '.' + run_str_out + '_rigid.dill'
+# # meta files contain the data across all wafers
+# if fine_affine:
+#     agg_dill_fn_str = 'accum_meta_rough' + '.' + run_str_out + '.dill'
+#     agg_rigid_dill_fn_str = 'accum_meta_rough' + '.' + run_str_out + '_rigid.dill'
+#     agg_dill_in_fn_str = 'accum_meta_' + run_type.split('_')[0] + '.' + run_str_in + '.dill'
+# else:
+agg_dill_fn_str = 'accum_meta_' + run_type.split('_')[0] + '.' + run_str_out + '.dill'
+agg_rigid_dill_fn_str = 'accum_meta_' + run_type.split('_')[0] + '.' + run_str_out + '_rigid.dill'
 
 # option to use interpolated deltas during fine accumulation, probably leave this always true
 load_interpolated_deltas = True
@@ -332,15 +347,15 @@ region_strs = [None]*nwafer_ids
 #protocol_folders_all = [None]*nwafer_ids
 fine_dill_fns = [None]*nwafer_ids
 rough_dill_fns = [None]*nwafer_ids
-rough_dill_out_fns = [None]*nwafer_ids
+# rough_dill_out_fns = [None]*nwafer_ids
 rough_rigid_dill_fns = [None]*nwafer_ids
 rough_dicts = [None]*nwafer_ids
 rough_affine_skip_dill_fns = [[None]*max_range_skips for x in range(nwafer_ids)]
 rough_affine_skip_dicts = [[None]*max_range_skips for x in range(nwafer_ids)]
 
-# outputs for fine_affine_raw mode
+# outputs for fine_to_rough mode
 rough_out_affine_skip_dill_fns = [[None]*max_range_skips for x in range(nwafer_ids)]
-rough_out_rigid_affine_skip_dill_fns = [[None]*max_range_skips for x in range(nwafer_ids)]
+# rough_out_rigid_affine_skip_dill_fns = [[None]*max_range_skips for x in range(nwafer_ids)]
 
 # get all the dill filenames, and load input dill dicts
 for j,i in zip(wafer_ids, range(nwafer_ids)):
@@ -356,8 +371,8 @@ for j,i in zip(wafer_ids, range(nwafer_ids)):
     fine_dill_fns[i] = os.path.join(alignment_folders[i], fine_dill_fn_str.format(j, run_str_out_fine))
     rough_dill_fns[i] = os.path.join(alignment_folders[i], rough_dill_fn_str.format(j, run_str_out_rough))
     rough_rigid_dill_fns[i] = os.path.join(alignment_folders[i], rough_rigid_dill_fn_str.format(j,run_str_out_rough))
-    if fine_affine:
-        rough_dill_out_fns[i] = os.path.join(alignment_folders[i], rough_dill_fn_str.format(j, run_str_out_fine))
+    # if fine_affine:
+    #     rough_dill_out_fns[i] = os.path.join(alignment_folders[i], rough_dill_fn_str.format(j, run_str_out_fine))
 
     if any_rough:
         for k in range(max_range_skips):
@@ -366,17 +381,17 @@ for j,i in zip(wafer_ids, range(nwafer_ids)):
                     rough_affine_dill_fn_str.format(j, k, run_str_in))
             with open(rough_affine_skip_dill_fns[i][k], 'rb') as f: d = dill.load(f)
             rough_affine_skip_dicts[i][k] = d
-    if (valid_experiment_folders and (any_fine or rerough)) and not print_rough_status:
+    if (valid_experiment_folders and (any_fine or rerough or fine_to_rough)) and not print_rough_status:
         rough_dill_fn = rough_dill_fns[i] if not rerough else \
             os.path.join(alignment_folders[i], rough_dill_fn_str.format(j, run_strs_in[1]))
         with open(rough_dill_fn, 'rb') as f: rough_dicts[i] = dill.load(f)
 
-    if fine_affine_raw:
+    if fine_to_rough:
         for k in range(max_range_skips):
             rough_out_affine_skip_dill_fns[i][k] = os.path.join(alignment_folders[i],
                     rough_affine_dill_fn_str.format(j, k, run_str_out_fine))
-            rough_out_rigid_affine_skip_dill_fns[i][k] = os.path.join(alignment_folders[i],
-                    rough_rigid_affine_dill_fn_str.format(j, k, run_str_out_fine))
+            # rough_out_rigid_affine_skip_dill_fns[i][k] = os.path.join(alignment_folders[i],
+            #         rough_rigid_affine_dill_fn_str.format(j, k, run_str_out_fine))
 
 # meta dill stores aggregated alignments unrolled over wafers
 agg_dill_fn = os.path.join(meta_folder, agg_dill_fn_str)
@@ -435,10 +450,13 @@ for i in range(nwafer_ids):
         wafers_nregions[i] = len(region_strs[i])
         solved_orders[i] = np.arange(0,wafers_nregions[i])
 
-if fine_affine:
-    agg_dill_in_fn = os.path.join(meta_folder, agg_dill_in_fn_str)
-    with open(agg_dill_in_fn, 'rb') as f: agg_dict = dill.load(f)
+# if fine_affine:
+#     agg_dill_in_fn = os.path.join(meta_folder, agg_dill_in_fn_str)
+#     with open(agg_dill_in_fn, 'rb') as f: agg_dict = dill.load(f)
 
+# where to save optional debug plots (outliers for example)
+plots_folder = os.path.join(meta_folder, debug_plots_subfolder)
+dosave_path = plots_folder if save_plot_deltas else ''
 
 
 # xxx - overall it would make more sense to have aggregator as a helper class to wafer,
@@ -697,7 +715,7 @@ elif fine_outliers:
     else:
         if not init_blocks:
             aggregator.fine_deltas_outlier_detection(min_inliers=interp_inliers, nworkers=arg_nworkers,
-                doplots=plot_deltas)
+                doplots=plot_deltas, dosave_path=dosave_path)
         if init_blocks:
             print('Initializing fine outliers temporary block dills'); t = time.time()
             if single_block:
@@ -909,71 +927,89 @@ elif fine_filter:
     print('\tdone in %.4f s' % (time.time() - t, ))
 
     aggregator.fine_deltas_affine_filter(fine_filtering_shape_pixels, affine_degree=1,
-        use_interp_points=use_interp_points, doplots=plot_deltas)
+        use_interp_points=use_interp_points, doplots=plot_deltas, dosave_path=dosave_path)
     print('Dumping fine filtered deltas back to delta dills'); t = time.time()
     aggregator.update_fine(update_type='filtered_deltas')
     print('\tdone in %.4f s' % (time.time() - t, ))
 
-elif fine_affine:
-    assert(nprocesses==1) # did not implement the merge, see below
-    inds = np.array_split(np.arange(aggregator.order_rng[0],aggregator.order_rng[1]), nprocesses)
-    rngs = [[x[0],x[-1]+1] for x in inds]
-    print('Initializing for fine to rough alignment, range {}-{}'.format(rngs[iprocess][0],
-        rngs[iprocess][1])); t = time.time()
-    aggregator.init_fine(grid_locations_pixels, alignment_folders, delta_dill_fn_str, range_skips, use_crops_um,
-        griddist_pixels, img_range=rngs[iprocess], load_type='solved', run_str=run_str_in)
-    print('\tdone in %.4f s' % (time.time() - t, ))
+# elif fine_affine:
+#     # xxx - basically not using this code path in favor of fine_to_rough, basically only because
+#     #   this made more sense intuitively than forcing the reconciled fine deltas into global affines.
+#     #   real justification would require a comparison.
+#
+#     assert(nprocesses==1) # did not implement the merge, see below
+#     inds = np.array_split(np.arange(aggregator.order_rng[0],aggregator.order_rng[1]), nprocesses)
+#     rngs = [[x[0],x[-1]+1] for x in inds]
+#     print('Initializing for fine to rough alignment, range {}-{}'.format(rngs[iprocess][0],
+#         rngs[iprocess][1])); t = time.time()
+#     aggregator.init_fine(grid_locations_pixels, alignment_folders, delta_dill_fn_str, range_skips, use_crops_um,
+#         griddist_pixels, img_range=rngs[iprocess], load_type='solved', run_str=run_str_in)
+#     print('\tdone in %.4f s' % (time.time() - t, ))
+#
+#     aggregator.cum_deltas = agg_dict['cum_deltas']
+#     aggregator.cum_comps_sel = agg_dict['cum_comps_sel']
+#     # this is so that the solved affine can be applied on top of an existing rough affine.
+#     if rerough:
+#         aggregator.wafers_imaged_order_rough_affines = [None]*nwafer_ids
+#         for i in range(nwafer_ids):
+#             aggregator.wafers_imaged_order_rough_affines[i] = rough_dicts[i]['imaged_order_affines']
+#
+#     if run_merge:
+#         print('Merging fine dills'); t = time.time()
+#         assert(False) # xxx - implement me
+#         # need a "None-based" merge, replaces None's in current merge dict with not Nones in current proc load
+#     else:
+#         aggregator.fine_solved_deltas_to_rough_affines()
+#
+#     for i in range(nwafer_ids):
+#         d = {
+#              'solved_order':solved_orders[i],
+#              'nregions':wafers_nregions[i],
+#              'imaged_order_affines':aggregator.wafers_imaged_order_rough_affines[i],
+#             }
+#         with open(rough_dill_out_fns[i], 'wb') as f: dill.dump(d, f)
+#     # these are used for plotting / debug and also for re-running accumulation subset.
+#     d = {
+#          'wafer_ids':wafer_ids,
+#          'wafers_template_order':np.nan,
+#          'wafers_nimgs':aggregator.wafers_nimgs,
+#          'cum_wafers_nimgs':aggregator.cum_wafers_nimgs,
+#          'order_rng':aggregator.order_rng,
+#          'cum_affines':aggregator.cum_affines,
+#          'total_nimgs':aggregator.total_nimgs,
+#         }
+#     with open(agg_dill_fn, 'wb') as f: dill.dump(d, f)
 
-    aggregator.cum_deltas = agg_dict['cum_deltas']
-    aggregator.cum_comps_sel = agg_dict['cum_comps_sel']
-    # this is so that the solved affine can be applied on top of an existing rough affine.
-    if rerough:
-        aggregator.wafers_imaged_order_rough_affines = [None]*nwafer_ids
-        for i in range(nwafer_ids):
-            aggregator.wafers_imaged_order_rough_affines[i] = rough_dicts[i]['imaged_order_affines']
+elif fine_to_rough:
+    # xxx - expose this as a param?
+    use_interp_points = True
 
-    if run_merge:
-        print('Merging fine dills'); t = time.time()
-        assert(False) # xxx - implement me
-        # need a "None-based" merge, replaces None's in current merge dict with not Nones in current proc load
-    else:
-        aggregator.fine_deltas_to_rough_affines()
-
-    for i in range(nwafer_ids):
-        d = {
-             'solved_order':solved_orders[i],
-             'nregions':wafers_nregions[i],
-             'imaged_order_affines':aggregator.wafers_imaged_order_rough_affines[i],
-            }
-        with open(rough_dill_out_fns[i], 'wb') as f: dill.dump(d, f)
-    # these are used for plotting / debug and also for re-running accumulation subset.
-    d = {
-         'wafer_ids':wafer_ids,
-         'wafers_template_order':np.nan,
-         'wafers_nimgs':aggregator.wafers_nimgs,
-         'cum_wafers_nimgs':aggregator.cum_wafers_nimgs,
-         'order_rng':aggregator.order_rng,
-         'cum_affines':aggregator.cum_affines,
-         'total_nimgs':aggregator.total_nimgs,
-        }
-    with open(agg_dill_fn, 'wb') as f: dill.dump(d, f)
-
-elif fine_affine_raw:
-    assert(nprocesses==1) # did not implement the merge, see below
     inds = np.array_split(np.arange(aggregator.order_rng[0],aggregator.order_rng[1]), nprocesses)
     rngs = [[x[0],x[-1]+1] for x in inds]
     print('Initializing for fine to rough raw affines from delta dills, range {}-{}'.format(rngs[iprocess][0],
         rngs[iprocess][1])); t = time.time()
     aggregator.init_fine(grid_locations_pixels, alignment_folders, delta_dill_fn_str, range_skips, use_crops_um,
-        griddist_pixels, img_range=rngs[iprocess], load_type='process_fine', run_str=run_str_in)
+        griddist_pixels, img_range=rngs[iprocess], load_type='process_fine', run_str=run_str_in,
+        load_interpolated_deltas=use_interp_points)
     print('\tdone in %.4f s' % (time.time() - t, ))
 
     if run_merge:
-        print('Merging fine dills'); t = time.time()
-        assert(False) # xxx - implement me
-        # need a "None-based" merge, replaces None's in current merge dict with not Nones in current proc load
+        print('Merging rough affine dills'); t = time.time()
+        for i in range(nprocesses):
+            proc_str = '.' + str(iprocess)
+            fn = rough_out_affine_skip_dill_fns[i][k]+proc_str
+            with open(fn, 'rb') as f: d = dill.load(f)
+            if i==0:
+                dmrg = d
+            else:
+                dmrg['forward_affines'][rngs[i][0]:rngs[i][1]] = d['forward_affines'][rngs[i][0]:rngs[i][1]]
+                dmrg['reverse_affines'][rngs[i][0]:rngs[i][1]] = d['reverse_affines'][rngs[i][0]:rngs[i][1]]
+                dmrg['forward_pts_src'][rngs[i][0]:rngs[i][1]] = d['forward_pts_src'][rngs[i][0]:rngs[i][1]]
+                dmrg['forward_pts_dst'][rngs[i][0]:rngs[i][1]] = d['forward_pts_dst'][rngs[i][0]:rngs[i][1]]
+                dmrg['reverse_pts_src'][rngs[i][0]:rngs[i][1]] = d['reverse_pts_src'][rngs[i][0]:rngs[i][1]]
+                dmrg['reverse_pts_dst'][rngs[i][0]:rngs[i][1]] = d['reverse_pts_dst'][rngs[i][0]:rngs[i][1]]
     else:
-        aggregator.fine_deltas_to_rough_deltas()
+        aggregator.fine_deltas_to_rough_affines(use_interp_points=use_interp_points, cutoff_to_fit=interp_inliers)
 
     for i in range(nwafer_ids):
         for k in range(max_range_skips):
@@ -986,18 +1022,8 @@ elif fine_affine_raw:
                  'reverse_pts_dst':aggregator.reverse_pts_dst[i][k],
                  }
             proc_str = ('.' + str(iprocess)) if nprocesses > 1 and not run_merge else ''
-            with open(rough_out_affine_skip_dill_fns[i][k]+proc_str, 'wb') as f: dill.dump(d, f)
-
-            d = {'solved_order':solved_orders[i], 'nregions':wafers_nregions[i],
-                 'rforward_affines':aggregator.forward_affines[i][k],
-                 'rreverse_affines':aggregator.reverse_affines[i][k],
-                 'forward_pts_src':aggregator.forward_pts_src[i][k],
-                 'forward_pts_dst':aggregator.forward_pts_dst[i][k],
-                 'reverse_pts_src':aggregator.reverse_pts_src[i][k],
-                 'reverse_pts_dst':aggregator.reverse_pts_dst[i][k],
-                 }
-            proc_str = ('.' + str(iprocess)) if nprocesses > 1 and not run_merge else ''
-            with open(rough_out_rigid_affine_skip_dill_fns[i][k]+proc_str, 'wb') as f: dill.dump(d, f)
+            fn = rough_out_affine_skip_dill_fns[i][k]+proc_str
+            with open(fn, 'wb') as f: dill.dump(d, f)
         #for k in range(max_range_skips):
     #for i in range(nwafer_ids):
 

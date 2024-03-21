@@ -21,7 +21,7 @@ this program. If not, see <http://www.gnu.org/licenses/>.
 
 import os
 import time
-import glob
+#import glob
 import dill
 import argparse
 
@@ -43,7 +43,7 @@ from def_common_params import get_paths, meta_folder, all_wafer_ids, total_nwafe
 from def_common_params import scale_nm, nimages_per_mfov, legacy_zen_format, native_subfolder
 from def_common_params import dsstep, use_thumbnails_ds, twopass_default_tol_nm
 from def_common_params import wafer_region_prefix_str, slice_balance_fn_str, align_subfolder
-from def_common_params import brightness_slice_histo_nsat #, region_manifest_cnts
+from def_common_params import brightness_slice_histo_nsat, region_suffix
 
 from def_common_params import tissue_mask_ds, tissue_mask_min_edge_um, tissue_mask_min_hole_edge_um
 
@@ -56,6 +56,8 @@ parser.add_argument('--run-type', nargs=1, type=str, default=['residuals'],
     help='the type of plots to generate')
 parser.add_argument('--wafer_ids', nargs='+', type=int, default=[],
     help='specify to only plot a subset of wafer ids')
+parser.add_argument('--all-wafers', dest='all_wafers', action='store_true',
+    help='instead of specifying wafer id(s), include all wafers for dataset')
 parser.add_argument('--region_inds', nargs='+', type=int, default=[-1],
     help='list of region indices to run (< 0 for all regions in wafer)')
 parser.add_argument('--region-inds-rng', nargs=2, type=int, default=[-1,-1],
@@ -152,6 +154,10 @@ plot_xy_scatters = False
 
 
 ## parameters that are determined based on above parameters
+
+# set wafer_ids to contain all wafers, if specified
+if args['all_wafers']:
+    wafer_ids = list(all_wafer_ids)
 
 outdir = os.path.join(meta_folder, 'brightness')
 os.makedirs(outdir, exist_ok=True)
@@ -791,25 +797,38 @@ for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
 
     # this is for trying to figure out a good tolerance vs the median deltas for twopass 2d alignment.
     if histo_width_plot:
-        # just glob for all the available stitched regions instead of having to instantiate each region
-        fns = glob.glob(os.path.join(alignment_folder, native_subfolder if native else '', '*_stitched.h5'))
-        # sort newest to oldest makes looking at reimages easier
-        fns.sort(key=os.path.getmtime); fns = fns[::-1]
-        if region_inds[0] > -1:
-            fns = [x for x in fns if cregion.region_str in x]
-        nfns = len(fns)
+        ## just glob for all the available stitched regions instead of having to instantiate each region
+        #fns = glob.glob(os.path.join(alignment_folder, native_subfolder if native else '', '*_stitched.h5'))
+        ## sort newest to oldest makes looking at reimages easier
+        #fns.sort(key=os.path.getmtime); fns = fns[::-1]
+        #if region_inds[0] > -1:
+        #    fns = [x for x in fns if cregion.region_str in x]
+        #nfns = len(fns)
+
+        nfns = nregions
         #nfns = 20 # to test or use with reimages
         rng = [0.05, 0.98]
         width = np.empty((nfns,1), dtype=np.int64); width.fill(-1)
         mode = np.empty((nfns,1), dtype=np.int64); mode.fill(-1)
+        area = np.zeros((nfns,1), dtype=np.int64)
+        fns = [None]*nfns
 
-        for fn,i in zip(fns, range(nfns)):
-            dsstr = ('_'+str(dsstep_histo)) if dsstep_histo > 1 else ''
+        cregion_inds = region_inds if region_inds[0] > -1 else range(1,nregions+1)
+        for region_ind in cregion_inds:
+            region_str = region_strs_flat[region_ind-1]
+            prefix = wafer_region_prefix_str.format(wafer_id, region_str)
+            fn = os.path.join(alignment_folder, prefix + region_suffix + '.h5')
+            i = region_ind - 1
+            fns[i] = fn
             print(fn)
-            histo, _ = big_img_load(fn, dataset='histogram'+dsstr)
+
+            dsstr = ('_'+str(dsstep_histo)) if dsstep_histo > 1 else ''
+            attrs = {'area':0}
+            histo, _ = big_img_load(fn, dataset='histogram'+dsstr, attrs=attrs)
             # if i==0:
             #     histos = np.empty((nfns, histo.size), dtype=np.int64); histos.fill(-1)
             # histos[i,:] = histo
+            area[i] = attrs['area'] if attrs['area'] is not None else 0
 
             # remove saturated pixels at ends.
             histo_nsat = brightness_slice_histo_nsat
@@ -833,6 +852,7 @@ for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
                 plt.figure(1234); plt.gcf().clf(); plt.plot(histo)
                 plt.figure(1235); plt.gcf().clf(); plt.plot(dhisto)
                 plt.show()
+        #for fn,i in zip(fns, range(nfns)):
 
         pfns = [os.path.basename(x) for x in fns]
         nprint = nfns
@@ -858,9 +878,19 @@ for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
                 for i in range(nprint):
                     print('{} {}'.format(pfns[inds[i,0]], vals[i,0]))
         # for j in range(len(pvals)):
+
+        # piggybacked this mode for exporting the areas
+        if wafer_ind == 0:
+            wafers_areas = [[] for x in range(max(all_wafer_ids)+1)]
+        wafers_areas[wafer_id] = area
     #if histo_width_plot:
 
 #for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
+
+if histo_width_plot:
+    dill_fn = 'wafers_areas.dill'
+    d = {'wafers_areas':wafers_areas,}
+    with open(dill_fn, 'wb') as f: dill.dump(d, f)
 
 if median_diff_plot:
     # for generating histograms of all 2D stitching residuals.

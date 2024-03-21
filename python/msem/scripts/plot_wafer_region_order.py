@@ -31,7 +31,13 @@ import argparse
 from msem import wafer
 from msem.utils import PolyCentroid, argsort
 from msem.wafer_solver import wafer_solver
-from aicspylibczimsem import CziMsem
+
+try:
+    from aicspylibczimsem import CziMsem
+    _aicspylibczimsem_imported = True
+except:
+    print('WARNING: aicspylibczimsem unavailable, needed to read czi files, not supported > python 3.10')
+    _aicspylibczimsem_imported = False
 
 from def_common_params import get_paths #, exclude_regions
 from def_common_params import czifiles, czfiles, czipath, czifile_ribbons, czifile_scenes, czifile_use_roi_polygons
@@ -145,6 +151,7 @@ first_last = True
 ## parameters that are determined based on above parameters
 
 assert( len(zen_reimages) == 0 or len(wafer_ids) == len(zen_reimages) ) # must be parallel to wafer ids
+assert( _aicspylibczimsem_imported or not legacy_zen_format ) # legacy format requires czi file reader
 
 for wafer_id,wafer_ind in zip(wafer_ids, range(nwafer_ids)):
 #for wafer_id in wafer_ids:

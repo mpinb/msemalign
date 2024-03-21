@@ -111,17 +111,20 @@ _dtype_fft = np.float32; _dtype_cfft = np.complex64
 #   Our technical reference document on NORMXCORR2 shows how to get from
 #   equation 2 of the Lewis paper to the code below.
 
-def local_sum(A,m,n):
+# Tempting to have local sum return A and A**2, but tested more than once
+#   and it is slower doing it internally in this function for all cases
+#   tested, likely due to the relatively large amount of padding.
+def local_sum(A,m,n, _xp):
     # We thank Eli Horn for providing this code, used with his permission,
     # to speed up the calculation of local sums. The algorithm depends on
     # precomputing running sums as described in "Fast Normalized
     # Cross-Correlation", by J. P. Lewis, Industrial Light & Magic.
     # http://www.idiom.com/~zilla/Papers/nvisionInterface/nip.html
 
-    B = np.lib.pad(A, ((m,m),(n,n)), 'constant', constant_values=0)
-    s = np.cumsum(B, axis=0)
+    B = _xp.pad(A, ((m,m),(n,n)), 'constant', constant_values=0)
+    s = _xp.cumsum(B, axis=0)
     c = s[m:-1,:]-s[:-m-1,:]
-    s = np.cumsum(c, axis=1)
+    s = _xp.cumsum(c, axis=1)
     return s[:,n:-1]-s[:,:-n-1]
 
 # xxx - in an ideal world I never wrote this as accepting the adjacency matrix.
@@ -154,15 +157,17 @@ def normxcorr2_fft_adj(templates, templates_shape, imgs, imgs_shape, adj_matrix,
     Tntri = int(use_tri_templates) + 1
     Antri = int(use_tri_images) + 1
 
-    # xxx - marginally better performance with real ffts, decided not worth it for now
-    #   because the implication for precision for using real ffts versus full ffts is unclear.
-    real_fft = False
-    # whether to zero pad for faster fft performance
-    # xxx - same story here, did not really help that much, unclear if the normalization is affected.
-    calc_fast_len = False
+    # Both of these options offer performance improvments in many cases.
+    # xxx - remove options? was slightly unclear if this affects the normalization at all,
+    #   however rcc_xcorr is using scipy fftconvolve which does both of these things internally.
+    # use real fft functions (rfft2) instead of regular (complex) fft functions.
+    real_fft = True
+    # zero pad to "fast fft" sizes for improved fft performanced.
+    calc_fast_len = True
+
     # divide by zero tolerance
-    #tol = np.finfo(_dtype_fft).eps
-    tol = 1e-6
+    tol = np.finfo(_dtype_fft).eps
+    #tol = 1e-6
 
     # do not remove these, not worth the slight time savings
     assert(all([x is None or (x.shape == A_size).all() for y in imgs for x in y]))
@@ -196,8 +201,18 @@ def normxcorr2_fft_adj(templates, templates_shape, imgs, imgs_shape, adj_matrix,
         tpoutsize = toutsize
 
     if real_fft:
+        # from https://docs.scipy.org/doc/scipy/reference/generated/scipy.fft.rfftn.html
+        # "The length of the last axis transformed will be s[-1]//2+1,
+        #    while the remaining transformed axes will have lengths according to s, or unchanged from the input.""
         fftsize = (poutsize[0], poutsize[1]//2 + 1)
-        f_fft2 = fft_module.rfft2; f_ifft2 = fft_module.irfft2
+        if use_fft == FFT_types.pyfftw_fft:
+            f_fft2 = functools.partial(fft_module.rfft2, overwrite_input=True)
+            f_ifft2 = functools.partial(fft_module.irfft2, overwrite_input=True)
+        else:
+            # f_fft2 = functools.partial(fft_module.rfft2, overwrite_x=True)
+            # f_ifft2 = functools.partial(fft_module.irfft2, overwrite_x=True)
+            f_fft2 = fft_module.rfft2
+            f_ifft2 = fft_module.irfft2
     else:
         fftsize = tpoutsize
         if use_fft == FFT_types.pyfftw_fft:
@@ -240,11 +255,11 @@ def normxcorr2_fft_adj(templates, templates_shape, imgs, imgs_shape, adj_matrix,
             local_sum_A[z] = [None]*nimgs; denom_A[z] = [None]*nimgs; Fb[z] = [None]*nimgs
             for x in range(nimgs):
                 if Aimgs[z][x] is None: continue
-                Ad = Aimgs[z][x].astype(_dtype_fft)
-                local_sum_A[z][x] = local_sum(Ad,m,n)
-                local_sum_A2 = local_sum(Ad*Ad,m,n)
-                diff_local_sums = ( local_sum_A2 - (local_sum_A[z][x]**2)/mn )
-                denom_A[z][x] = np.sqrt( np.maximum(diff_local_sums, 0) )
+                Ad = xp.asarray(Aimgs[z][x], dtype=_dtype_fft)
+                local_sum_A[z][x] = local_sum(Ad,m,n, xp)
+                local_sum_A2 = local_sum(Ad*Ad,m,n, xp)
+                diff_local_sums = ( local_sum_A2 - (local_sum_A[z][x]*local_sum_A[z][x])/mn )
+                denom_A[z][x] = xp.sqrt( xp.maximum(diff_local_sums, 0) )
                 A[:] = xp.asarray(Aimgs[z][x])
                 Fb[z][x] = xp.empty(fftsize, dtype=_dtype_cfft)
                 if use_fft == FFT_types.pyfftw_fft:
@@ -306,18 +321,28 @@ def normxcorr2_fft_adj(templates, templates_shape, imgs, imgs_shape, adj_matrix,
             else:
                 xcorr_TA = xp.real(f_ifft2(F[Tistriu], s=tpoutsize))
             cxcorr_TA = xcorr_TA[tuple([slice(sz) for sz in toutsize])] if calc_fast_len else xcorr_TA
-            cxcorr_TA = cp.asnumpy(cxcorr_TA) if use_fft == FFT_types.cupy_fft else cxcorr_TA
 
+            # denom_T and Tdsum_mn are scalars. local_sums (and denom_A) are the same size as cxcorr_TA.
             denom = denom_T[Tistriu]*denom_A[Aistriu][y]
             numerator = (cxcorr_TA - local_sum_A[Aistriu][y]*Tdsum_mn[Tistriu])
+
             # remove divide by zeros using specified tolerance, replace with zero correlation
-            Ci = np.zeros(outsize, dtype=_dtype_fft)
-            sel = (denom > tol); Ci[sel] = numerator[sel] / denom[sel]
+            Ci = xp.zeros(outsize, dtype=_dtype_fft)
+            if use_fft == FFT_types.cupy_fft:
+                # the selects are very slow in cupy / gpu
+                cp.divide(numerator, denom, out=Ci)
+                cp.putmask(Ci, denom <= tol, 0)
+            else:
+                sel = (denom > tol); Ci[sel] = numerator[sel] / denom[sel]
 
             mCi = Ci[crp[0]:outsize[0]-crp[0],crp[1]:outsize[1]-crp[1]]
-            C[x,y] = np.max(mCi) # the correlation peak magnitude
             # the correlation peak location in the correlation image
-            deltaC = np.array(np.unravel_index(np.argmax(mCi), outsize - 2*crp)) + crp
+            ind = xp.argmax(mCi); peak = mCi[xp.unravel_index(ind, mCi.shape)]
+            if use_fft == FFT_types.cupy_fft:
+                ind = cp.asnumpy(ind); peak = cp.asnumpy(peak)
+            C[x,y] = peak # the correlation peak magnitude
+            # the correlation peak location in the correlation image
+            deltaC = np.array(np.unravel_index(ind, outsize - 2*crp)) + crp
             deltaA = deltaC - T_size + 1 # the correlation peak location in the image A
             # the shift require for peak correlation of the image that the template came from relative to the image A
             D0[x,y], D1[x,y] = deltaA - (template_offset[Tistriu][x] if template_offset is not None else 0) \
@@ -414,15 +439,17 @@ def normxcorr2_fft(template, imgs, imgs_shape=None, crp=np.array([0,0]),
     assert( (outsize > 2*crp).all() ) # specified cropping is bigger than the output xcorr size
     toutsize = tuple(outsize.tolist()) # cupy fails without explicit tuple
 
-    # xxx - marginally better performance with real ffts, decided not worth it for now
-    #   because the implication for precision for using real ffts versus full ffts is unclear.
-    real_fft = False
-    # whether to zero pad for faster fft performance
-    # xxx - same story here, did not really help that much, unclear if the normalization is affected.
-    calc_fast_len = False
+    # Both of these options offer performance improvments in many cases.
+    # xxx - remove options? was slightly unclear if this affects the normalization at all,
+    #   however rcc_xcorr is using scipy fftconvolve which does both of these things internally.
+    # use real fft functions (rfft2) instead of regular (complex) fft functions.
+    real_fft = True
+    # zero pad to "fast fft" sizes for improved fft performanced.
+    calc_fast_len = True
+
     # divide by zero tolerance
-    #tol = np.finfo(_dtype_fft).eps
-    tol = 1e-6
+    tol = np.finfo(_dtype_fft).eps
+    #tol = 1e-6
 
     # do not remove these, not worth the slight time savings
     assert(all([x is None or (x.shape == A_size).all() for x in imgs]))
@@ -455,8 +482,18 @@ def normxcorr2_fft(template, imgs, imgs_shape=None, crp=np.array([0,0]),
         tpoutsize = toutsize
 
     if real_fft:
+        # from https://docs.scipy.org/doc/scipy/reference/generated/scipy.fft.rfftn.html
+        # "The length of the last axis transformed will be s[-1]//2+1,
+        #    while the remaining transformed axes will have lengths according to s, or unchanged from the input.""
         fftsize = (poutsize[0], poutsize[1]//2 + 1)
-        f_fft2 = fft_module.rfft2; f_ifft2 = fft_module.irfft2
+        if use_fft == FFT_types.pyfftw_fft:
+            f_fft2 = functools.partial(fft_module.rfft2, overwrite_input=True)
+            f_ifft2 = functools.partial(fft_module.irfft2, overwrite_input=True)
+        else:
+            # f_fft2 = functools.partial(fft_module.rfft2, overwrite_x=True)
+            # f_ifft2 = functools.partial(fft_module.irfft2, overwrite_x=True)
+            f_fft2 = fft_module.rfft2
+            f_ifft2 = fft_module.irfft2
     else:
         fftsize = tpoutsize
         if use_fft == FFT_types.pyfftw_fft:
@@ -485,11 +522,11 @@ def normxcorr2_fft(template, imgs, imgs_shape=None, crp=np.array([0,0]),
         # image fft precompute loop
         local_sum_A = [None]*nimgs; denom_A = [None]*nimgs; Fb = [None]*nimgs
         for x in range(nimgs):
-            Ad = Aimgs[x].astype(_dtype_fft)
-            local_sum_A[x] = local_sum(Ad,m,n)
-            local_sum_A2 = local_sum(Ad*Ad,m,n)
-            diff_local_sums = ( local_sum_A2 - (local_sum_A[x]**2)/mn )
-            denom_A[x] = np.sqrt( np.maximum(diff_local_sums, 0) )
+            Ad = xp.asarray(Aimgs[x], dtype=_dtype_fft)
+            local_sum_A[x] = local_sum(Ad,m,n, xp)
+            local_sum_A2 = local_sum(Ad*Ad,m,n, xp)
+            diff_local_sums = ( local_sum_A2 - (local_sum_A[x]*local_sum_A[x])/mn )
+            denom_A[x] = xp.sqrt( xp.maximum(diff_local_sums, 0) )
             A[:] = xp.asarray(Aimgs[x])
             Fb[x] = xp.empty(fftsize, dtype=_dtype_cfft)
             if use_fft == FFT_types.pyfftw_fft:
@@ -535,18 +572,27 @@ def normxcorr2_fft(template, imgs, imgs_shape=None, crp=np.array([0,0]),
         else:
             xcorr_TA = xp.real(f_ifft2(F, s=tpoutsize))
         cxcorr_TA = xcorr_TA[tuple([slice(sz) for sz in toutsize])] if calc_fast_len else xcorr_TA
-        cxcorr_TA = cp.asnumpy(cxcorr_TA) if use_fft == FFT_types.cupy_fft else cxcorr_TA
 
+        # denom_T and Tdsum_mn are scalars. local_sums (and denom_A) are the same size as cxcorr_TA.
         denom = denom_T*denom_A[x]
         numerator = (cxcorr_TA - local_sum_A[x]*Tdsum_mn)
+
         # remove divide by zeros using specified tolerance, replace with zero correlation
-        Ci = np.zeros(outsize, dtype=_dtype_fft)
-        sel = (denom > tol); Ci[sel] = numerator[sel] / denom[sel]
+        Ci = xp.zeros(outsize, dtype=_dtype_fft)
+        if use_fft == FFT_types.cupy_fft:
+            # the selects are very slow in cupy / gpu
+            cp.divide(numerator, denom, out=Ci)
+            cp.putmask(Ci, denom <= tol, 0)
+        else:
+            sel = (denom > tol); Ci[sel] = numerator[sel] / denom[sel]
 
         mCi = Ci[crp[0]:outsize[0]-crp[0],crp[1]:outsize[1]-crp[1]]
-        C[x] = np.max(mCi) # the correlation peak magnitude
         # the correlation peak location in the correlation image
-        deltaC = np.array(np.unravel_index(np.argmax(mCi), outsize - 2*crp)) + crp
+        ind = xp.argmax(mCi); peak = mCi[xp.unravel_index(ind, mCi.shape)]
+        if use_fft == FFT_types.cupy_fft:
+            ind = cp.asnumpy(ind); peak = cp.asnumpy(peak)
+        C[x] = peak # the correlation peak magnitude
+        deltaC = np.array(np.unravel_index(ind, outsize - 2*crp)) + crp
         deltaA = deltaC - T_size + 1 # the correlation peak location in the image A
         D0[x], D1[x] = deltaA
 
@@ -702,7 +748,7 @@ def template_match_rotate_images(templates, imgs, rotation_step, rotation_range,
         #img_pad = 2*np.random.random(sz + 2*pad)-1; img_pad[pad[0]:-pad[0], pad[1]:-pad[1]] = templates[j]
         # constant:
         # NOTE: this is the best appraoch, but images MUST be zero mean, use normalize==True in template_match_preproc
-        img_pad = np.lib.pad(templates[j], ((pad[0],pad[0]),(pad[1],pad[1])), 'constant', constant_values=0.)
+        img_pad = np.pad(templates[j], ((pad[0],pad[0]),(pad[1],pad[1])), 'constant', constant_values=0.)
         # checkerboard:
         #img_pad = np.empty(sz + 2*pad, dtype=imgs_dtype); img_pad.fill(-1.)
         #img_pad[1::2, ::2] = 1.; img_pad[::2, 1::2] = 1.; img_pad[pad[0]:-pad[0], pad[1]:-pad[1]] = templates[j]

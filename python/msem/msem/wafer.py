@@ -63,7 +63,12 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.path import Path
 
-from aicspylibczimsem import CziMsem
+try:
+    from aicspylibczimsem import CziMsem
+    _aicspylibczimsem_imported = True
+except:
+    print('WARNING: aicspylibczimsem unavailable, needed to read czi files, not supported > python 3.10')
+    _aicspylibczimsem_imported = False
 
 from .region import region
 from ._template_match import template_match_rotate_images, template_match_preproc
@@ -129,13 +134,12 @@ class wafer(region):
                  exclude_regions=[], solved_order=None, load_stitched_coords=None, translate_roi_center=False,
                  use_thumbnails_ds=0, thumbnail_folders=[], roi_polygon_scale=0., wafer_format_str='wafer{:02d}_',
                  backload_roi_polys=None, nblocks=[1,1], iblock=[0,0], block_overlap_um=[0,0], scale_nm=None,
-                 region_ext='.h5', region_interp_type_deltas='cubic', deformation_points_boundary_um=0.,
+                 region_ext='.h5', region_interp_type_deltas='cubic', use_coordinate_based_xforms=False,
                  load_rough_xformed_img=False, load_img_subfolder='', griddist_um=0., init_regions=True,
                  legacy_zen_format=False, nimages_per_mfov=None, init_region_coords=True, region_manifest_cnts=None,
                  use_tissue_masks=False, tissue_mask_path=None, tissue_mask_ds=1, tissue_mask_fn_str=None,
                  tissue_mask_min_edge_um=0., tissue_mask_min_hole_edge_um=0., tissue_mask_bwdist_um=0., zorder=None,
-                 use_coordinate_based_xforms=False, block_overlap_grid_um=[0,0], region_include_cnts=None,
-                 verbose=False):
+                 block_overlap_grid_um=[0,0], region_include_cnts=None, custom_roi=[None, None], verbose=False):
         self.wafer_verbose = verbose
         self.experiment_folders = experiment_folders
 
@@ -208,6 +212,9 @@ class wafer(region):
         #print(self.rough_bounding_box[0], self.rough_bounding_box[1])
         assert( (self.grid_locations.min(0) >= self.rough_bounding_box[0]).all() )
         assert( (self.grid_locations.max(0) <= self.rough_bounding_box[1]).all() )
+
+        # optionally defines another custom roi that further restricts the acquisition roi
+        self.custom_roi = custom_roi
 
         # create the region list before super init
         self.indexed_nregions = [sum([len(x) for x in y]) for y in region_strs]
@@ -330,12 +337,16 @@ class wafer(region):
         self.region_recon_roi_poly_raw = [None]*self.nregions
         self.limi_to_region_affine = None
 
-        # initialize optional full affine transformation for rough alignment
-        self.region_affines = [None]*self.nregions
+        # initialize optional full affine transformation for rough alignment.
+        # if defined needs to be array of arrays in order to support
+        #     multiple rough alignments (multiple affine transformations).
+        self.regions_affines = None
 
         # initialize the deformation grids to None so by default no deformations are applied when loading.
-        self.deformation_points = None
-        self.imaged_order_deformation_vectors = [None]*self.nregions
+        # need to be defined as array (deformations_points) or array of arrays (deformations_vectors) if defined
+        #   in order to support multiple fine alignment transformations.
+        self.deformations_points = None
+        self.imaged_order_deformations_vectors = None
 
         # only use these values for computing neighboring regions.
         # they are based on the zeiss coordinates, so will not be exactly correct for msem stitched regions.
@@ -520,6 +531,7 @@ class wafer(region):
     def set_region_rotations_czi(self, czifile, scene=1, ribbon=1, rotation=0., czfile=None, use_polygons=False,
                                  use_roi_polygons=False, use_full_affine=True, remove_duplicates=False, doplots=False):
         assert(self.nregions > 5) # point matching is not going to work for only a few regions
+        assert( _aicspylibczimsem_imported ) # need this library in order to read the czi files
         if use_roi_polygons:
             print('WARNING: using roi polys for limi to region mapping, mostly intended as validation')
 
@@ -786,10 +798,10 @@ class wafer(region):
             if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
 
             # apply the rough-alignment affine transformation
-            if self.region_affines is not None and self.region_affines[ind] is not None:
+            if self.regions_affines[0] is not None and self.regions_affines[0][ind] is not None:
                 if verbose: print('Apply rough affine xform'); t = time.time()
-                #print('applying affine'); print(self.region_affines[ind][:2,:])
-                a,b,c,d,e,f = self.region_affines[ind][:2,:].flat[:]
+                #print('applying affine'); print(self.regions_affines[0][ind][:2,:])
+                a,b,c,d,e,f = self.regions_affines[0][ind][:2,:].flat[:]
                 img = img.transform(img.size, Image.AFFINE, (a,b,c,d,e,f), resample=wafer.region_interp_type)
 
                 if load_xform_bg and bgsel is not None:
@@ -797,7 +809,7 @@ class wafer(region):
                             fillcolor=1)
                 if load_xform_tm and tm_bw is not None:
                     # adjust the translation for the relative downsampling level of the mask
-                    caff = self.region_affines[ind].copy(); caff[:2,2] /= rel_ds; a,b,c,d,e,f = caff[:2,:].flat[:]
+                    caff = self.regions_affines[0][ind].copy(); caff[:2,2] /= rel_ds; a,b,c,d,e,f = caff[:2,:].flat[:]
                     tm_bw = tm_bw.transform(tm_bw.size, Image.AFFINE, (a,b,c,d,e,f), resample=Image.NEAREST)
                 if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
 
@@ -848,7 +860,7 @@ class wafer(region):
         # a pixel-dense method for interpolating that also extrapolates is possible, but
         #   for the methods attempted (MLS, TPS) this is way too compute intensive,
         #   particularly at high resolution (natve @4nm).
-        if self.deformation_points is not None:
+        if self.deformations_points is not None:
             if verbose: print('Apply warping deformation'); t = time.time()
             bgsel = None # warping xform is not applied to the background, so do not return it
             assert( not self.use_tissue_masks ) # xxx - did not implement the warping for the tissues masks, ouch
@@ -862,9 +874,9 @@ class wafer(region):
             # NOTE: p is modified, so in reality we need this copy.
             #   However, this copy is memory-expensive for dense grids,
             #     and in practive the deformation points are only used once per-process.
-            #p = self.deformation_points.astype(np.double, copy=True)
-            p = self.deformation_points.astype(np.double)
-            v = self.imaged_order_deformation_vectors[ind].astype(np.double)
+            #p = self.deformations_points[0].astype(np.double, copy=True)
+            p = self.deformations_points[0].astype(np.double)
+            v = self.imaged_order_deformations_vectors[0][ind].astype(np.double)
             assert( np.isfinite(p).all() ) # non-finite points should be handled by wafer_aggregator
 
             pmin, pmax, cmin, cmax, vx, vy = self._region_load_setup_deformations(p, v,
@@ -913,7 +925,7 @@ class wafer(region):
                     prefilter=False)[dmin[1]:crng[1]-dmax[1], dmin[0]:crng[0]-dmax[0]]
             del cimg, map_x, map_y
             if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
-        #if self.deformation_points is not None:
+        #if self.deformations_points is not None:
 
         return img, roi_points, control_points, img_shape, icrop_min, bgsel, tm_bw
     #def _region_load_xforms(self
@@ -971,43 +983,54 @@ class wafer(region):
                 igrid_min, igrid_max, _ = self._center_box_pixels(target_ctr, 1)
                 points = points - igrid_min
 
-                if self.region_affines is not None and self.region_affines[ind] is not None:
-                    # warp roi points with affine to match image, use inverse affine for the points
-                    aff = lin.inv(self.region_affines[ind])
-                    # scikit learn puts constant terms on the left, remove augment and flip
-                    aff = np.concatenate( (aff[:2,2][:,None], aff[:2,:2], ), axis=1 )
-                    pts = self.poly_degree1.fit_transform(points)
-                    points = np.dot(pts, aff.T)
+                if self.regions_affines is not None:
+                    nrough = len(self.regions_affines)
+                    for i in range(nrough):
+                        if self.regions_affines[i][ind] is not None:
+                            # warp roi points with affine to match image, use inverse affine for the points
+                            aff = lin.inv(self.regions_affines[i][ind])
+                            # scikit learn puts constant terms on the left, remove augment and flip
+                            aff = np.concatenate( (aff[:2,2][:,None], aff[:2,:2], ), axis=1 )
+                            pts = self.poly_degree1.fit_transform(points)
+                            points = np.dot(pts, aff.T)
+                        else:
+                            assert(nrough == 1) # why would you do this?
         else: # if not self.load_rough_xformed_img:
             target_ctr = None
             rot_region_size = region_size
 
-        if self.deformation_points is not None:
-            p = self.deformation_points.astype(np.double)
-            v = self.imaged_order_deformation_vectors[ind].astype(np.double)
+        if self.deformations_points is not None:
+            nfine = len(self.deformations_points)
+            for i in range(nfine):
+                if self.deformations_points[i] is not None:
+                    p = self.deformations_points[i].astype(np.double)
+                    v = self.imaged_order_deformations_vectors[i][ind].astype(np.double)
 
-            # warp the roi points first by interpoating the vectors at the roi points.
-            # the transform of the points is the forward mapping, this means just negative of
-            #   the inverse mapping used below by map_coordinates.
-            if points is not None:
-                # use inverse distance weighting (IDW) to interpolate the vectors at the roi points.
-                # xxx - need to parameterize any of these?
-                idw_p = 2. # squaring consistently seems to be best choice
-                scl = 1.5
-                min_nbrs = 3
-                nbrs = NearestNeighbors(radius=scl*self.griddist, algorithm='ball_tree').fit(p)
-                dist, nnbrs = nbrs.radius_neighbors(points, return_distance=True)
-                knbrs = NearestNeighbors(n_neighbors=min_nbrs, algorithm='kd_tree').fit(p)
-                kdist, knnbrs = knbrs.kneighbors(points, return_distance=True)
-                nnbrs_nsel = np.array([x.size < min_nbrs for x in nnbrs])
-                nnbrs = [x if y else z for x,y,z in zip(knnbrs,nnbrs_nsel,nnbrs)]
-                dist = [x if y else z for x,y,z in zip(kdist,nnbrs_nsel,dist)]
-                for i in range(points.shape[0]):
-                    # weight the average by the inverse distance to each point.
-                    # this is inverse distance weighting interpolation.
-                    W = 1/dist[i]**idw_p
-                    points[i,:] = points[i,:] + (-v[nnbrs[i],:]*W[:,None]).sum(0)/W.sum()
-        #if self.deformation_points is not None:
+                    # warp the roi points first by interpoating the vectors at the roi points.
+                    # the transform of the points is the forward mapping, this means just negative of
+                    #   the inverse mapping used below by map_coordinates.
+                    if points is not None:
+                        # use inverse distance weighting (IDW) to interpolate the vectors at the roi points.
+                        # xxx - need to parameterize any of these?
+                        idw_p = 2. # squaring consistently seems to be best choice
+                        scl = 1.5
+                        min_nbrs = 3
+                        nbrs = NearestNeighbors(radius=scl*self.griddist, algorithm='ball_tree').fit(p)
+                        dist, nnbrs = nbrs.radius_neighbors(points, return_distance=True)
+                        knbrs = NearestNeighbors(n_neighbors=min_nbrs, algorithm='kd_tree').fit(p)
+                        kdist, knnbrs = knbrs.kneighbors(points, return_distance=True)
+                        nnbrs_nsel = np.array([x.size < min_nbrs for x in nnbrs])
+                        nnbrs = [x if y else z for x,y,z in zip(knnbrs,nnbrs_nsel,nnbrs)]
+                        dist = [x if y else z for x,y,z in zip(kdist,nnbrs_nsel,dist)]
+                        for i in range(points.shape[0]):
+                            # weight the average by the inverse distance to each point.
+                            # this is inverse distance weighting interpolation.
+                            W = 1/dist[i]**idw_p
+                            points[i,:] = points[i,:] + (-v[nnbrs[i],:]*W[:,None]).sum(0)/W.sum()
+                else: #if self.deformations_points[i] is not None:
+                    assert(nfine == 1) # why would you do this?
+            #for i in range(nfine):
+        #if self.deformations_points is not None:
 
         return points, target_ctr, rot_region_size
     #def _xform_points(self
@@ -1018,12 +1041,17 @@ class wafer(region):
         # xxx - currently not supporting inverting the deformations
 
         # invert the affine transformation (inverse is forward transformation for points).
-        if self.region_affines is not None and self.region_affines[ind] is not None:
-            aff = self.region_affines[ind]
-            # scikit learn puts constant terms on the left, remove augment and flip
-            aff = np.concatenate( (aff[:2,2][:,None], aff[:2,:2], ), axis=1 )
-            pts = self.poly_degree1.fit_transform(points)
-            points = np.dot(pts, aff.T)
+        if self.regions_affines is not None:
+            nrough = len(self.regions_affines)
+            for i in range(nrough-1,-1,-1):
+                if self.regions_affines[i][ind] is not None:
+                    aff = self.regions_affines[i][ind]
+                    # scikit learn puts constant terms on the left, remove augment and flip
+                    aff = np.concatenate( (aff[:2,2][:,None], aff[:2,:2], ), axis=1 )
+                    pts = self.poly_degree1.fit_transform(points)
+                    points = np.dot(pts, aff.T)
+                else:
+                    assert(nrough == 1) # why would you do this?
 
         # invert the rough bounding box crop
         igrid_min, igrid_max, _ = self._center_box_pixels(target_ctr, 1)
@@ -1160,22 +1188,6 @@ class wafer(region):
         # NOTE: for this method, everything works backwards. we start with the coordinates in the output block
         #   and then inverse transform them back to the source image.
 
-        if self.deformation_points is not None:
-            if verbose: print('Apply coords warping deformation'); t = time.time()
-            # the points and the vectors that define the warping, use double for interpolating the vector field.
-            # with the addition of the rough bounding box, the deformation points are the same for all regions.
-            # NOTE: p is modified, so in reality we need this copy.
-            #   However, this copy is memory-expensive for dense grids,
-            #     and in practive the deformation points are only used once per-process.
-            #p = self.deformation_points.astype(np.double, copy=True)
-            p = self.deformation_points.astype(np.double)
-            v = self.imaged_order_deformation_vectors[ind].astype(np.double)
-            assert( np.isfinite(p).all() ) # non-finite points should be handled by wafer_aggregator
-
-            # creates the dense interpolated warpings
-            pmin, pmax, _, _, vx, vy = self._region_load_setup_deformations(p, v,
-                    icrop_min, icrop_min_grid, icoords_size, icoords_size_grid, False, verbose, doplots)
-
         # create final coordinates over the rough bounding box (or subblock)
         # NOTE: all the transformations of coords need to be chosen carefully to minimize reallocation.
         #   these coords are very memory expensive and any extra copies can bloat the memory footprint.
@@ -1186,25 +1198,52 @@ class wafer(region):
         coords = coords[::-1,:,:] # x/y need to be swapped for coords
         if (icrop_min != 0).any(): coords += icrop_min[:,None,None]
 
-        if self.deformation_points is not None:
-            # apply the deformation to the coordinates over the bounding box of the deformation points.
-            tmp = coords[0,pmin[1]:pmax[1], pmin[0]:pmax[0]]
-            coords[0,pmin[1]:pmax[1], pmin[0]:pmax[0]] = tmp + vx
-            del vx
-            tmp = coords[1,pmin[1]:pmax[1], pmin[0]:pmax[0]]
-            coords[1,pmin[1]:pmax[1], pmin[0]:pmax[0]] = tmp + vy
-            del vy, tmp
-            if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
+        if self.deformations_points is not None:
+            nfine = len(self.deformations_points)
+            for i in range(nfine):
+                if self.deformations_points[i] is not None:
+                    if verbose: print('Apply coords warping deformation'); t = time.time()
+                    # points and the vectors that define the warping, use double for interpolating the vector field.
+                    # with the addition of the rough bounding box, the deformation points are the same for all regions.
+                    # NOTE: p is modified, so in reality we need this copy.
+                    #   However, this copy is memory-expensive for dense grids,
+                    #     and in practive the deformation points are only used once per-process.
+                    #p = self.deformations_points[i].astype(np.double, copy=True)
+                    p = self.deformations_points[i].astype(np.double)
+                    v = self.imaged_order_deformations_vectors[i][ind].astype(np.double)
+                    assert( np.isfinite(p).all() ) # non-finite points should be handled by wafer_aggregator
+
+                    # creates the dense interpolated warpings
+                    pmin, pmax, _, _, vx, vy = self._region_load_setup_deformations(p, v,
+                            icrop_min, icrop_min_grid, icoords_size, icoords_size_grid, False, verbose, doplots)
+
+                    # apply the deformation to the coordinates over the bounding box of the deformation points.
+                    tmp = coords[0,pmin[1]:pmax[1], pmin[0]:pmax[0]]
+                    coords[0,pmin[1]:pmax[1], pmin[0]:pmax[0]] = tmp + vx
+                    del vx, tmp
+                    tmp = coords[1,pmin[1]:pmax[1], pmin[0]:pmax[0]]
+                    coords[1,pmin[1]:pmax[1], pmin[0]:pmax[0]] = tmp + vy
+                    del vy, tmp
+                    if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
+                else: #if self.deformations_points[i] is not None:
+                    assert(nfine == 1) # why would you do this?
+            #for i in range(nfine):
+        #if self.deformations_points is not None:
 
         # reshape for all other transforms
         coords = coords.reshape(2,-1)
 
-        if self.region_affines is not None and self.region_affines[ind] is not None:
-            if verbose: print('Apply coords rough affine xform'); t = time.time()
-            tmp = self.region_affines[ind].astype(xdtype)
-            coords = np.dot(tmp[:2,:2], coords)
-            coords += tmp[:2,2][:,None]
-            if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
+        if self.regions_affines is not None:
+            nrough = len(self.regions_affines)
+            for i in range(nrough-1,-1,-1):
+                if self.regions_affines[i][ind] is not None:
+                    if verbose: print('Apply coords rough affine xform number {}'.format(i)); t = time.time()
+                    tmp = self.regions_affines[i][ind].astype(xdtype)
+                    coords = np.dot(tmp[:2,:2], coords)
+                    coords += tmp[:2,2][:,None]
+                    if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
+                else:
+                    assert(nrough == 1) # why would you do this?
 
         if verbose: print('Apply coords microscope translation and rotation'); t = time.time()
         # get rotation center and do all xforms for roi points
@@ -1461,7 +1500,10 @@ class wafer(region):
                 img = None
         elif self.input_data_type == msem_input_data_types.hdf5_stack:
             slice_image_fn = slice_image_fn + self.region_ext
-            roi_points, _ = big_img_load(slice_image_fn, dataset='roi_points')
+            try:
+                roi_points, _ = big_img_load(slice_image_fn, dataset='roi_points')
+            except:
+                roi_points = None
             if load_img:
                 if custom_rng is None:
                     _nblks = self.nblocks; _iblk = self.iblock; _novlp = self.block_overlap_pix
@@ -1514,7 +1556,12 @@ class wafer(region):
         # this is left in as _region_load_xforms. this method only supports block processing for the fine alignemnt.
         # the new method transforms the output coordinates in reverse back to the region images,
         # called _region_load_coords and it fully supports block processing, including for the rough transformations.
-        f_region_load = self._region_load_coords if self.use_coordinate_based_xforms else self._region_load_xforms
+        if self.use_coordinate_based_xforms:
+            f_region_load = self._region_load_coords
+        else:
+            f_region_load = self._region_load_xforms
+            assert(self.regions_affines is None or len(self.regions_affines) == 1) # use coord xforms
+            assert(self.deformations_points is None or len(self.deformations_points) == 1) # use coord xforms
         img, roi_points, control_points, img_shape, icrop_min, bgsel, tm_bw = \
             f_region_load(ind, slice_image_fn, bg_fill_type, do_bg_fill, region_size, img, bgsel, tm_bw,
                 load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, verbose, doplots)
@@ -1541,6 +1588,10 @@ class wafer(region):
             ctr = PolyCentroid(roi_points[:,0], roi_points[:,1])
             roi_points_scl = (roi_points - ctr)*self.roi_polygon_scale + ctr
             grid_selects = Path(roi_points_scl).contains_points(grid_points)
+
+        if self.custom_roi[i] is not None:
+            mask = Path(self.custom_roi[i]).contains_points(grid_points)
+            grid_selects = mask if grid_selects is None else np.logical_and(grid_selects, mask)
 
         bw = None
         if self.use_tissue_masks:
@@ -1634,7 +1685,7 @@ class wafer(region):
                 # this is an optimization for speed, with high image coverage it's better to preproc all at once.
                 if ngrid > self.ngrid_cutoff and doproc:
                     imgs_proc[i] = template_match_preproc(imgs[i], whiten_sigma=self._proc_whiten_sigma,
-                            aligned_copy=not self.image_crops_copy, clahe_clipLimit=self._proc_clahe_clipLimit,
+                            aligned_copy=False, clahe_clipLimit=self._proc_clahe_clipLimit,
                             clahe_tileGridSize=self._proc_clahe_tileGridSize, filter_size=self._proc_filter_size,
                             xcorr_img_size=csz.prod())
             img = imgs[i]; img_proc = imgs_proc[i]
@@ -2002,14 +2053,23 @@ class wafer(region):
 
             if save_masks_in:
                 # load the mask from the specified folder
-                tind = self.zorder[cnt]
+                tind = self.zorder[cnt] if self.zorder is not None else export_solved_order[x]
                 slice_image_fn = self._get_region_filename(x)
                 if self.tissue_mask_fn_str:
-                    pfn = self.tissue_mask_fn_str.format(tind)
+                    #pfn = self.tissue_mask_fn_str.format(tind)
+                    pfn = self.tissue_mask_fn_str.format(tind + 1) # xxx - thanks SM
                 else:
-                    pfn = os.path.basename(slice_image_fn)
+                    # xxx - meh, how to handle different suffix... just use the same one for mask export?
+                    pfn = os.path.basename(slice_image_fn) + '.tiff'
+                    #pfn = '_'.join(os.path.basename(slice_image_fn).split('_')[:-1]) + '_mask.tif'
                 fn = os.path.join(save_masks_in, pfn)
                 bw = tifffile.imread(fn).astype(bool)
+
+                # decided to apply the custom roi here against the mask, instead of dealing with it in run_regions,
+                #   because it would also need to be inverse transformed, which would result in a unique custom
+                #   polygon for every slice which would be annoying and unnecessary.
+                if self.custom_roi[x] is not None:
+                    bw = fill_outside_polygon(bw, np.array(self.custom_roi[x]) / rel_ds)
 
                 # invert the alignments in which the mask was generated
                 #   in order for it to align with the slice region image.
@@ -2163,7 +2223,7 @@ class wafer(region):
                     # paddings at different downsamplings can results in different sizes.
                     # so, crop to the downsampled output image size.
                     bw = bw[:oimg.shape[0], :oimg.shape[1]]
-                    oimg = bw
+                    oimg = bw.astype(np.uint8) # convert to uint8 so that webknossos can cube it
 
                 if do_overlays:
                     # dot legend (update this if changed):
@@ -2211,7 +2271,7 @@ class wafer(region):
                         big_img_save(h5fn, bgsel, img_shape=img_shape, nblks=self.nblocks, iblk=self.iblock,
                             novlp_pix=self.block_overlap_pix, dataset='background', recreate=True, compression=True,
                             img_shape_blk=img_shape_blk, bcrop=bcrop, f1=f1, f2=f2)
-                    if self.first_block:
+                    if self.first_block and roi_points is not None:
                         big_img_save(h5fn, roi_points, roi_points.shape, dataset='roi_points', recreate=True)
                     if lock: gpfs_file_unlock(f1,f2)
 

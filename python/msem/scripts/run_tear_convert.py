@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+os.system('date')
 
 # script to convert a downloaded webknossos tear annotation file into stored dills
 #   that are easily loadable in the msem package without the pain of dealing with
@@ -37,6 +39,7 @@ import shutil
 
 import tifffile
 from matplotlib import pyplot as plt
+os.system('date')
 
 # all parameters loaded from an experiment-specific import.
 # NOTE: def_common_params should load without any other msem dependencies, so only need it in the PYTHONPATH,
@@ -45,6 +48,7 @@ from def_common_params import get_paths, total_nwafers, all_wafer_ids #, legacy_
 from def_common_params import meta_folder, meta_dill_fn_str, wafer_region_prefix_str, order_txt_fn_str, region_suffix
 from def_common_params import tears_subfolder, torn_regions, tear_annotation_ds
 from def_common_params import region_manifest_cnts, region_include_cnts
+os.system('date')
 
 
 ### argparse

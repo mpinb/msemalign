@@ -37,9 +37,12 @@ def import_exclude_regions():
 # <<< path and filename parameters
 
 # root directories, change depending on run location
-root_raw = '/axon/axon_fs/cne-mSEM-data'
-root_thumb = '/axon/scratch/pwatkins/mSEM-data-thumbnails/ds4'
-root_align = '/axon/scratch/pwatkins/mSEM-proc'
+root_raw = '/gpfs/soma_fs/cne-mSEM/mSEM-data'
+root_thumb = '/gpfs/soma_fs/cne-mSEM/mSEM-data-thumbnails/ds4'
+root_align = '/gpfs/soma_fs/cne-mSEM/mSEM-proc'
+#root_raw = '/axon/axon_fs/cne-mSEM-data'
+#root_thumb = '/axon/scratch/pwatkins/mSEM-data-thumbnails/ds4'
+#root_align = '/axon/scratch/pwatkins/mSEM-proc'
 root_czi = root_raw
 
 # override or specify the voxel resolution
@@ -556,6 +559,10 @@ thumbnail_subfolders_order = [x + '_solve_order' for x in thumbnail_subfolders]
 # various debug plots save path, relative to meta
 debug_plots_subfolder = 'debug_plots'
 
+# define a custom polygon that can supplement the masks for only including features from with
+#   a particular polygon relative to the rough bounding box.
+custom_roi = [None for x in range(total_nwafers+1)]
+
 # for importing masks that define the tissue borders in each slice
 tissue_mask_path = None # to disable the tissue mask, also new mode where masks are saved to region hdf5s
 #tissue_mask_fn_str = '' # uses same name as the thumbnail exports
@@ -590,9 +597,9 @@ max_npts_feature_correspondence = 0 # to disable
 
 # basically how constrained to make the affine xform fit for the rough alignment of the SIFT points.
 #affine_rigid_type = 0 # full affine
-#affine_rigid_type = 1 # rigid, rotation and translation only
+affine_rigid_type = 1 # rigid, rotation and translation only
 #affine_rigid_type = 2 # rigid uniform scale
-affine_rigid_type = 3 # rigid nonuniform scale
+#affine_rigid_type = 3 # rigid nonuniform scale
 
 # minimum number of features fit to ransac transform to not reject match.
 # also used as threshold for minimum percent matches during image matching.
@@ -651,8 +658,8 @@ keypoints_nworkers_per_process = 10 # axon
 
 # parallelization of sift percent matches computations
 # total number of workers is ngpus*njobs_per_gpu*nprocesses
-matches_gpus = [0] # for single gpu
-#matches_gpus = [0,1,2,3] # on soma cluster 4 gpus per node
+#matches_gpus = [0] # for single gpu
+matches_gpus = [0,1,2,3] # on soma cluster 4 gpus per node
 
 # parallelization of sift keypoint and matches >>>
 

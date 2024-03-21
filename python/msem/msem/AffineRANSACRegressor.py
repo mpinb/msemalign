@@ -69,10 +69,12 @@ def ransac_job(ind, inds, ransac, Xpts, ypts, result_queue, verbose):
                 warnings.simplefilter(action='ignore')
                 ransac.fit(Xpts, ypts)
                 ccoef = ransac.estimator_.coef_.copy(); cmask = ransac.inlier_mask_.copy()
-                if ransac.n_trials_ < ransac.max_trials:
-                    fail_cnt = 0
-                else:
-                    fail_cnt += 1
+                fail_cnt = 0
+                # xxx - should we still take these fits if it hits max_trials without early stopping?
+                #if ransac.n_trials_ < ransac.max_trials:
+                #    fail_cnt = 0
+                #else:
+                #    fail_cnt += 1
         except:
             print('ransac fit failed:')
             print(traceback.format_exc())

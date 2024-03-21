@@ -46,6 +46,7 @@ import scipy.spatial.distance as scidist
 import scipy.stats as st
 import scipy.optimize as opt
 from scipy import signal
+import scipy.interpolate as interp
 
 import networkx as nx
 
@@ -320,7 +321,8 @@ def big_img_load(fn, nblks=[1,1], iblk=[0,0], novlp_pix=[0,0], dataset='image', 
             dest_sel = None if drng is None else np.s_[drng[0][0]:drng[0][1],drng[1][0]:drng[1][1]]
     image.read_direct(img_blk, source_sel=source_sel, dest_sel=dest_sel)
     if attrs is not None:
-        for k in attrs.keys(): attrs[k] = image.attrs[k]
+        for k in attrs.keys():
+            attrs[k] = image.attrs[k] if k in image.attrs else None
     fh.close()
 
     if return_rng:
@@ -573,18 +575,24 @@ def dill_lock_and_dump(fn, d, f1=None, f2=None):
 # used for filling in outliers deltas as part of the fine alignment process.
 # NOTE: this is a fully vectorized implementation, meaning that this will be very memory inefficient
 #   if you try to apply it at too many points (i.e., all pixel locations in a large image).
-def mls_rigid_transform(_v, p, q, alpha=1.0, tol=1e-6):
+def mls_rigid_transform(_v, p, q, alpha=1.0, tol=1e-6, dtype=np.double):
     ''' Rigid transform
     Image deformation using moving least squares
        see paper of same name by Schaefer et al
     ### Params:
-        * v - ndarray: an array with size [m, 2], points to transform
-        * p - ndarray: an array with size [n, 2], control points
-        * q - ndarray: an array with size [n, 2], deformed control points
+        * v - ndarray: an array with size [npts, 2], points to transform
+        * p - ndarray: an array with size [nctl, 2], control points
+        * q - ndarray: an array with size [nctl, 2], deformed control points
         * alpha - float: parameter used by weights
+        * dtype - data type to perform the calculations in, xxx - currently does nothing
     ### Return:
-        f_r - ndarray: an array with size [m, 2], deformed points from v
+        f_r - ndarray: an array with size [npts, 2], deformed points from v
+
+    NOTE: from paper: (_uT) is an operator on 2D vectors such that (x, y) = (−y, x).
     '''
+
+    assert( dtype == np.double ) # xxx - implement me?
+    _v = _v.astype(np.double); p = p.astype(np.double); q = q.astype(np.double)
 
     # <<< avoid divide by zero in the weight calculation
     # use a tolerance (something less than 1), because points in v that are very close to those in p
@@ -604,28 +612,28 @@ def mls_rigid_transform(_v, p, q, alpha=1.0, tol=1e-6):
     del knbrs, kdist, knnbrs
     # avoid divide by zero in the weight calculation >>>
 
-    m, n = v.shape[0], p.shape[0]
-    assert( q.shape[0] == n )
+    npts, nctl = v.shape[0], p.shape[0]
+    assert( q.shape[0] == nctl )
 
-    # shape (n,m,2)
+    # shape (nctl,npts,2)
     p_ij = p[:,None,:]
     q_ij = q[:,None,:]
     v_ij = v[None,:,:]
 
-    # weights, shape (n,m)
+    # weights, shape (nctl,npts)
     w = 1.0 / np.sum((p_ij - v_ij)**2, axis=2)**alpha
     w_ij = w[:,:,None]
     sum_w = np.sum(w, axis=0)
 
     # centroids
-    p_star = (w_ij * p_ij).sum(0) / sum_w[:,None] # shape (m,2)
-    q_star = (w_ij * q_ij).sum(0) / sum_w[:,None] # shape (m,2)
+    p_star = (w_ij * p_ij).sum(0) / sum_w[:,None] # shape (npts,2)
+    q_star = (w_ij * q_ij).sum(0) / sum_w[:,None] # shape (npts,2)
     p_star_ij = p_star[None,:,:]
     q_star_ij = q_star[None,:,:]
     p_hat_ij = p_ij - p_star_ij
     q_hat_ij = q_ij - q_star_ij
 
-    # similarity transform solved matrix
+    # similarity transform matrix
     p_hat_ij_uT = np.zeros_like(p_hat_ij)
     # from paper: (_uT) is an operator on 2D vectors such that (x, y) = (−y, x).
     p_hat_ij_uT[:,:,0] = -p_hat_ij[:,:,1]
@@ -634,15 +642,17 @@ def mls_rigid_transform(_v, p, q, alpha=1.0, tol=1e-6):
     v_minus_p_star_uT = np.zeros_like(v_minus_p_star)
     v_minus_p_star_uT[:,:,0] = -v_minus_p_star[:,:,1]
     v_minus_p_star_uT[:,:,1] = v_minus_p_star[:,:,0]
-    # transform matrix, shape (n,m,2,2)
+    # transform matrix, shape (nctl,npts,2,2)
     A_ij = w_ij[:,:,:,None] * np.matmul(\
-            np.concatenate((p_hat_ij[:,:,:,None], -p_hat_ij_uT[:,:,:,None]), axis=3),
-            np.concatenate((v_minus_p_star[:,:,:,None], -v_minus_p_star_uT[:,:,:,None]), axis=3).transpose(0,1,3,2))
+            np.concatenate((p_hat_ij[:,:,None,:], -p_hat_ij_uT[:,:,None,:]), axis=2),
+            np.concatenate((v_minus_p_star[:,:,:,None], -v_minus_p_star_uT[:,:,:,None]), axis=3))
+    del p_star, p_star_ij, p_hat_ij, p_hat_ij_uT, v_minus_p_star_uT
 
-    # f_r, shape (m,2)
-    f_bar_r = np.matmul(q_hat_ij[:,:,None,:], A_ij).sum(0).reshape(m,2)
-    v_minus_p_star = v_minus_p_star.reshape(m,2)
+    # f_r, shape (npts,2)
+    f_bar_r = np.matmul(q_hat_ij[:,:,None,:], A_ij).sum(0).reshape(npts,2)
+    v_minus_p_star = v_minus_p_star.reshape(npts,2)
     _f_r = np.sqrt((v_minus_p_star**2).sum(1))[:,None] * f_bar_r / np.sqrt((f_bar_r**2).sum(1))[:,None] + q_star
+    del q_star, q_star_ij, q_hat_ij, v_minus_p_star, A_ij, f_bar_r
 
     # <<< avoid divide by zero in the weight calculation
     if any_v_in_p:
@@ -655,6 +665,225 @@ def mls_rigid_transform(_v, p, q, alpha=1.0, tol=1e-6):
     # avoid divide by zero in the weight calculation >>>
 
     return f_r
+
+
+def mls_rigid_lines_transform(_v, p, q, tol=1e-6, dtype=np.double):
+    ''' Rigid transform using line segments
+    Image deformation using moving least squares
+       see paper of same name by Schaefer et al
+    ### Params:
+        * v - ndarray: an array with size [npts, 2], points to transform
+        * p - ndarray: an array with size [nctl, ncrv, 2], control line segment endpoints
+        * q - ndarray: an array with size [nctl, ncrv, 2], deformed line segment endpoints
+        * dtype - data type to perform the calculations in, xxx - not fully supported
+        ncrv is the number of points that define the "curve", for the line segments ncrv == 2
+    ### Return:
+        f_r - ndarray: an array with size [npts, 2], deformed points from v
+
+    NOTE: from paper: (_uT) is an operator on 2D vectors such that (x, y) = (−y, x).
+    '''
+
+    assert( dtype == np.double ) # xxx - implement me?
+    _v = _v.astype(np.double); p = p.astype(np.double); q = q.astype(np.double)
+
+    # <<< avoid divide by zero in the weight calculation
+    # use a tolerance (something less than 1), because points in v that are very close to the endpoints in p
+    #   can also cause MLS to explode.
+    knbrs = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(p.reshape(-1,2))
+    kdist, knnbrs = knbrs.kneighbors(_v, return_distance=True)
+    nsel_v = (kdist < tol).reshape(-1)
+    any_v_in_p = nsel_v.any()
+    if any_v_in_p:
+        #print('{} points in query ({}) within {} of control ({})'.format(nsel_v.sum(), _v.shape[0], tol, p.shape[0]))
+        closest_p_in_v = knnbrs.reshape(-1)[nsel_v]
+        sel_v = np.logical_not(nsel_v)
+        v = _v[sel_v,:]
+    else:
+        del nsel_v
+        v = _v
+    del knbrs, kdist, knnbrs
+    # avoid divide by zero in the weight calculation >>>
+
+    npts, nctl = v.shape[0], p.shape[0]
+    assert( q.shape[0] == nctl )
+
+    # endpoints of the line segments
+    # shape (nctl, 2)
+    a, b, c, d = p[:,0,:], p[:,1,:], q[:,0,:], q[:,1,:]
+    # shape (nctl, npts, 2)
+    a_ij, b_ij, c_ij, d_ij = a[:,None,:], b[:,None,:], c[:,None,:], d[:,None,:]
+    v_ij = v[None,:,:]
+
+    # <<< evaluate the weight function integrals
+
+    #   xxx - functionize this part? will we try to evaluate for different curve types?
+    # NOTE: paper says "we provide a closed-form solution for alpha=2".
+    #   xxx - is this a typo, actually alpha==1? this was the default for the point-based xforms.
+    a_minus_b = (a_ij - b_ij)
+    a_minus_v = (a_ij - v_ij)
+    a_minus_v_uT = np.zeros_like(a_minus_v)
+    a_minus_v_uT[:,:,0] = -a_minus_v[:,:,1]
+    a_minus_v_uT[:,:,1] = a_minus_v[:,:,0]
+    del a_minus_v
+    big_delta = (a_minus_v_uT * a_minus_b).sum(2)
+    del a_minus_b, a_minus_v_uT
+    sel = (np.abs(big_delta) < tol)
+    big_delta = big_delta[np.logical_not(sel)]
+
+    # the integral results used for the weights
+    # shape (nctl, npts)
+    delta00 = np.zeros((nctl, npts), dtype=dtype)
+    delta01 = np.zeros((nctl, npts), dtype=dtype)
+    delta11 = np.zeros((nctl, npts), dtype=dtype)
+
+    # for points that are co-linear with the line segment, big_delta is zero.
+    # integrals reduce to a different solution in these cases.
+    # from paper: "When v is on the line sgement defined by a_i and b_i, these ingegrals do not
+    #   need to be evlatuated because the function f(v) interpolates the line segments."
+    # xxx - but CAN they still be evaluated using the reduced colinear solutions?
+    #   ... did not see any point in a separate code path.
+    if sel.sum() > 0:
+        b_minus_a = (b_ij - a_ij)
+        norm_a_minus_b_5 = np.sqrt((b_minus_a * b_minus_a).sum(2)[sel])**5
+        a_minus_v_dot_b_minus_a = ((a_ij - v_ij) * b_minus_a).sum(2)[sel]
+        v_minus_b_dot_b_minus_a = ((v_ij - b_ij) * b_minus_a).sum(2)[sel]
+        del b_minus_a
+        delta00[sel] =  norm_a_minus_b_5 / (3 * v_minus_b_dot_b_minus_a    * a_minus_v_dot_b_minus_a**3)
+        delta01[sel] = -norm_a_minus_b_5 / (6 * v_minus_b_dot_b_minus_a**2 * a_minus_v_dot_b_minus_a**2)
+        delta11[sel] =  norm_a_minus_b_5 / (3 * v_minus_b_dot_b_minus_a**3 * a_minus_v_dot_b_minus_a   )
+        del norm_a_minus_b_5, a_minus_v_dot_b_minus_a, v_minus_b_dot_b_minus_a
+
+    sel = np.logical_not(sel)
+    if sel.sum() > 0:
+        b_minus_a = (b_ij - a_ij)
+        v_minus_b = (v_ij - b_ij)
+        b_minus_v_uT = np.zeros_like(v_minus_b)
+        b_minus_v_uT[:,:,0] = v_minus_b[:,:,1]
+        b_minus_v_uT[:,:,1] = -v_minus_b[:,:,0]
+        a_minus_v = (a_ij - v_ij)
+        a_minus_v_uT = np.zeros_like(a_minus_v)
+        a_minus_v_uT[:,:,0] = -a_minus_v[:,:,1]
+        a_minus_v_uT[:,:,1] = a_minus_v[:,:,0]
+        theta = np.arctan( (-v_minus_b *  b_minus_a).sum(2)[sel] / (b_minus_v_uT *  b_minus_a).sum(2)[sel] ) - \
+                np.arctan( ( a_minus_v * -b_minus_a).sum(2)[sel] / (a_minus_v_uT * -b_minus_a).sum(2)[sel] )
+        del b_minus_v_uT, a_minus_v_uT
+        coeff = np.sqrt((b_minus_a * b_minus_a).sum(2).repeat(npts, axis=1)[sel]) / (2*big_delta**2)
+        del b_minus_a
+        beta00 = (a_minus_v * a_minus_v).sum(2)[sel]
+        beta01 = (a_minus_v * v_minus_b).sum(2)[sel]
+        beta11 = (v_minus_b * v_minus_b).sum(2)[sel]
+        del v_minus_b, a_minus_v
+        coeff2 = theta / big_delta
+        delta00[sel] = coeff * ( beta01 / beta00 - beta11 * coeff2)
+        delta01[sel] = coeff * ( 1               - beta01 * coeff2 )
+        delta11[sel] = coeff * ( beta01 / beta11 - beta00 * coeff2 )
+        del coeff, coeff2, theta, beta00, beta01, beta11
+
+    del big_delta
+    # evaluate the weight function integrals >>>
+
+    # shape (nctl,npts,ncrv,2)
+    p_ij = p[:,None,:,:]
+    q_ij = q[:,None,:,:]
+
+    # shape (nctl,npts,2)
+    delta00 = delta00[:,:,None]; delta01 = delta01[:,:,None]; delta11 = delta11[:,:,None]
+    # centroids, shape (npts,2)
+    denom = (delta00 + 2*delta01 + delta11).sum(0)
+    delta_00_plus_01 = delta00 + delta01
+    delta_01_plus_11 = delta01 + delta11
+    p_star = (a_ij * delta_00_plus_01 + b_ij * delta_01_plus_11).sum(0) / denom
+    q_star = (c_ij * delta_00_plus_01 + d_ij * delta_01_plus_11).sum(0) / denom
+    del denom, delta_00_plus_01, delta_01_plus_11
+    # shape (nctl,npts,2)
+    p_star_ij = p_star[None,:,:]
+    q_star_ij = q_star[None,:,:]
+    # shape (nctl,npts,ncrv,2)
+    p_hat_ij = p_ij - p_star_ij[:,:,None,:]
+    q_hat_ij = q_ij - q_star_ij[:,:,None,:]
+    # shape (nctl,npts,2)
+    a_hat_ij, b_hat_ij = p_hat_ij[:,:,0,:], p_hat_ij[:,:,1,:]
+    c_hat_ij, d_hat_ij = q_hat_ij[:,:,0,:], q_hat_ij[:,:,1,:]
+
+    # multiply out the weight matrix with the first column vector of the similarity transform matrix.
+    a_hat_ij_uT = np.zeros_like(a_hat_ij)
+    a_hat_ij_uT[:,:,0] = -a_hat_ij[:,:,1]
+    a_hat_ij_uT[:,:,1] = a_hat_ij[:,:,0]
+    b_hat_ij_uT = np.zeros_like(b_hat_ij)
+    b_hat_ij_uT[:,:,0] = -b_hat_ij[:,:,1]
+    b_hat_ij_uT[:,:,1] = b_hat_ij[:,:,0]
+    # unrolled weight matrix, shape (nctl,npts,4,2)
+    W_ij = np.concatenate((
+            ( delta00 * a_hat_ij    + delta01 * b_hat_ij   )[:,:,None,:],
+            (-delta00 * a_hat_ij_uT - delta01 * b_hat_ij_uT)[:,:,None,:],
+            ( delta01 * a_hat_ij    + delta11 * b_hat_ij   )[:,:,None,:],
+            (-delta01 * a_hat_ij_uT - delta11 * b_hat_ij_uT)[:,:,None,:],
+            ), axis=2)
+    del a_hat_ij, a_hat_ij_uT, b_hat_ij, b_hat_ij_uT, delta00, delta01, delta11
+    v_minus_p_star = v_ij - p_star_ij
+    v_minus_p_star_uT = np.zeros_like(v_minus_p_star)
+    v_minus_p_star_uT[:,:,0] = -v_minus_p_star[:,:,1]
+    v_minus_p_star_uT[:,:,1] = v_minus_p_star[:,:,0]
+    # transform matrix, shape (nctl,npts,4,2)
+    A_ij = np.matmul(W_ij, np.concatenate((v_minus_p_star[:,:,:,None], -v_minus_p_star_uT[:,:,:,None]), axis=3))
+    del p_star, p_star_ij, p_hat_ij, v_minus_p_star_uT
+
+    # f_r, shape (npts,2)
+    f_bar_r = np.matmul(np.concatenate((c_hat_ij, d_hat_ij), axis=2)[:,:,None,:], A_ij).sum(0).reshape(npts,2)
+    v_minus_p_star = v_minus_p_star.reshape(npts,2)
+    _f_r = np.sqrt((v_minus_p_star**2).sum(1))[:,None] * f_bar_r / np.sqrt((f_bar_r**2).sum(1))[:,None] + q_star
+    del q_star, q_star_ij, q_hat_ij, v_minus_p_star, A_ij, f_bar_r
+
+    # <<< avoid divide by zero in the weight calculation
+    if any_v_in_p:
+        f_r = np.zeros_like(_v)
+        f_r[sel_v,:] = _f_r
+        # just the deformed control points for points in v that are very close to points in p
+        f_r[nsel_v,:] = q[closest_p_in_v,:]
+    else:
+        f_r = _f_r
+    # avoid divide by zero in the weight calculation >>>
+
+    return f_r
+
+
+def warp_image_remap_interp(img, pts, deltas, use_TPS=False):
+    img_shape = img.shape[:2]
+    nchans = 1 if img.ndim==2 else img.shape[2]
+    # img_dtype = img.dtype
+
+    # create a series of warped images
+    #grid_y, grid_x = np.indices((img_shape[0], img_shape[1]), dtype=np.double)
+    grid_pts = np.mgrid[:img_shape[0],:img_shape[1]]
+    grid_pts = grid_pts[::-1,:,:]
+    grid_x = grid_pts[0,:,:]; grid_y = grid_pts[1,:,:]
+
+    if not use_TPS:
+        print('Interpolating with griddata'); t = time.time()
+        vx = interp.griddata(pts, deltas[:,0], (grid_x, grid_y), fill_value=0., method='cubic')
+        vy = interp.griddata(pts, deltas[:,1], (grid_x, grid_y), fill_value=0., method='cubic')
+        print('\tdone in %.4f s' % (time.time() - t, ))
+    else:
+        print('Interpolating with TPS'); t = time.time()
+        xflat = grid_pts.reshape(2,-1).T
+        #n = None # all points as neighbors
+        n = 7
+        vx = interp.RBFInterpolator(pts, deltas[:,0], kernel='thin_plate_spline',
+                neighbors=n)(xflat).reshape(grid_x.shape)
+        vy = interp.RBFInterpolator(pts, deltas[:,1], kernel='thin_plate_spline',
+                neighbors=n)(xflat).reshape(grid_y.shape)
+        print('\tdone in %.4f s' % (time.time() - t, ))
+
+    coords = [vy+grid_y, vx+grid_x]
+    if nchans == 1:
+        image = nd.map_coordinates(img, coords, order=1, mode='constant', cval=0.0, prefilter=False)
+    else:
+        image = [None]*nchans
+        for i in range(nchans):
+            image[i] = nd.map_coordinates(img[:,:,i], coords, order=1, mode='constant', cval=0.0, prefilter=False)
+        image = np.concatenate([x[:,:,None] for x in image], axis=2)
+
+    return image
 
 
 # https://stackoverflow.com/questions/11498169/dealing-with-angle-wrap-in-c-code
@@ -1047,31 +1276,45 @@ def find_histo_mode(histo, mode_limits, mode_rel, histo_smooth_size):
 
 # <<< plotting functions for deltas / grid points
 
-def make_delta_plot(cgrid_points, deltas=None, grid_sel_r=None, grid_sel_b=None, center=False, figno=2):
-    scl = 0.1; msz = 36
+def make_delta_plot(cgrid_points, deltas=None, grid_sel_r=None, grid_sel_b=None, center=False, overlay=False,
+        quiver_color='k', figno=2):
+    scl = 0.05; msz = 24
+    #scl = 0.1; msz = 36
     #scl = 1.; msz = 36
-    min_cgrid = cgrid_points.min(0); max_cgrid = cgrid_points.max(0)
-    print('npts at xmin (nypts) {} ({})'.format((cgrid_points[:,0] == min_cgrid[0]).sum(),
-        2*(cgrid_points[:,0] == min_cgrid[0]).sum()-1))
-    print('npts at ymin (nxpts) {}'.format((cgrid_points[:,1] == min_cgrid[1]).sum()))
-    plt.figure(figno); plt.clf()
-    plt.scatter(cgrid_points[:,0], cgrid_points[:,1], c='g', s=msz, marker='.')
-    if grid_sel_r is not None:
-        plt.scatter(cgrid_points[grid_sel_r,0], cgrid_points[grid_sel_r,1], c='r', s=msz, marker='.')
-    if grid_sel_b is not None:
-        plt.scatter(cgrid_points[grid_sel_b,0], cgrid_points[grid_sel_b,1], c='b', s=msz, marker='.')
+    plt.figure(figno)
+    if not overlay:
+        min_cgrid = cgrid_points.min(0); max_cgrid = cgrid_points.max(0)
+        nypts = np.isclose(cgrid_points[:,0], min_cgrid[0]).sum()
+        top_left = np.isclose(cgrid_points, min_cgrid).all(1).any()
+        bottom_left = np.isclose(cgrid_points, [min_cgrid[0], max_cgrid[1]]).all(1).any()
+        if top_left and bottom_left:
+            nypts = 2*nypts - 1
+        elif not top_left and not bottom_left:
+            nypts = 2*nypts + 1
+        else:
+            nypts = 2*nypts
+        nxpts = np.isclose(cgrid_points[:,1], min_cgrid[1]).sum()
+        print('hex grid is {} x {} (x by y)'.format(nxpts, nypts))
+        plt.clf()
+        plt.scatter(cgrid_points[:,0], cgrid_points[:,1], c='g', s=msz, marker='.')
+        if grid_sel_r is not None:
+            plt.scatter(cgrid_points[grid_sel_r,0], cgrid_points[grid_sel_r,1], c='r', s=msz, marker='.')
+        if grid_sel_b is not None:
+            plt.scatter(cgrid_points[grid_sel_b,0], cgrid_points[grid_sel_b,1], c='b', s=msz, marker='.')
 
     #plt.plot(0, 0, 'r.')
     if deltas is not None:
         d = (deltas - deltas[0,:]) if center else deltas
         plt.quiver(cgrid_points[:,0], cgrid_points[:,1], d[:,0], d[:,1],
-                   angles='xy', scale_units='xy', scale=scl, color='k')
-    plt.xlim([min_cgrid[0], max_cgrid[0]])
-    plt.ylim([min_cgrid[1], max_cgrid[1]])
-    plt.gca().invert_yaxis()
-    plt.gca().set_aspect('equal')
-    plt.gcf().set_size_inches(8,6)
-    plt.axis('off')
+                   angles='xy', scale_units='xy', scale=scl, color=quiver_color)
+
+    if not overlay:
+        plt.xlim([min_cgrid[0], max_cgrid[0]])
+        plt.ylim([min_cgrid[1], max_cgrid[1]])
+        plt.gca().invert_yaxis()
+        plt.gca().set_aspect('equal')
+        plt.gcf().set_size_inches(8,6)
+        plt.axis('off')
 
 
 def make_grid_plot(simplices, cgrid_points, ctrs=None, deltas=None, figno=1):

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import os
+os.system('date')
+
 """run_regions.py
 
 Top level command-line interface for 2D alignment and montaging of image
@@ -46,6 +49,7 @@ import cv2
 # from sklearnex import patch_sklearn
 # patch_sklearn()
 from sklearn.neighbors import NearestNeighbors
+os.system('date')
 
 from msem import region, zimages
 from msem.utils import big_img_load, big_img_save, big_img_info, big_img_init, gpfs_file_unlock, tile_nblks_to_ranges
@@ -72,20 +76,22 @@ from def_common_params import region_stitching_twopass, region_stitching_twopass
 from def_common_params import tissue_mask_ds, tissue_mask_fn_str, tissue_mask_min_edge_um, tissue_mask_min_hole_edge_um
 from def_common_params import tears_subfolder, torn_regions, tear_annotation_ds, tear_grid_density
 from def_common_params import noblend_subfolder
+os.system('date')
 
 
 # <<< turn on stack trace for warnings
-import traceback
-import warnings
-#import sys
-
-def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
-    log = file if hasattr(file,'write') else sys.stderr
-    traceback.print_stack(file=log)
-    log.write(warnings.formatwarning(message, category, filename, lineno, line))
-
-warnings.showwarning = warn_with_traceback
-#warnings.simplefilter("always")
+#import traceback
+#import warnings
+##import sys
+#os.system('date')
+#
+#def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
+#    log = file if hasattr(file,'write') else sys.stderr
+#    traceback.print_stack(file=log)
+#    log.write(warnings.formatwarning(message, category, filename, lineno, line))
+#
+#warnings.showwarning = warn_with_traceback
+#warnings.simplefilter('error', UserWarning) # have the warning throw an exception
 # turn on stack trace for warnings >>>
 
 
@@ -121,6 +127,8 @@ parser.add_argument('--roi-polygon-scale', nargs=1, type=float, default=[1.],
     help='amount to scale the roi poly (ignore areas outside), 0 for disable')
 parser.add_argument('--tissue-masks', dest='tissue_masks', action='store_true',
     help='use (or export) the tissue masks')
+parser.add_argument('--histos-compute-areas', dest='histos_compute_areas', action='store_true',
+    help='when running histograms, also compute the roi/mask union area')
 parser.add_argument('--slice-rescale-range', nargs=2, type=float, default=[0.5, 99.5],
     help='histogram limits (<= 1) or grayscale limits for slice-contrast-rescale')
 parser.add_argument('--slice-adjust', nargs=1, type=float, default=[0.],
@@ -267,6 +275,9 @@ overlap_radius = args['overlap_radius'][0]
 
 # read in tissues masks for each slice, more refined/precise that roi polygon
 tissue_masks = args['tissue_masks']
+
+# when running histos, get the area (in pixels) of the mask used for computing histos
+histos_compute_areas = args['histos_compute_areas']
 
 # options for blockwise processing, mostly intended for native
 nblks = args['nblocks'][::-1]
@@ -433,12 +444,16 @@ any_slice_histo_adjust = (any_slice_histo_adjust or run_save_target_histo)
 
 # for parallelizing slice histogram calculations
 def compute_histos_job(ind, inds, fns, rois_points, use_tissue_mask, tissue_mask_min_size, tissue_mask_min_hole_size,
-        dsstep, nblks, use_iblk, result_queue, doplots, verbose):
+        dsstep, nblks, use_iblk, result_queue, compute_area, doplots, verbose):
     if verbose: print('\tworker%d: started' % (ind,))
     nimgs = len(fns); doinit = True
     single_block = all([x==1 for x in nblks])
     for i in range(nimgs):
-        histo = None
+        histo = None; area = 0
+        # xxx - somehow gpfs created a situation where everything was normal:
+        #   (1) empty stderr file (2) special message printed (3) all jobs completed normally
+        #   and still one of the h5 files had empty blocks that were not written.
+        write_count_unique = write_count_expected = -1
         if fns[i] is not None:
             # decided to support blockwise processing serially. did not see a situation where slices become so
             #   large that this is prohibitive (diferent slices parallized by workers here and also by processes).
@@ -447,7 +462,11 @@ def compute_histos_job(ind, inds, fns, rois_points, use_tissue_mask, tissue_mask
                 iblk = np.unravel_index(b, nblks)
                 if use_iblk is not None and not all([x == y for x,y in zip(use_iblk, iblk)]): continue
                 if verbose: print('Loading {}, block {} {}'.format(fns[i],iblk[0],iblk[1])); t = time.time()
-                img, img_shape, blk_rng = big_img_load(fns[i], nblks=nblks, iblk=iblk, return_rng=True)
+                attrs={'write_mask':None} if write_count_unique < 0 else write_count_unique
+                img, img_shape, blk_rng = big_img_load(fns[i], nblks=nblks, iblk=iblk, return_rng=True, attrs=attrs)
+                if write_count_unique < 0:
+                    write_count_unique = int((attrs['write_mask'] > 0).sum())
+                    write_count_expected = int(np.prod(np.array(attrs['write_mask'].shape)))
                 if verbose:
                     print('\tdone loading in %.4f s' % (time.time() - t, ))
                     print('img blk is {}x{}'.format(img.shape[1],img.shape[0]))
@@ -466,7 +485,6 @@ def compute_histos_job(ind, inds, fns, rois_points, use_tissue_mask, tissue_mask
                 if cpts is not None:
                     if verbose: print('Fill 0 outside polygon'); t = time.time()
                     img = fill_outside_polygon(img, cpts, docrop=(single_block and not use_tissue_mask))
-                    if single_block: cpts = cpts - cpts.min(0)
                     if verbose: print('\tdone filling in %.4f s' % (time.time() - t, ))
                 if use_tissue_mask:
                     if verbose: print('Fill 0 outside mask {}'); t = time.time()
@@ -528,24 +546,18 @@ def compute_histos_job(ind, inds, fns, rois_points, use_tissue_mask, tissue_mask
 
                     # zero out everything outside of mask (as with polygon)
                     img[bw] = 0
-                #if mask_fns[i] is not None:
+                    if compute_area:
+                        nbw = np.logical_not(bw)
+                        nbw = fill_outside_polygon(nbw, cpts)
+                        area = nbw.sum(dtype=np.int64)
+                #if use_tissue_mask:
 
                 if verbose: print('Img is {}x{}'.format(img.shape[1],img.shape[0]))
 
                 # for validation, keeping for reference / debug
                 if doplots:
-                    #import matplotlib.patches as patches
                     plt.figure(); plt.gcf().clf()
-                    #bw = fill_outside_polygon(np.logical_not(bw), cpts, docrop=(single_block and mask_fns[i] is None))
-                    #img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                    #tmp = np.zeros(bw.shape + (3,), dtype=np.uint8)
-                    #tmp[bw,2] = 255
-                    #img = cv2.addWeighted(tmp, 1., img, 1, 0.0)
-                    #plt.imshow(img)
                     plt.imshow(img, cmap='gray')
-                    #poly = patches.Polygon(cpts, linewidth=2, edgecolor='r',
-                    #                       facecolor='none', linestyle='--',)
-                    #plt.gca().add_patch(poly)
                     plt.show()
 
                 if doinit:
@@ -559,9 +571,12 @@ def compute_histos_job(ind, inds, fns, rois_points, use_tissue_mask, tissue_mask
                 if verbose: print('\tdone with histo in %.4f s' % (time.time() - t, ))
             #for b in range(tblks):
         #if fns[i] is not None:
-        res = {'ind':inds[i], 'histo':histo, 'iworker':ind}
+        res = {'ind':inds[i], 'histo':histo, 'area':area, 'write_count_unique':write_count_unique,
+                'write_count_expected':write_count_expected, 'iworker':ind}
         result_queue.put(res)
+    #for i in range(nimgs):
     if verbose: print('\tworker%d: completed' % (ind,))
+#def compute_histos_job(
 
 def load_brightness_other(fn, strkey, ftype):
     print("load_brightness_other '{}'".format(fn))
@@ -1638,9 +1653,8 @@ for wafer_id in wafer_ids:
             workers[i] = mp.Process(target=compute_histos_job, daemon=True,
                     args=(i, inds[i], slice_histos_include_fns[inds[i][0]:inds[i][-1]+1],
                         slice_histos_roi_polys[inds[i][0]:inds[i][-1]+1],
-                        #slice_histos_mask_fns[inds[i][0]:inds[i][-1]+1],
-                        tissue_masks, cregion.tissue_mask_min_size, cregion.tissue_mask_min_hole_size,
-                        dsstep, nblks, None if no_iblock else iblk, result_queue, show_plots, True))
+                        tissue_masks, cregion.tissue_mask_min_size, cregion.tissue_mask_min_hole_size, dsstep, nblks,
+                        None if no_iblock else iblk, result_queue, histos_compute_areas, show_plots, True))
             workers[i].start()
         # NOTE: only call join after queue is emptied
 
@@ -1671,7 +1685,12 @@ for wafer_id in wafer_ids:
 
             # the size of the histo is already set in the hdf5, so the -1 gets broadcast
             histo = res['histo'] if res['histo'] is not None else -np.ones((1,), dtype=np.int64)
-            big_img_save(slice_histos_fns[res['ind']], histo, histo.shape, dataset='histogram'+dsstr)
+            if res['write_count_unique'] < res['write_count_expected']:
+                print('write_count_unique {} < write_count_expected {}: {}'.format(
+                    res['write_count_unique'], res['write_count_expected'], slice_histos_fns[res['ind']]))
+                assert(False)
+            big_img_save(slice_histos_fns[res['ind']], histo, histo.shape, dataset='histogram'+dsstr,
+                attrs={'area':res['area']})
             worker_cnts[res['iworker']] += 1
             i += 1
         assert(result_queue.empty())

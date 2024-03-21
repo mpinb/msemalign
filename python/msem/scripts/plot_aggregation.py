@@ -19,6 +19,12 @@ You should have received a copy of the GNU General Public License along with
 this program. If not, see <http://www.gnu.org/licenses/>.
 """
 
+# <<< so figures can be saved without X11, uncomment
+#import matplotlib as mpl
+#mpl.use('Agg')
+# so figures can be saved without X11, uncomment >>>
+import matplotlib.pyplot as plt
+
 import os
 import dill
 import argparse
@@ -32,13 +38,28 @@ import scipy.ndimage as nd
 # from sklearnex import patch_sklearn
 # patch_sklearn()
 from sklearn import linear_model, preprocessing
+from sklearn.neighbors import NearestNeighbors
 
 import matplotlib.tri as mtri
-import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
 from def_common_params import meta_folder, meta_dill_fn_str, fine_grid_xy_spc
 from msem.utils import big_img_load, big_img_info
+from msem import wafer_solver
+
+# <<< turn on stack trace for warnings
+#import traceback
+#import warnings
+#import sys
+#
+#def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
+#    log = file if hasattr(file,'write') else sys.stderr
+#    traceback.print_stack(file=log)
+#    log.write(warnings.formatwarning(message, category, filename, lineno, line))
+#
+#warnings.showwarning = warn_with_traceback
+#warnings.simplefilter('error', UserWarning) # have the warning throw an exception
+# turn on stack trace for warnings >>>
 
 ## argparse
 
@@ -61,6 +82,8 @@ parser.add_argument('--no-negate-deltas', dest='negate_deltas', action='store_fa
                     help='do not flip the sign on the deltas (the mapping direction)')
 parser.add_argument('--quiver_scale', nargs=1, type=float, default=[1.],
                     help='scale for the delta quivers, 1. is at xy scale')
+parser.add_argument('--fine_xcorrs-tsp', dest='fine_xcorrs_tsp', action='store_true',
+                    help='special mode for fine xcorrs plots to run local reordering')
 
 args = parser.parse_args()
 args = vars(args)
@@ -89,6 +112,9 @@ mean_wafer_id = args['mean_wafer_id'][0]
 
 # scale for delta quivers, > 1. scales arrows down, < 1. scales arrows up
 quiver_scl = args['quiver_scale'][0]
+
+# special mode along with fine xcorrs plots that reruns tsp solver to do local re-orderings
+fine_xcorrs_tsp = args['fine_xcorrs_tsp']
 
 # this is an identifier so that multiple rough/fine alignemnts can be exported / loaded easily.
 run_str = args['run_str'][0]
@@ -581,7 +607,7 @@ if fine_outliers_plot:
         if save_plots: plt.gcf().savefig(os.path.join(outdir,'noutliers_crop{}_diff.png').format(c))
 
     # plot of mean percent outliers with moving average removed
-    cutoff = 0.05
+    cutoff = 0.15
     #sum_crops_percent_inliers_mean_nbrs = percent_inliers_mean_nbrs.sum(1) # why sum over crops?
     sum_crops_percent_inliers_mean_nbrs = percent_inliers_mean_nbrs[:,-1]
     ma = nd.uniform_filter1d(sum_crops_percent_inliers_mean_nbrs, 21, axis=0)
@@ -593,6 +619,7 @@ if fine_outliers_plot:
     print('Top low percent inliers (based on moving diff > {:.5f}):'.format(cutoff))
     inds = np.argsort(madiff,axis=0); i = np.nonzero(madiff[inds] > cutoff)[0]
     offset = 0 # can set this for the crops so the original z index is printed, for example
+    #print(i.size)
     if i.size > 0:
         for j in range(madiff.size-1, i[0]-1, -1):
         #for j in range(madiff.size-1, madiff.size-10, -1):
@@ -612,6 +639,8 @@ if fine_outliers_plot:
     if not save_plots: plt.show()
 
 if fine_xcorrs_plot:
+    print_excel = False
+
     if use_reslice:
         print('WARNING: currently only a single process fine reslice supported')
         print('WARNING: reslice MUST be generated as a single block')
@@ -654,20 +683,128 @@ if fine_xcorrs_plot:
 
     # to identify possible swap locations
     bw = (xcorr_nbr_comp[:,0] > 0)
-    print(bw.sum())
+    #print(bw.sum())
     labels, nlbls = nd.label(bw)
+    xcorr_nbr_positives = []
     if nlbls > 0:
         sizes = np.bincount(np.ravel(labels))[1:] # component sizes
         rmv = np.nonzero(sizes < 2)[0] + 1
-        #rmv = np.nonzero(sizes < 1)[0] + 1
+        #rmv = np.nonzero(sizes < 1)[0] + 1 # does nothing, just so the rmv block does not need to be commented
         if rmv.size > 0:
             sel = np.isin(labels, rmv)
             bw[sel] = 0
             labels[sel] = 0
             labels, nlbls = nd.label(labels > 0)
-        print(nlbls)
+        print('Number of xcorr neighbor positives {}'.format(nlbls))
         slcs = nd.find_objects(labels)
-        print([x[0].start for x in slcs])
-        for slc in slcs: print(slc[0].start)
+        xcorr_nbr_positives = [x[0].start for x in slcs]
+        print(xcorr_nbr_positives)
+        if print_excel:
+            print('Indices (for copying to excel):')
+            for slc in slcs: print(slc[0].start)
+    xcorr_nbr_positives = np.array(xcorr_nbr_positives)
+
+    if fine_xcorrs_tsp:
+        print('running tsp solver in local neighborhoods using distance as one-minus-xcorr values')
+
+        z_nnbrs_rad = [15, 5]
+        min_inliers = 10
+        assert(z_nnbrs_rad[0] > z_nnbrs_rad[1]  + 1 > 2)
+
+        # code mostly copied from wafer_aggregator.py reconcile_deltas_job.
+        # assign same variable names.
+        n = nimgs
+        assert(nnbrs % 2 == 0)
+        neighbor_range = nnbrs//2
+        neighbor_rng = [x for x in range(-neighbor_range,neighbor_range+1) if x != 0]
+        nneighbors = nnbrs
+
+        z_nnbrs = 2*z_nnbrs_rad[0] + 1
+        assert(z_nnbrs < n) # z neighborhood can not be bigger than the number of slices
+        z_nearest = NearestNeighbors(n_neighbors=z_nnbrs, algorithm='kd_tree').fit(np.arange(n).reshape(-1,1))
+        nlocal = z_nnbrs #; nlocal_nbrs = z_nnbrs + nneighbors
+        #min_nnbrs = -min(neighbor_rng)
+        # second array value is the radius size of the chunk to store in each iteration (ziters).
+        # the overlap that is not part of the chunk but part of the neighborhood is discarded.
+        nchunks = max([np.round(n/(2*z_nnbrs_rad[1])).astype(np.int64), 1])
+        ichunks = np.array_split(np.arange(n), nchunks)
+        ziters = len(ichunks)
+
+        print('Computing shortest path through slices z_nnbrs_rad = {} {}'.format(*z_nnbrs_rad)); t = time.time()
+        # m = nlocal_nbrs
+        m = z_nnbrs
+        global_tour = np.zeros(n, dtype=np.int64)
+        for iz in range(ziters):
+            # distance matrix that the TSP solver will be applied to
+            xcd = np.zeros((m,m), dtype=np.double)
+
+            zinds = np.sort(z_nearest.kneighbors(np.array([ichunks[iz].mean(dtype=np.int64)]).reshape((1,1)),
+                    return_distance=False).reshape(-1))
+            # range to be solved in original slice indices
+            zrng = [zinds.min(), zinds.max()+1]
+            # range to be stored in original slice indices (not including overlap)
+            crng = [ichunks[iz].min(), ichunks[iz].max()+1]
+            # range to be stored in adjacency matrix indices (not including overlap)
+            # lcrng = [np.nonzero(zinds == crng[0])[0][0] + min_nnbrs,
+            #             np.nonzero(zinds == crng[1] - 1)[0][0] + min_nnbrs + 1]
+            lcrng = [np.nonzero(zinds == crng[0])[0][0],
+                        np.nonzero(zinds == crng[1] - 1)[0][0] + 1]
+
+            # outer loop over slices to be solved
+            for i,il in zip(range(zrng[0],zrng[1]), range(nlocal)):
+                # inner loop over number of neighboring slices to use
+                for k,ik in zip(neighbor_rng, range(nneighbors)):
+                    j = i+k; jl = il+k
+                    # unlike the loops in reconcile_deltas_job, do not include the "trailing" neighbors.
+                    if il < 0 or il >= m or jl < 0 or jl >= m: continue
+
+                    # xcorrs = xcorrs.reshape((nimgs,nnbrs,-1))
+                    if xcorrs[i,ik,:].count() > min_inliers:
+                        xcd[jl,il] = xcorrs[i,ik,:].mean() # worked best in quick tests, others too many FPs
+                        #xcd[jl,il] = np.ma.median(xcorrs[i,ik,:])
+                        #xcd[jl,il] = xcorrs[i,ik,:].max()
+                        #xcd[jl,il] = xcorrs[i,ik,:].min()
+                #for k,ik in zip(neighbor_rng, range(nneighbors)):
+            #for i,il in zip(range(zrng[0],zrng[1]), range(nlocal)):
+
+            xcd, _ = wafer_solver.preprocess_percent_matches(xcd)
+            # xxx - this does not work if the solver tries to swap one of the single specified endpoints
+            #iendpoints = [0 if iz > 0 else None, m-1 if iz < ziters-1 else None]
+            iendpoints = [0, m-1]
+            tour, endpoints = wafer_solver.normxcorr_tsp_solver(xcd, iendpoints=iendpoints)
+
+            global_tour[crng[0]:crng[1]] = tour[lcrng[0]:lcrng[1]] + zrng[0]
+            #print(crng, lcrng, zrng)
+            #print(global_tour[crng[0]:crng[1]], tour[lcrng[0]:lcrng[1]])
+            #print(tour)
+            #print()
+        # for iz in range(ziters):
+        print('\tdone in %.4f s' % (time.time() - t, ))
+        xcorr_tsp_positives = np.nonzero(global_tour != np.arange(n))[0]
+        print('{} tour locations differing from original z-ordering:'.format(xcorr_tsp_positives.size))
+        print(xcorr_tsp_positives)
+        if print_excel:
+            print('Indices (for copying to excel):')
+            for x in xcorr_tsp_positives: print(x)
+        print('Proposed order at tour locations differing from original z-ordering:')
+        print(global_tour[xcorr_tsp_positives])
+        if print_excel:
+            print('Indices (for copying to excel):')
+            for x in global_tour[xcorr_tsp_positives]: print(x)
+
+        cutoff = 5
+        print('Locations that agree within {} in z'.format(cutoff))
+        xcorr_nn = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(xcorr_nbr_positives.reshape(-1,1))
+        xcdist, xcinds = xcorr_nn.kneighbors(xcorr_tsp_positives.reshape(-1,1), return_distance=True)
+        xcinds = np.unique(xcinds[xcdist <= cutoff])
+        print(xcorr_nbr_positives[xcinds])
+        #print('Indices (for copying to excel):')
+        #for x in xcorr_nbr_positives[xcinds]: print(x)
+
+        plt.figure(13)
+        plt.plot(global_tour)
+        plt.ylabel('new tour')
+        plt.xlabel('original z-ordering')
+    #if fine_xcorrs_tsp:
 
     if not save_plots: plt.show()

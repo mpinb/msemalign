@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import os
+os.system('date')
+
 """run_wafer_solver.py
 
 Top level command-line interface for the wafer ordering solving and for
@@ -31,6 +34,7 @@ import os
 import sys
 import argparse
 import time
+os.system('date')
 
 from msem import wafer, wafer_solver
 from msem.utils import make_hex_points, dill_lock_and_load, dill_lock_and_dump
@@ -45,12 +49,13 @@ from def_common_params import region_suffix, thumbnail_suffix
 from def_common_params import lowe_ratio, nfeatures, max_npts_feature_correspondence
 from def_common_params import affine_rigid_type, min_feature_matches, roi_polygon_scales, matches_iroi_polygon_scales
 from def_common_params import rough_residual_threshold_um, min_fit_pts_radial_std_um, max_fit_translation_um
-from def_common_params import rough_bounding_box_xy_spc, rough_grid_xy_spc
+from def_common_params import rough_bounding_box_xy_spc, rough_grid_xy_spc, custom_roi
 from def_common_params import wafer_solver_bbox_xy_spc, wafer_solver_bbox_trans
 from def_common_params import keypoints_nworkers_per_process, keypoints_nprocesses, matches_full, matches_gpus
 from def_common_params import keypoints_filter_size, keypoints_rescale
 from def_common_params import tissue_mask_path, tissue_mask_fn_str, tissue_mask_ds
 from def_common_params import tissue_mask_min_edge_um, tissue_mask_min_hole_edge_um, tissue_mask_bwdist_um
+os.system('date')
 
 
 ## argparse
@@ -115,10 +120,11 @@ parser.add_argument('--percent-matches-topn', nargs=1, type=int, default=[0],
 parser.add_argument('--percent-matches-normalize', dest='percent_matches_normalize', action='store_true',
     help='normalize percent matches for solver with row means/stds')
 parser.add_argument('--percent-matches-normalize-minmax', dest='percent_matches_normalize_minmax',
-    action='store_true',
-    help='normalize percent matches for solver with row means/stds')
+    action='store_true', help='normalize percent matches for solver with row means/stds')
 parser.add_argument('--random-exclude-perc', nargs=1, type=float, default=[0.],
     help='a sensitivity test for the order solving method')
+parser.add_argument('--keep-sift-perc', nargs=1, type=float, default=[0.],
+    help='another sensitivity test for the order solving method')
 # make ransac iterations easily controlable from command line
 # because of heuristics in wafer_solver ransac, makes sense for default to be a few repeats
 parser.add_argument('--ransac-repeats', nargs=1, type=int, default=[5],
@@ -235,8 +241,13 @@ percent_matches_normalize = args['percent_matches_normalize']
 percent_matches_normalize_minmax = args['percent_matches_normalize_minmax']
 
 # a sensitivity test for the order solving method, introduce a random percentage of "removed slices".
-# 0.0 deafult normal setting is normal functionality (no test).
+# 0.0 default normal setting is normal functionality (no test).
 random_exclude_perc = args['random_exclude_perc'][0]
+
+# a sensitivity test for the order solving method.
+# randomly remove this percentage of SIFT features from each slice.
+# 0.0 or 1.0 default normal setting is normal functionality (no test).
+sample_p = args['keep_sift_perc'][0]
 
 ## fixed parameters not exposed in def_common_params
 
@@ -387,8 +398,11 @@ for skip_slices_cross_wafer_ind in skip_slices_cross_wafer_inds:
         # changed this code path so that all that happens is calculating keypoints.
         # needed to separate out workflow because over about 500 slices / wafer
         #   the entire workflow is no longer runable at once on machine with 64G memory.
-        solver.compute_wafer_keypoints(nfeatures, nthreads_per_job=arg_nworkers, iprocess=iprocess,
-            filter_size=keypoints_filter_size, rescale=keypoints_rescale)
+        custom_polygon = custom_roi[wafer_ids[0]]
+        custom_polygon = np.array(custom_polygon) if custom_polygon is not None else None
+        solver.compute_wafer_keypoints(nfeatures, custom_polygon=custom_polygon,
+            nthreads_per_job=arg_nworkers, iprocess=iprocess, filter_size=keypoints_filter_size,
+            rescale=keypoints_rescale, sample_p=sample_p)
         solver.wafer_images = [None]*solver.wafer_nimages
         d = {'wafer_descriptors':solver.wafer_descriptors,
              'wafer_pickleable_keypoints':solver.wafer_pickleable_keypoints,

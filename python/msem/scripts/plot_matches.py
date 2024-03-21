@@ -28,7 +28,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 import scipy.ndimage as nd
 
-from def_common_params import get_paths, exclude_regions
+from def_common_params import get_paths, exclude_regions, all_wafer_ids
 from def_common_params import matches_dill_fn_str
 from def_common_params import keypoints_nprocesses, keypoints_dill_fn_str
 from def_common_params import order_txt_fn_str
@@ -118,6 +118,15 @@ if keypoints_histo:
         for k in d['wafer_processed_keypoints']:
             descriptors_cnt[k] = d['wafer_descriptors'][k].shape[0]
         del d
+
+    # for generating a prettier plot, dump dill
+    dill_fn = 'sift_counts.dill'
+    if os.path.isfile(dill_fn):
+        with open(dill_fn, 'rb') as f: d = dill.load(f)
+    else:
+        d = {'descriptors_cnt':[[] for x in range(max(all_wafer_ids)+1)],}
+    d['descriptors_cnt'][wafer_id] = descriptors_cnt
+    with open(dill_fn, 'wb') as f: dill.dump(d, f)
 
     # descriptors_cnt = np.array([x.shape[0] for x in all_descriptors])
     histK,bins = np.histogram(descriptors_cnt, 50)
@@ -259,6 +268,18 @@ plt.title(tstr)
 plt.legend(['full matrix', 'row max'])
 plt.ylabel('normalized log count')
 plt.xlabel('% matches')
+
+# plot the percent matches matrix using scatter (so large matrices are more visible)
+# image of the percent keypoints matches matrix used to solve region order (TSP)
+plt.figure()
+tmp = percent_matches.copy()
+tmp[tmp < ncutoff] = 0
+inds = np.transpose(np.nonzero(tmp))
+c = tmp[inds[:,0], inds[:,1]]
+#c = np.log10(c)
+plt.scatter(inds[:,1], inds[:,0], c=c, s=12, marker='.')
+plt.gca().invert_yaxis()
+plt.gca().set_aspect('equal')
 
 
 if nregions > 0:

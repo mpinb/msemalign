@@ -28,26 +28,31 @@ import sys
 # import time
 
 try:
-    from def_common_params import get_paths, order_txt_fn_str, exclude_txt_fn_str
-    from def_common_params import all_wafer_ids, region_manifest_cnts
+    from def_common_params import get_paths, order_txt_fn_str, exclude_txt_fn_str, wafer_region_prefix_str
+    from def_common_params import all_wafer_ids, region_manifest_cnts, region_include_cnts
 except ModuleNotFoundError:
     print('WARNING: no def_common_params (must specify wafer ids info)')
     order_txt_fn_str = 'wafer{:02d}_region_solved_order.txt'
     exclude_txt_fn_str = 'wafer{:02d}_region_excludes.txt'
     get_paths = all_wafer_ids = region_manifest_cnts = None
 
+try:
+    import webknossos as wk
+except:
+    print('WARNING: no webknossos (needed for --solved_zinds-nml)')
+
 # <<< turn on stack trace for warnings
-import traceback
-import warnings
-#import sys
-
-def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
-    log = file if hasattr(file,'write') else sys.stderr
-    traceback.print_stack(file=log)
-    log.write(warnings.formatwarning(message, category, filename, lineno, line))
-
-warnings.showwarning = warn_with_traceback
-#warnings.simplefilter("always")
+#import traceback
+#import warnings
+##import sys
+#
+#def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
+#    log = file if hasattr(file,'write') else sys.stderr
+#    traceback.print_stack(file=log)
+#    log.write(warnings.formatwarning(message, category, filename, lineno, line))
+#
+#warnings.showwarning = warn_with_traceback
+#warnings.simplefilter('error', UserWarning) # have the warning throw an exception
 # turn on stack trace for warnings >>>
 
 ### argparse
@@ -60,8 +65,22 @@ parser.add_argument('--write-order', dest='write_order', action='store_true',
     help='write out the wafer orders (default write manual-reorder.txt')
 parser.add_argument('--reorder-file', nargs=1, type=str, default=['manual-reorder.txt'],
     help='specify the name of the manual reorder file (to be edited or edited)')
+parser.add_argument('--swap-file', nargs=1, type=str, default=[''],
+    help='specify the name of a file with swap to incorporate into reorder file')
 parser.add_argument('--sort-excludes', dest='sort_excludes', action='store_true',
     help='in write-order mode, sort the excludes by region')
+parser.add_argument('--wafer-region_ids-lookup', nargs='+', type=int, default=[],
+    help='convert list consisting of wafer_id, region_ind (base 1)')
+parser.add_argument('--region_zinds-lookup', nargs='+', type=int, default=[],
+    help='convert list of region zinds (base 0)')
+parser.add_argument('--solved_zinds-lookup', nargs='+', type=int, default=[],
+    help='convert list of solved zinds (base 0)')
+parser.add_argument('--solved_zinds-nml', nargs=2, type=str, default=['', ''],
+    help='create dummy nml file (and dataset name) to serve as solved zind lookup')
+parser.add_argument('--solved_zinds-nml-pos', nargs=2, type=int, default=[0,0],
+    help='specify position for --solved_zinds-nml node placement (2D)')
+parser.add_argument('--solved_zinds-nml-voxel_size', nargs=3, type=int, default=[1,1,1],
+    help='specify voxel size for the *dummy* nml solved zind lookup')
 args = parser.parse_args()
 args = vars(args)
 
@@ -80,9 +99,23 @@ write_order = args['write_order']
 # filename for the edited / to be edited manual reordering
 reorder_file = args['reorder_file'][0]
 
+# optional filename for to perform a "batch" of swaps.
+# format is one swap per line (base 0), existing_index new_index
+swap_file = args['swap_file'][0]
+
 # optionally write the order out
 sort_excludes = args['sort_excludes']
 
+# special mode for converting indices
+wafer_region_ids_lookup = args['wafer_region_ids_lookup']
+region_zinds_lookup = args['region_zinds_lookup']
+solved_zinds_lookup = args['solved_zinds_lookup']
+
+# special mode for converting all solved indices into a dummy nml.
+# can use this as a lookup in webknossos.
+solved_zinds_nml = args['solved_zinds_nml']
+solved_zinds_nml_pos = args['solved_zinds_nml_pos']
+solved_zinds_nml_voxel_size = args['solved_zinds_nml_voxel_size']
 
 ## fixed parameters not exposed in def_common_params
 
@@ -112,6 +145,99 @@ if region_manifest_cnts is None: region_manifest_cnts = [None] + wafer_manifest_
 
 nwafers = len(all_wafer_ids)
 
+if solved_zinds_nml[0]:
+    solved_zinds_lookup = range(sum(region_manifest_cnts[1:]))
+
+# special modes for that convert wafer ids / region inds back and forth between region and solved order z indices
+if len(wafer_region_ids_lookup) > 0 or len(region_zinds_lookup) > 0 or len(solved_zinds_lookup) > 0:
+    cum_manifest_cnts = np.concatenate(([0], np.cumsum(region_manifest_cnts[1:])))
+    cum_include_cnts = np.concatenate(([0], np.cumsum(region_include_cnts[1:])))
+    cum_exclude_cnts = cum_manifest_cnts - cum_include_cnts
+
+    if solved_zinds_nml[0]:
+        annotation = wk.Annotation(name="zind-to-region-ind-lookup",
+            dataset_name=solved_zinds_nml[1], voxel_size=solved_zinds_nml_voxel_size)
+        group = annotation.skeleton.add_group("solved_zind_to_region")
+
+    if len(wafer_region_ids_lookup) > 0:
+        tmp = np.array(wafer_region_ids_lookup).reshape(-1,2)
+        wafer_ids = tmp[:,0]
+        use_region_inds = tmp[:,1]
+    else:
+        wafer_ids = None
+        use_region_inds = region_zinds_lookup if len(region_zinds_lookup) > 0 else solved_zinds_lookup
+
+    print('{: <25} {: <7} {: <7} {: <7} {: <7} {}'.format('prefix', 'wafer', 'region', 'zind', 'zslvd', 'excl?'))
+    for wafer_id, wafer_ind in zip(all_wafer_ids, range(nwafers)):
+        if wafer_ids is not None and wafer_id not in wafer_ids: continue
+        _, _, _, alignment_folder, _, region_strs = get_paths(wafer_id)
+        nregions = sum([len(x) for x in region_strs])
+        # region_strs is a list of lists unfortunately, seperated by experiment folders. flatten.
+        region_strs_flat = [item for sublist in region_strs for item in sublist]
+        order_txt_fn, exclude_txt_fn = get_order_exclude_txt_fns(wafer_id)
+        if os.path.isfile(order_txt_fn):
+            solved_order = np.fromfile(order_txt_fn, dtype=np.uint32, sep=' ')-1 # saved order is 1-based
+        else:
+            solved_order = None
+        if os.path.isfile(exclude_txt_fn) or exclude_regions is not None:
+            if exclude_regions is not None:
+                # for porting the old method, which defined the excludes in def_common_params
+                excludes = np.array(exclude_regions[wafer_id], dtype=np.uint32)-1 # defined excludes are 1-based
+            else:
+                excludes = np.fromfile(exclude_txt_fn, dtype=np.uint32, sep=' ')-1 # saved excludes are 1-based
+
+        for slice_or_region_ind in use_region_inds:
+            if len(region_zinds_lookup) > 0 or len(solved_zinds_lookup) > 0:
+                if len(region_zinds_lookup) > 0:
+                    wafer_zind = slice_or_region_ind - cum_manifest_cnts[wafer_ind]
+                    if wafer_zind >= 0 and wafer_zind < region_manifest_cnts[wafer_id]:
+                        region_ind = wafer_zind + 1
+                    else:
+                        continue
+                else:
+                    wafer_zind = slice_or_region_ind - cum_include_cnts[wafer_ind]
+                    if wafer_zind >= 0 and wafer_zind < region_include_cnts[wafer_id]:
+                        region_ind = solved_order[wafer_zind] + 1
+                    else:
+                        wafer_zind = slice_or_region_ind - cum_include_cnts[-1] - cum_exclude_cnts[wafer_ind]
+                        if wafer_zind >= 0 and wafer_zind < excludes.size:
+                            region_ind = excludes[wafer_zind] + 1
+                        else:
+                            continue
+            else:
+                region_ind = slice_or_region_ind
+            region_str = region_strs_flat[region_ind-1]
+            zind = cum_manifest_cnts[wafer_ind] + region_ind - 1
+
+            prefix = wafer_region_prefix_str.format(wafer_id, region_str)
+            exclude_str = ''
+            if solved_order is not None:
+                try:
+                    solved_zind = np.nonzero(solved_order == region_ind-1)[0][0] + cum_include_cnts[wafer_ind]
+                except:
+                    solved_zind = np.nonzero(excludes == region_ind-1)[0][0]
+                    solved_zind += (cum_include_cnts[-1] + cum_exclude_cnts[wafer_ind])
+                    exclude_str = 'excluded'
+            else:
+                solved_zind = -1
+            print('{: <25} {: <7} {: <7} {: <7} {: <7} {}'.format(
+                prefix, wafer_id, region_ind, zind, solved_zind, exclude_str))
+
+            if solved_zinds_nml[0]:
+                tree = group.add_tree(prefix)
+                node_1 = tree.add_node(
+                        position=(solved_zinds_nml_pos[0], solved_zinds_nml_pos[1], solved_zind),
+                        comment=f'{prefix} {wafer_id=} {region_ind=} {zind=} {solved_zind=} {exclude_str}',
+                        )
+                # node_2 = tree.add_node(position=(icnodes[i,1,0], icnodes[i,1,1], solved_zind))
+                # tree.add_edge(node_1, node_2)
+        #for slice_or_region_ind in use_region_inds:
+    #for wafer_id, wafer_ind in zip(all_wafer_ids, range(nwafers)):
+
+    if solved_zinds_nml[0]: annotation.save(solved_zinds_nml[0])
+    sys.exit(0)
+# if len(wafer_region_ids_lookup) > 0 or len(region_zinds_lookup) > 0 or len(solved_zinds_lookup) > 0:
+
 # util either re-creates the wafer solved order / exclude files based on the manual reordering (write_order==True)
 #   or creates the manual reorder file based on the wafer solved order / exclude files (write_order==False).
 
@@ -127,6 +253,10 @@ if not write_order:
         loaded_solved_order[w] = solved_order
         nincluded[w] = solved_order.size
 
+    # optionally do a "batch set" of swaps, typically comes from an excel spreadsheet (semi-manual),
+    #   or generated by the local tsp re-ordering method of detecting swaps.
+    swaps = np.fromfile(swap_file, dtype=np.int32, sep=' ').reshape(-1,2) if swap_file else None
+
     # this creates the manual reordering file to be edited from the wafer solved orders and excludes
     print('Converting solved order and excludes to manual edit format')
     all_solved_order = np.empty((0,), dtype=np.int32)
@@ -138,10 +268,19 @@ if not write_order:
     for wafer_id, w in zip(all_wafer_ids, range(nwafers)):
         order_txt_fn, exclude_txt_fn = get_order_exclude_txt_fns(wafer_id)
         print('wafer {} included {}'.format(wafer_id, nincluded[w]))
-        all_solved_order = np.concatenate((all_solved_order, loaded_solved_order[w]))
-        all_region_indices = np.concatenate((all_region_indices, loaded_solved_order[w] + cum_manifest - 1))
         next_cum_nincluded = cum_nincluded + nincluded[w]
-        all_indices = np.concatenate((all_indices, np.arange(cum_nincluded, next_cum_nincluded, dtype=np.int32)))
+        csolved_order = loaded_solved_order[w]
+        cregion_indices = loaded_solved_order[w] + cum_manifest - 1
+        cindices = np.arange(cum_nincluded, next_cum_nincluded, dtype=np.int32)
+        if swaps is not None:
+            sel = np.logical_and(swaps[:,0] >= cum_nincluded, swaps[:,0] < next_cum_nincluded)
+            cswaps = swaps[sel,:] - cum_nincluded
+            csolved_order[cswaps[:,0]] = csolved_order[cswaps[:,1]]
+            cregion_indices[cswaps[:,0]] = cregion_indices[cswaps[:,1]]
+            cindices[cswaps[:,0]] = cindices[cswaps[:,1]]
+        all_solved_order = np.concatenate((all_solved_order, csolved_order))
+        all_region_indices = np.concatenate((all_region_indices, cregion_indices))
+        all_indices = np.concatenate((all_indices, cindices))
         all_solved_order = np.concatenate((all_solved_order, [-1]))
         all_region_indices = np.concatenate((all_region_indices, [-1]))
         all_indices = np.concatenate((all_indices, [-1]))

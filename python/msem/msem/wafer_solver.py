@@ -79,8 +79,8 @@ import queue
 SIFT_descriptor_dtype = np.float32
 SIFT_descriptor_ndims = 256
 
-def compute_keypoints_job(nfeatures, nthreads_per_job, ind, inds, imgs, result_queue, polygons, masks, mask_ds,
-        filter_size, rescale, min_features, verbose):
+def compute_keypoints_job(nfeatures, nthreads_per_job, ind, inds, imgs, result_queue, polygons, custom_polygon,
+        masks, mask_ds, filter_size, rescale, min_features, sample_p, verbose):
     if verbose: print('\tworker%d started' % (ind, ))
     cv2.setNumThreads(nthreads_per_job)
     # Initiate SIFT detector
@@ -113,7 +113,7 @@ def compute_keypoints_job(nfeatures, nthreads_per_job, ind, inds, imgs, result_q
             # normalizing makes l2 distance the same as cosine distance, xxx - this seems to give worse result
             #d = self.wafer_descriptors[i]; self.wafer_descriptors[i] = d / np.linalg.norm(d, axis=1)[:,None]
 
-            mask = None
+            mask = pmask = None
             if masks[i] is not None:
                 ipts = np.round(np.array([x.pt for x in keypoints]) / mask_ds).astype(np.int64)
                 # round can put some points over the max
@@ -124,16 +124,32 @@ def compute_keypoints_job(nfeatures, nthreads_per_job, ind, inds, imgs, result_q
                 polygon = Path(polygons[i])
                 pmask = polygon.contains_points(np.array([x.pt for x in keypoints]))
                 mask = np.logical_and(mask,pmask) if mask is not None else pmask
+            if custom_polygon is not None:
+                polygon = Path(custom_polygon)
+                tmp = polygon.contains_points(np.array([x.pt for x in keypoints]))
+                pmask = tmp if pmask is None else np.logical_and(tmp, pmask)
+                mask = np.logical_and(mask,pmask) if mask is not None else pmask
+            if sample_p is not None and sample_p > 0 and sample_p < 1:
+                if mask is None: mask = np.ones(descriptors.shape[0], dtype=bool)
+                mask_n = mask.sum(); sample_n = int(mask_n * sample_p)
+                if sample_n > 0:
+                    idxs = np.random.choice(mask_n, size=sample_n, replace=False)
+                    new_mask = np.zeros(mask_n, dtype=bool)
+                    new_mask[idxs] = 1; mask[mask] = new_mask
+                    del new_mask, idxs
             if mask is not None:
-                # do not mask if it results in very few keypoints
+                # if the mask results in very few keypoints, use the polygon only masks,
+                #   i.e. the roi and the custom-defined polygon.
                 tmp = [x for x,m in zip(keypoints,mask) if m]
-                if len(tmp) < min_features:
-                    # try the polygon-only mask
+                if len(tmp) < min_features and pmask is not None:
                     tmp = [x for x,m in zip(keypoints,pmask) if m]
                     mask = pmask
-                if len(tmp) >= min_features:
-                    keypoints = tmp
-                    descriptors = descriptors[mask,:]
+                # # do not mask if it results in very few keypoints
+                # if len(tmp) >= min_features:
+                #     keypoints = tmp
+                #     descriptors = descriptors[mask,:]
+                keypoints = tmp
+                descriptors = descriptors[mask,:]
 
             # https://stackoverflow.com/questions/10045363/pickling-cv2-keypoint-causes-picklingerror
             # this is needed for saving to dill file, but also can not insert the keypoints into the
@@ -340,13 +356,18 @@ class wafer_solver(zimages):
     # if there are multiple tours with the same distance, concorde seems to not be deterministic.
     #   it might return a different optimal tour on subsequent calls.
     @staticmethod
-    def normxcorr_tsp_solver(Cin, endpoints_first=False, iendpoints=None):
+    def normxcorr_tsp_solver(Cin, endpoints_first=False, iendpoints=[None, None]):
         # NOTE: only the triu elements of Cin are used. set tril elements to zero incase triu was not passed.
         Cin = sp.triu(Cin,1) if sp.issparse(Cin) else np.triu(Cin,1)
         n = Cin.shape[0]; assert( n == Cin.shape[1] ) # need triu weighted adjacency matrix
 
-        if iendpoints is not None: endpoints = iendpoints
-        if endpoints_first and iendpoints is None:
+        # can specify no endpoints, a single endpoint or both endpoints.
+        no_iendpoints = (iendpoints[0] is None and iendpoints[1] is None)
+        both_iendpoints = (iendpoints[0] is not None and iendpoints[1] is not None)
+        single_iendpoint = not (no_iendpoints or both_iendpoints)
+        if both_iendpoints:
+            endpoints = iendpoints
+        elif endpoints_first:
             # take as endpoints the two slices with the smallest second correlations.
             C2m = Cin + Cin.T # symmetric corrleation distance using average between directional comparisons
             C2 = np.zeros((n,), dtype=np.double)
@@ -380,7 +401,7 @@ class wafer_solver(zimages):
         Cd = Cd.astype(crd_dtype)
         Cd[Cd == 0] = crd_noconn
 
-        if endpoints_first or iendpoints is not None:
+        if endpoints_first or both_iendpoints:
             # add a small-weight connection between the endpoints to create a circuit
             if endpoints[1] > endpoints[0]:
                 Cd[endpoints[0], endpoints[1]] = crd_conn
@@ -431,13 +452,24 @@ class wafer_solver(zimages):
         # xxx - did not enumerate other failure conditions when testing previously, what happens if no path is found?
         assert(np.unique(tour).size == n) # concorde failed
 
-        if not endpoints_first and iendpoints is None:
+        if not endpoints_first and no_iendpoints:
             # take as the endpoints the "weakest link"
             Cd2 = Cd + Cd.T
             tour_dist = Cd2[tour, np.roll(tour,-1)]
             ind = np.argmax(tour_dist)
             # also check distance from first to last point
             endpoints = tour[ind:ind+2] if tour_dist[ind] > Cd2[tour[0], tour[-1]] else [tour[0], tour[-1]]
+        elif single_iendpoint:
+            if iendpoints[0] is not None:
+                i = np.nonzero(tour == iendpoints[0])[0][0]
+                j = tour[(i - 1) % n]; k = tour[(i + 1) % n]
+                # prefer the greater node index as the other endpoint
+                endpoints = [iendpoints[0], j if j > k else k]
+            else:
+                i = np.nonzero(tour == iendpoints[1])[0][0]
+                j = tour[(i - 1) % n]; k = tour[(i + 1) % n]
+                # prefer the lesser node index as the other endpoint
+                endpoints = [j if j < k else k, iendpoints[1]]
 
         # shift the endpoints to the end positions
         i = np.nonzero(tour == endpoints[0])[0][0]; j = np.nonzero(tour == endpoints[1])[0][0]
@@ -678,7 +710,8 @@ class wafer_solver(zimages):
         return inds, inds_proc
 
 
-    def compute_wafer_keypoints(self, nfeatures, filter_size=0, rescale=False, nthreads_per_job=None, iprocess=0):
+    def compute_wafer_keypoints(self, nfeatures, custom_polygon=None, filter_size=0, rescale=False,
+            nthreads_per_job=None, iprocess=0, sample_p=None):
         if self.wafer_solver_verbose:
             print('Computing keypoints / descriptors for {} images'.format(self.wafer.nregions,))
             print('\tusing {} jobs with {} cv2 threads per job and {} processes'.format(\
@@ -708,12 +741,13 @@ class wafer_solver(zimages):
         for i in range(nworkers):
             if inds[i].size == 0: continue # in case there are more total workers than images
             pts = self.wafer_roi_points_scaled[0][inds[i][0]:inds[i][-1]+1]
+            cpts = custom_polygon / self.dsthumbnail if custom_polygon is not None else None
             msks = self.wafer_tissue_masks[inds[i][0]:inds[i][-1]+1]
             rel_ds = self.wafer.tissue_mask_ds // self.dsthumbnail
             workers[i] = mp.Process(target=compute_keypoints_job, daemon=True,
                     args=(nfeatures, nthreads_per_job, i, inds[i], self.wafer_images[inds[i][0]:inds[i][-1]+1],
-                        result_queue, pts, msks, rel_ds, filter_size, rescale, self.min_feature_matches,
-                        self.wafer_solver_verbose))
+                        result_queue, pts, cpts, msks, rel_ds, filter_size, rescale, self.min_feature_matches,
+                        sample_p, self.wafer_solver_verbose))
             workers[i].start()
         # NOTE: only call join after queue is emptied
         # https://stackoverflow.com/questions/45948463/python-multiprocessing-join-deadlock-depends-on-worker-function
@@ -1029,10 +1063,10 @@ class wafer_solver(zimages):
         #   before fitting the xform, then return failure immediately.
         if npts < self.min_feature_matches:
             return npts, pts_src, pts_dst, tpts_src, tpts_dst, affine, mask, npts_fit, any_ransac_success, fail_type
-        fail_type = -1
 
         Xpts = poly.fit_transform(pts_src) if self.rigid_type == RigidRegression_types.affine else pts_src
 
+        fail_type = None
         for cnt in range(self.ransac_repeats):
             # NOTE: use nworkers for repeats so they all run in parallel.
             #   when the ransac was instantiated we divided ransac max by nworkers,
@@ -1057,7 +1091,7 @@ class wafer_solver(zimages):
                 #stds = [np.std(d1), np.std(d2)]
                 # use median absolute deviation to be more robust to outliers
                 stds = [1.4826*np.median(np.abs(x - np.median(x))) for x in [d1,d2]]
-                heuristic_radial_std_pass = all([x > self.min_fit_pts_radial_std for x in stds])
+                heuristic_radial_std_pass = all([x >= self.min_fit_pts_radial_std for x in stds])
 
                 # reject this fit if the translation is outside of some tolerance
                 heuristic_translation_pass = (np.abs(caffine[:2,2]) <= self.max_fit_translation).all()
@@ -1072,12 +1106,13 @@ class wafer_solver(zimages):
                         npts_fit = mask.sum(); fail_type = 0; fail_cnt = 0
                 else:
                     fail_cnt += 1
-                    if fail_type != 0:
+                    if fail_type is None or fail_type != 0:
                         fail_type = ((not heuristic_radial_std_pass)<<0) + ((not heuristic_translation_pass)<<1)
 
         # code path for this combines forward and reverse outside this function.
         # only set failure type here.
-        if npts_fit < self.min_feature_matches: fail_type = -3
+        if fail_type is None or (fail_type == 0 and npts_fit < self.min_feature_matches):
+            fail_type = -3
 
         return npts, pts_src, pts_dst, tpts_src, tpts_dst, affine, mask, npts_fit, any_ransac_success, fail_type
 
@@ -1178,28 +1213,30 @@ class wafer_solver(zimages):
     def keypoints_overlay_image(self, x, pts, msk, dosave_path, fnstr, iorder):
         ckeypts_nomatch, ckeypts_match_nofit, ckeypts_match = self._matching_keypoints_masks(x, pts, msk)
 
+        # convert to color image for the overlays
+        oimg = cv2.cvtColor(self.wafer_images[x], cv2.COLOR_GRAY2RGB)
+
         # get keypoints that did not match at all (Lowe test)
         ckeypts_nomatch = np.array([xx.pt for xx in self.wafer_keypoints[x]])
         nbrs = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(pts)
         d = nbrs.kneighbors(ckeypts_nomatch, return_distance=True)[0]
         ckeypts_nomatch = ckeypts_nomatch[d.reshape(-1) > 0, :]
-
         # get the matching keypoints and those fitting the transform
-        ckeypts_match_nofit = pts[np.logical_not(msk),:]
+        #ckeypts_match_nofit = pts[np.logical_not(msk),:]
+
         ckeypts_match = pts[msk,:]
-
-        # convert to color image for the overlays
-        oimg = cv2.cvtColor(self.wafer_images[x], cv2.COLOR_GRAY2RGB)
-
-        ckeypts = [ckeypts_nomatch, ckeypts_match_nofit, ckeypts_match]
-        clrs = [[255,0,0], [255,0,0], [0,0,255]] # match vs no match only
+        #ckeypts = [ckeypts_nomatch, ckeypts_match_nofit, ckeypts_match]
+        #clrs = [[255,0,0], [255,0,0], [0,0,255]] # match vs no match only
+        ckeypts = [ckeypts_match]
+        clrs = [[0,255,0],] # match only
         for i in range(len(ckeypts)):
             # create a boolean overlay containing dilated keypoints
             ikeypts = np.round(ckeypts[i]).astype(np.int64)
             bwkeypts = np.zeros(self.wafer_images_size[x,::-1], dtype=bool)
             bwkeypts[ikeypts[:,1], ikeypts[:,0]] = 1
             conn8 = nd.generate_binary_structure(2,2)
-            bwkeypts = nd.binary_dilation(bwkeypts, structure=conn8, iterations=3)
+            #bwkeypts = nd.binary_dilation(bwkeypts, structure=conn8, iterations=3) # good for matches comparison
+            bwkeypts = nd.binary_dilation(bwkeypts, structure=conn8, iterations=11) # good for slice-visibility
 
             # overlay the dilated keypoints
             #if i==0: overlay = np.zeros(bwkeypts.shape + (3,), dtype=np.uint8)
@@ -1448,12 +1485,18 @@ class wafer_solver(zimages):
                     bad_match = (not forward_ransac_success and not reverse_ransac_success)
                     # also mark this as a bad match if both the number of ransac fits are below some threshold
                     bad_match = bad_match or (max([npts_fit_forward, npts_fit_reverse]) < self.min_feature_matches)
-                    if not bad_match: break # if the match is good, do not iterate the roi polygon scale loop
+                    if bad_match:
+                        print(f'bad match iter {iscl=}: {npts_fit_forward=} {npts_fit_reverse=}')
+                        print(f'{forward_ransac_success=} {reverse_ransac_success=}')
+                        print(f'{forward_fail_type=} {reverse_fail_type=}')
+                    else:
+                        break # if the match is good, do not iterate the roi polygon scale loop
                 #if self.wafer.sel_missing_regions[x] or self.wafer.sel_missing_regions[y] or not solved_order_mask[i]:
             #for iscl in range(self.roi_polygon_nscales):
             if do_overlays:
                 continue # hijacked this function to optionally export images with sift features
             if bad_match:
+                print(f'bad match: {x=} {y=} {npts_forward=} {npts_fit_forward=} {npts_reverse=} {npts_fit_reverse=}')
                 # save the "bad matches" edges that need to be fixed manually
                 self.solved_order_bad_matches[nbad_matches,:] = [x,y]
                 self.solved_order_bad_matches_inds[nbad_matches] = i+1

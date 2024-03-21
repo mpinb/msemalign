@@ -53,6 +53,11 @@ heur=
 # then save the target histogram to the meta file with:
 # run_regions.py --run-type save-target-histo --wafer_ids 2 --region_inds 433
 
+# for only processing special (reimaged, torn, etc) slices
+reimg=
+#reimg="--reimage-index 1"
+#reimg="--torn-regions"
+
 # define this to export in solved order without rough alignment without downsampling (16 nm)
 #export_no_rough_ds1=1
 

@@ -483,6 +483,10 @@ thumbnail_subfolders_order = [x + '_solve_order' for x in thumbnail_subfolders]
 # various debug plots save path, relative to meta
 debug_plots_subfolder = 'debug_plots'
 
+# define a custom polygon that can supplement the masks for only including features from with
+#   a particular polygon relative to the rough bounding box.
+custom_roi = [None for x in range(total_nwafers+1)]
+
 # for importing masks that define the tissue borders in each slice
 tissue_mask_path = None # to disable the tissue mask
 tissue_mask_fn_str = '' # uses same name as the thumbnail exports

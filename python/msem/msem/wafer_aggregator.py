@@ -19,6 +19,12 @@ You should have received a copy of the GNU General Public License along with
 this program. If not, see <http://www.gnu.org/licenses/>.
 """
 
+## <<< so figures can be saved without X11, uncomment
+#import matplotlib as mpl
+#mpl.use('Agg')
+## so figures can be saved without X11, uncomment >>>
+import matplotlib.pyplot as plt
+
 import numpy as np
 import time
 import os
@@ -38,8 +44,6 @@ from sklearn import linear_model, preprocessing
 from sklearn.neighbors import NearestNeighbors
 # xxx - sometimes intel version completely crashes or hangs, not worth the modest speedup
 #from sklearnex.neighbors import NearestNeighbors
-
-import matplotlib.pyplot as plt
 
 from .mfov import mfov
 from .zimages import zimages
@@ -683,7 +687,6 @@ class wafer_aggregator(zimages):
 
         return voronoi_vectors_to_point_vectors(vrdeltas, pts, vor, idw_p=idw_p, bcast=True)
 
-    # <<< new rough alignment "reconciler"
 
     # initialize member variables for rough affines and rough affined fitted points from solver.
     def init_rough(self, rough_alignment_grid_pixels,
@@ -871,9 +874,15 @@ class wafer_aggregator(zimages):
                 kdist, _ = knbrs.kneighbors(self.grid_locations_pixels, return_distance=True)
                 pts_sel = np.logical_or(pts_sel, kdist.reshape(-1) < rough_distance_cutoff_pixels)
 
+            #if pts_sel.sum() <= 12:
+            #    i_wafer_id = self.wafer_ids[i_wafer_ind]
+            #    i_slice_str = self.region_strs[i_wafer_ind][self.solved_orders[i_wafer_ind][i_ind]]
+            #    print('\nProcessing total order ind %d' % (i,))
+            #    print('\tind %d slice %s wafer %d, sel pts %d' % (i_ind, i_slice_str, i_wafer_id, pts_sel.sum()))
+            #    make_delta_plot(self.grid_locations_pixels, deltas=self.cum_deltas[i,:,:], grid_sel_r=pts_sel)
+            #    plt.show()
+            #    continue
             assert(pts_sel.sum() > 12) # not enough grid points nearby
-            #print('at img ind {}, {} / {} pts selected'.format(i,pts_sel.sum(),self.ngrid))
-            #make_delta_plot(solved_centers,deltas=self.cum_deltas[i,:,:], grid_sel=pts_sel); plt.show()
 
             grid_pts_dst = self.grid_locations_pixels[pts_sel,:] + self.cum_deltas[i,pts_sel,:]
             clf.fit(grid_pts_src[pts_sel,:], grid_pts_dst)
@@ -909,9 +918,6 @@ class wafer_aggregator(zimages):
         if self.wafer_aggregator_verbose:
             print('\tdone in %.4f s' % (time.time() - t, ))
 
-    # new rough alignment "reconciler" >>>
-
-    # <<< new fine alignment "reconciler"
 
     def _set_block_info(self, iblock):
         self.iblock = iblock
@@ -945,6 +951,7 @@ class wafer_aggregator(zimages):
         #   result individually. since the results are just single points this is slow with the queue.
         #   additionally, the blocks should be small enough that the returned results are not over the
         #   max size allowable for passing through the queue (pickling limitations).
+        nworkers = min([nworkers, inproc])
         nproc = nworkers
         workers = [None]*nworkers
         result_queue = mp.Queue(nproc)
@@ -1801,7 +1808,7 @@ class wafer_aggregator(zimages):
         #for i in range(nproc):
     #def fine_deltas_reslice_load(self,
 
-    def fine_deltas_outlier_detection(self, min_inliers=0, nworkers=1, doplots=False):
+    def fine_deltas_outlier_detection(self, min_inliers=0, nworkers=1, doplots=False, dosave_path=''):
         if self.wafer_aggregator_verbose:
             print('Outlier detection fine, ngrid points {}, img range {}-{}'.format(self.ngrid,
                 self.img_range[0],self.img_range[1]))
@@ -2068,30 +2075,39 @@ class wafer_aggregator(zimages):
                     print('\t%d / %d outliers are nearby outliers' % (all_nearby_outliers[i][ik].size,cnt))
 
                 if doplots:
-                    # histograms
-                    dmags = np.sqrt((cdeltas*cdeltas).sum(1))
-                    dhist,dbins = np.histogram(dmags, 50)
-                    dcbins = dbins[:-1] + (dbins[1]-dbins[0])/2
-                    plt.figure(2); plt.gcf().clf()
-                    plt.plot(dcbins, dhist)
+                    # # histograms
+                    # dmags = np.sqrt((cdeltas*cdeltas).sum(1))
+                    # dhist,dbins = np.histogram(dmags, 50)
+                    # dcbins = dbins[:-1] + (dbins[1]-dbins[0])/2
+                    # plt.figure(2); plt.gcf().clf()
+                    # plt.plot(dcbins, dhist)
+
+                    pn = os.path.join(dosave_path, 'outliers')
+                    bfn = 'order{:05d}_ind{}_slice{}_wafer{}_compare-to{}_ind{}_slice{}_wafer{}'.format(
+                            i, i_ind, i_slice_str, i_wafer_id, k, j_ind, j_slice_str, j_wafer_id)
+                    bfn = os.path.join(pn, bfn)
+                    ext = '.svg'
 
                     # make_delta_plot(grid_pts, deltas=deltas[i,ik,:,:],
                     #         figno=10, grid_sel_b=sel_excluded, grid_sel_r=sel_outliers)
                     # tmp = deltas[i,ik,:,:].copy()
                     make_delta_plot(grid_pts, deltas=cdeltas,
                             figno=10, grid_sel_b=sel_excluded, grid_sel_r=sel_outliers)
-                    tmp = cdeltas.copy()
+                    if dosave_path: plt.savefig(bfn + '_red-outliers_blue-excl' + ext)
                     # show ok outliers as red points that still have deltas
+                    tmp = cdeltas.copy()
                     tmp[np.logical_and(sel_outliers, np.logical_not(sel_ok_outliers)),:] = 0
                     #tmp[sel_outliers,:] = 0 # do not show ok outliers at all
                     make_delta_plot(grid_pts, deltas=tmp,
                             figno=11, grid_sel_b=sel_excluded, grid_sel_r=sel_outliers)
-                    # color the nearby outliers instead of excluded
-                    sel_nearby = np.zeros_like(sel_excluded)
-                    sel_nearby[all_nearby_outliers[i][ik]] = 1
-                    make_delta_plot(grid_pts, deltas=tmp,
-                            figno=12, grid_sel_b=sel_nearby, grid_sel_r=sel_outliers)
-                    plt.show()
+                    if dosave_path: plt.savefig(bfn + '_red-zeroed-outliers_blue-excl' + ext)
+                    # # color the nearby outliers instead of excluded
+                    # sel_nearby = np.zeros_like(sel_excluded)
+                    # sel_nearby[all_nearby_outliers[i][ik]] = 1
+                    # make_delta_plot(grid_pts, deltas=tmp,
+                    #         figno=12, grid_sel_b=sel_nearby, grid_sel_r=sel_outliers)
+
+                    if not dosave_path: plt.show()
 
             #for k,ik in zip(self.neighbor_rng, range(self.nneighbors)):
         #for i in range(self.total_nimgs):
@@ -2261,7 +2277,7 @@ class wafer_aggregator(zimages):
             print('\tdone in %.4f s' % (time.time() - t, ))
     #def interpolate_fine_outliers(self):
 
-    def fine_deltas_to_rough_deltas(self):
+    def fine_deltas_to_rough_affines(self, use_interp_points=False, cutoff_to_fit=0.):
         if self.wafer_aggregator_verbose:
             print('Fine inlier affine fits, ngrid points {}, img range {}-{}'.format(self.ngrid,
                 self.img_range[0],self.img_range[1]))
@@ -2269,29 +2285,24 @@ class wafer_aggregator(zimages):
 
         # inits affines and points
         self.forward_affines = [None]*self.nwafer_ids; self.reverse_affines = [None]*self.nwafer_ids
-        self.rforward_affines = [None]*self.nwafer_ids; self.rreverse_affines = [None]*self.nwafer_ids
         self.forward_pts_src = [None]*self.nwafer_ids; self.reverse_pts_src = [None]*self.nwafer_ids
         self.forward_pts_dst = [None]*self.nwafer_ids; self.reverse_pts_dst = [None]*self.nwafer_ids
         for i in range(self.nwafer_ids):
             self.forward_affines[i] = [[None]*self.wafers_nimgs[i] for x in range(self.max_neighbor_range)]
             self.reverse_affines[i] = [[None]*self.wafers_nimgs[i] for x in range(self.max_neighbor_range)]
-            self.rforward_affines[i] = [[None]*self.wafers_nimgs[i] for x in range(self.max_neighbor_range)]
-            self.rreverse_affines[i] = [[None]*self.wafers_nimgs[i] for x in range(self.max_neighbor_range)]
             self.forward_pts_src[i] = [[None]*self.wafers_nimgs[i] for x in range(self.max_neighbor_range)]
             self.reverse_pts_src[i] = [[None]*self.wafers_nimgs[i] for x in range(self.max_neighbor_range)]
             self.forward_pts_dst[i] = [[None]*self.wafers_nimgs[i] for x in range(self.max_neighbor_range)]
             self.reverse_pts_dst[i] = [[None]*self.wafers_nimgs[i] for x in range(self.max_neighbor_range)]
 
-        # select for current inlier points
-        cinliers = np.empty((self.ngrid,), dtype=bool)
-        #all_sel_excluded = np.logical_not(np.isfinite(self.xcorrs))
-
         # turn the fine delta inliers into affine transformations to be applied to each slice.
         # these can be exported in the same format as rough deltas
         #   and then applied using the rough alignment mechanisms.
-        poly = preprocessing.PolynomialFeatures(degree=1)
-        clf = linear_model.LinearRegression(fit_intercept=False, copy_X=False, n_jobs=self.nthreads)
-        clf_rigid = RigidRegression()
+        clf = RigidRegression(rigid_type=self.rigid_type)
+
+        if not use_interp_points:
+            # select for current inlier points
+            sel_to_fit = np.empty((self.ngrid,), dtype=bool)
 
         # outer loop over slices, fits are done independently over slices and skips
         #for i in range(self.total_nimgs):
@@ -2316,27 +2327,37 @@ class wafer_aggregator(zimages):
                     print('\tind %d slice %s wafer %d, compare to offset %d, ind %d slice %s wafer %d' % \
                           (i_ind, i_slice_str, i_wafer_id, k, j_ind, j_slice_str, j_wafer_id))
 
-                # get the current source and dest points
-                cinliers.fill(1)
-                cinliers[self.all_fine_outliers[i][-1][ik]] = 0
-                #cinliers[np.logical_not(np.isfinite(self.xcorrs[i][ik,:]))] = 0 # converted to bool in init_fine
-                cinliers[np.logical_not(self.xcorrs[i][ik,:])] = 0
-                assert(cinliers.sum() > 12) # not enough inlier grid points to fit affine
-                # affines calculated on the points are the inverse of those for the images.
-                cgrid_pts_dst = self.grid_locations_pixels[cinliers,:]
-                cgrid_pts = cgrid_pts_dst + self.deltas[i][ik,cinliers,:]
-                cgrid_pts_src = poly.fit_transform(cgrid_pts)
+                if use_interp_points:
+                    sel_to_fit = (self.fine_weights[i][ik,:] > 0)
+                else:
+                    # get the current source and dest points
+                    sel_to_fit.fill(1)
+                    sel_to_fit[self.all_fine_outliers[i][-1][ik]] = 0
+                    #cexcluded = np.logical_not(np.isfinite(self.xcorrs[i][ik,:])) # converted to bool in init_fine
+                    cexcluded = np.logical_not(self.xcorrs[i][ik,:])
+                    sel_to_fit[cexcluded] = 0
+                nsel_to_fit = sel_to_fit.sum()
 
-                # fit the affines
-                clf.fit(cgrid_pts_src, cgrid_pts_dst)
-                # scikit learn puts constant terms on the left, flip and augment
-                caffine = clf.coef_
-                caffine = np.concatenate( (np.concatenate( (caffine[:,1:], caffine[:,0][:,None]), axis=1 ),
-                                           np.zeros((1,3), dtype=caffine.dtype)), axis=0 )
-                caffine[2,2] = 1
+                # same method as in the interpolation, allow an integer cutoff,
+                #   or a percentage of points cutoff
+                if cutoff_to_fit >= 1:
+                    cutoff = int(cutoff_to_fit)
+                else:
+                    cutoff = int(np.round(self.ngrid * cutoff_to_fit))
 
-                # also fit rigid affines, translation and rotation only
-                clf_rigid.fit(cgrid_pts, cgrid_pts_dst)
+                if nsel_to_fit >= cutoff:
+                    if self.verbose_iterations:
+                        print('\tFitting affine using {} points'.format(nsel_to_fit))
+                    # affines calculated on the points are the inverse of those for the images.
+                    cgrid_pts_dst = self.grid_locations_pixels[sel_to_fit,:]
+                    cgrid_pts = cgrid_pts_dst + self.deltas[i][ik,sel_to_fit,:]
+                    clf.fit(cgrid_pts, cgrid_pts_dst)
+                    caffine = clf.coef_.copy()
+                else:
+                    if self.verbose_iterations:
+                        print('\tNot fitting affine, npoints {} (of {}) < cutoff {}'.format(nsel_to_fit,
+                            self.ngrid, cutoff))
+                    cgrid_pts_dst = cgrid_pts = caffine = None
 
                 # "re-waferize" the outputs so they can be fed back into rough reconciler.
                 if k < 0:
@@ -2350,19 +2371,17 @@ class wafer_aggregator(zimages):
                     self.reverse_pts_src[wafer_ind][ak-1][skip_ind] = cgrid_pts
                     self.reverse_pts_dst[wafer_ind][ak-1][skip_ind] = cgrid_pts_dst
                     self.reverse_affines[wafer_ind][ak-1][skip_ind] = caffine
-                    self.rreverse_affines[wafer_ind][ak-1][skip_ind] = clf_rigid.coef_.copy()
                 else:
                     self.forward_pts_src[wafer_ind][ak-1][skip_ind] = cgrid_pts
                     self.forward_pts_dst[wafer_ind][ak-1][skip_ind] = cgrid_pts_dst
                     self.forward_affines[wafer_ind][ak-1][skip_ind] = caffine
-                    self.rforward_affines[wafer_ind][ak-1][skip_ind] = clf_rigid.coef_.copy()
 
             #for k,ik in zip(self.neighbor_rng, range(self.nneighbors)):
         #for i in range(self.img_range[0],self.img_range[1]):
 
         if self.wafer_aggregator_verbose:
             print('\tdone in %.4f s' % (time.time() - t, ))
-    #def fine_deltas_to_rough_deltas(self):
+    #def fine_deltas_to_rough_affines(self):
 
 
     def reconcile_fine_alignments(self, L1_norm=0., L2_norm=0., min_valid_slice_comparisons=0, regr_bias=False,
@@ -2433,7 +2452,7 @@ class wafer_aggregator(zimages):
         #     self.imaged_order_deltas[i_wafer_ind][i_slice] = self.cum_deltas[i,:,:]
 
     def fine_deltas_affine_filter(self, shape_pixels, affine_degree=1, use_interp_points=False,
-            affine_interpolation=False, output_features_scale=None, doplots=False):
+            affine_interpolation=False, output_features_scale=None, doplots=False, dosave_path=''):
         assert( not use_interp_points or not affine_interpolation ) # do not use these features together
         if self.wafer_aggregator_verbose:
             print('{} fine deltas with affine filter, ngrid points {}, img range {}-{}'.format(\
@@ -2540,6 +2559,7 @@ class wafer_aggregator(zimages):
                                 #print('WARNING: at grid point {}, only {} inliers'.format(g,sel_pts.sum()))
                         else:
                             print('WARNING: at grid point {}, only {} inliers'.format(g,sel_pts.sum()))
+                            print('Your filter size might be too small relative to the point spacing')
                             # better to leave the delta at zero, or to copy the original?
                             #self.filtered_deltas[i,ik,g,:] = self.deltas[i,ik,g,:]
                             assert(False) # with MLS interp should not happen
@@ -2562,12 +2582,22 @@ class wafer_aggregator(zimages):
                 #for g in range(ngrid):
 
                 if doplots:
+                    pn = os.path.join(dosave_path, 'outliers_interp-filter')
+                    bfn = 'order{:05d}_ind{}_slice{}_wafer{}_compare-to{}_ind{}_slice{}_wafer{}'.format(
+                            i, i_ind, i_slice_str, i_wafer_id, k, j_ind, j_slice_str, j_wafer_id)
+                    bfn = os.path.join(pn, bfn)
+                    ext = '.svg'
+
                     d = self.deltas[i][ik,:,:].copy()
-                    sel = (self.fine_weights[i][ik,:] == 0); d[sel, :] = 0
-                    make_delta_plot(grid_pts, deltas=d, figno=10)
+                    d[np.logical_not(cinliers)] = 0
+                    sel_outliers = self.all_fine_outliers[i][-1][ik]
+                    cexcluded = np.logical_not(self.xcorrs[i][ik,:])
+                    make_delta_plot(grid_pts, deltas=d, figno=10, grid_sel_b=cexcluded, grid_sel_r=sel_outliers)
                     d = self.filtered_deltas[i,ik,:,:].copy()
-                    make_delta_plot(grid_pts, deltas=d, figno=11)
-                    plt.show()
+                    make_delta_plot(grid_pts, deltas=d, figno=10, overlay=True, quiver_color='g')
+                    if dosave_path: plt.savefig(bfn + '_red-outliers_blue-excl_black-deltas_green-filtered' + ext)
+
+                    if not dosave_path: plt.show()
             #for k,ik in zip(self.neighbor_rng, range(self.nneighbors)):
 
             if affine_interpolation:
@@ -2654,60 +2684,61 @@ class wafer_aggregator(zimages):
             print('\tdone in %.4f s' % (time.time() - t, ))
     #def solved_deltas_affine_filter(self):
 
-    def fine_deltas_to_rough_affines(self, affine_degree=1):
-        if self.wafer_aggregator_verbose:
-            print('Affine fitting solved fine deltas, ngrid points {}, img range {}-{}'.format(self.ngrid,
-                self.img_range[0],self.img_range[1]))
-            t = time.time()
-
-        # inits
-        if self.wafers_imaged_order_rough_affines is None:
-            self.wafers_imaged_order_rough_affines = [None]*self.nwafer_ids
-            for i in range(self.nwafer_ids):
-                self.wafers_imaged_order_rough_affines[i] = [None]*self.wafers_nregions[i]
-        self.cum_affines = [None]*self.total_nimgs
-        poly = preprocessing.PolynomialFeatures(degree=affine_degree)
-        poly.fit_transform(np.random.rand(3,2)) # just so features are populated for 2D
-        clf = linear_model.LinearRegression(fit_intercept=False, copy_X=False, n_jobs=self.nthreads)
-
-        for i in range(self.img_range[0],self.img_range[1]):
-            i_wafer_ind = np.nonzero(i / self.cum_wafers_nimgs[1:] < 1.)[0][0]
-            i_ind = (i - self.cum_wafers_nimgs[i_wafer_ind]) % self.wafers_nimgs[i_wafer_ind]
-            i_slice = self.solved_orders[i_wafer_ind][i_ind]
-            #i_wafer_id = self.wafer_ids[i_wafer_ind]
-
-            cinliers = self.cum_comps_sel[i,:]
-            #assert(cinliers.sum() > poly.n_output_features_+1) # not enough inlier grid points
-            assert(cinliers.sum() > 2*poly.n_output_features_) # not enough inlier grid points
-
-            # affines calculated on the points are the inverse of those for the images.
-            cgrid_pts_dst = self.grid_locations_pixels[cinliers,:]
-            cgrid_pts = cgrid_pts_dst + self.cum_deltas[i,cinliers,:]
-            cgrid_pts_src = poly.fit_transform(cgrid_pts)
-
-            # fit the affines
-            clf.fit(cgrid_pts_src, cgrid_pts_dst)
-            # scikit learn puts constant terms on the left, flip and augment
-            caffine = clf.coef_
-            caffine = np.concatenate( (np.concatenate( (caffine[:,1:], caffine[:,0][:,None]), axis=1 ),
-                                       np.zeros((1,3), dtype=caffine.dtype)), axis=0 )
-            caffine[2,2] = 1
-
-            # save current affine for the wafer and over all wafers.
-            A = self.wafers_imaged_order_rough_affines[i_wafer_ind][i_slice]
-            if A is None:
-                self.wafers_imaged_order_rough_affines[i_wafer_ind][i_slice] = caffine
-                self.cum_affines[i] = caffine
-            else:
-                # apply the affine on top of an existing affine
-                B = np.dot(caffine, A)
-                self.wafers_imaged_order_rough_affines[i_wafer_ind][i_slice] = B
-                self.cum_affines[i] = B
-
-        #for i in range(self.img_range[0],self.img_range[1]):
-
-        if self.wafer_aggregator_verbose:
-            print('\tdone in %.4f s' % (time.time() - t, ))
-    #def fine_deltas_to_rough_affines(self):
-
-    # new fine alignment "reconciler" >>>
+# xxx - maybe remove? decided it makes more sense to convert the actual deltas to affines in the same
+#   format as the rough affines (calculated on SIFT features) and then rerun the rough reconciler,
+#   instead of this, which is simply to fit the solved fine alignment with an affine transformation.
+#     def fine_solved_deltas_to_rough_affines(self, affine_degree=1):
+#         if self.wafer_aggregator_verbose:
+#             print('Affine fitting solved fine deltas, ngrid points {}, img range {}-{}'.format(self.ngrid,
+#                 self.img_range[0],self.img_range[1]))
+#             t = time.time()
+#
+#         # inits
+#         if self.wafers_imaged_order_rough_affines is None:
+#             self.wafers_imaged_order_rough_affines = [None]*self.nwafer_ids
+#             for i in range(self.nwafer_ids):
+#                 self.wafers_imaged_order_rough_affines[i] = [None]*self.wafers_nregions[i]
+#         self.cum_affines = [None]*self.total_nimgs
+#         poly = preprocessing.PolynomialFeatures(degree=affine_degree)
+#         poly.fit_transform(np.random.rand(3,2)) # just so features are populated for 2D
+#         clf = linear_model.LinearRegression(fit_intercept=False, copy_X=False, n_jobs=self.nthreads)
+#
+#         for i in range(self.img_range[0],self.img_range[1]):
+#             i_wafer_ind = np.nonzero(i / self.cum_wafers_nimgs[1:] < 1.)[0][0]
+#             i_ind = (i - self.cum_wafers_nimgs[i_wafer_ind]) % self.wafers_nimgs[i_wafer_ind]
+#             i_slice = self.solved_orders[i_wafer_ind][i_ind]
+#             #i_wafer_id = self.wafer_ids[i_wafer_ind]
+#
+#             cinliers = self.cum_comps_sel[i,:]
+#             #assert(cinliers.sum() > poly.n_output_features_+1) # not enough inlier grid points
+#             assert(cinliers.sum() > 2*poly.n_output_features_) # not enough inlier grid points
+#
+#             # affines calculated on the points are the inverse of those for the images.
+#             cgrid_pts_dst = self.grid_locations_pixels[cinliers,:]
+#             cgrid_pts = cgrid_pts_dst + self.cum_deltas[i,cinliers,:]
+#             cgrid_pts_src = poly.fit_transform(cgrid_pts)
+#
+#             # fit the affines
+#             clf.fit(cgrid_pts_src, cgrid_pts_dst)
+#             # scikit learn puts constant terms on the left, flip and augment
+#             caffine = clf.coef_
+#             caffine = np.concatenate( (np.concatenate( (caffine[:,1:], caffine[:,0][:,None]), axis=1 ),
+#                                        np.zeros((1,3), dtype=caffine.dtype)), axis=0 )
+#             caffine[2,2] = 1
+#
+#             # save current affine for the wafer and over all wafers.
+#             A = self.wafers_imaged_order_rough_affines[i_wafer_ind][i_slice]
+#             if A is None:
+#                 self.wafers_imaged_order_rough_affines[i_wafer_ind][i_slice] = caffine
+#                 self.cum_affines[i] = caffine
+#             else:
+#                 # apply the affine on top of an existing affine
+#                 B = np.dot(caffine, A)
+#                 self.wafers_imaged_order_rough_affines[i_wafer_ind][i_slice] = B
+#                 self.cum_affines[i] = B
+#
+#         #for i in range(self.img_range[0],self.img_range[1]):
+#
+#         if self.wafer_aggregator_verbose:
+#             print('\tdone in %.4f s' % (time.time() - t, ))
+#     #def fine_solved_deltas_to_rough_affines(self):

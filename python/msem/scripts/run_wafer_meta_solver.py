@@ -6,6 +6,7 @@
 
 import numpy as np
 import scipy.sparse as sp
+from matplotlib import pyplot as plt
 
 import dill
 import argparse
@@ -14,24 +15,24 @@ import sys
 import time
 
 try:
-    from def_common_params import get_paths, order_txt_fn_str
+    from def_common_params import get_paths, order_txt_fn_str, exclude_txt_fn_str, region_include_cnts
     from def_common_params import meta_folder, meta_dill_fn_str, all_wafer_ids, total_nwafers
     from msem.wafer_solver import wafer_solver
 except ModuleNotFoundError:
     print('WARNING: no def_common_params (must specify meta dill / wafer ids)')
 
 # <<< turn on stack trace for warnings
-import traceback
-import warnings
-#import sys
-
-def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
-    log = file if hasattr(file,'write') else sys.stderr
-    traceback.print_stack(file=log)
-    log.write(warnings.formatwarning(message, category, filename, lineno, line))
-
-warnings.showwarning = warn_with_traceback
-#warnings.simplefilter("always")
+#import traceback
+#import warnings
+##import sys
+#
+#def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
+#    log = file if hasattr(file,'write') else sys.stderr
+#    traceback.print_stack(file=log)
+#    log.write(warnings.formatwarning(message, category, filename, lineno, line))
+#
+#warnings.showwarning = warn_with_traceback
+#warnings.simplefilter('error', UserWarning) # have the warning throw an exception
 # turn on stack trace for warnings >>>
 
 ### argparse
@@ -120,8 +121,10 @@ if len(meta_dills_merge) > 0:
     sys.exit(0)
 
 if plot_bad_matches:
-    nseq_keys = len(seq_keys)
-    nbad_matches = np.zeros((nseq_keys, seq_keys_niters), dtype=np.int64)
+    keys = ['order_seqs-sensitivity_0p1', 'order_seqs-sensitivity_0p15', 'order_seqs-sensitivity_0p2', 'order_seqs-sensitivity_0p3', 'order_seqs-sensitivity_0p5', 'order_seqs-solved_rigid']
+    nseq_keys = len(keys)
+    #nbad_matches = np.zeros((nseq_keys, seq_keys_niters), dtype=np.int64)
+    nbad_matches = np.zeros((nseq_keys,), dtype=np.int64)
 
 # iterate the specified wafers
 for wafer_id, wafer_ind in zip(wafer_ids, range(nwafers)):
@@ -156,18 +159,37 @@ for wafer_id, wafer_ind in zip(wafer_ids, range(nwafers)):
         # print(adj_count.nnz, adj_count.max(), adj_count.data.min())
 
         if plot_bad_matches:
-            tmp = k.split('-')
-            citer = int(tmp[-1])
-            ckey = tmp[-2]
-            ind = seq_keys.index(ckey)
-            nbad_matches[ind, citer-1] = len(new_sequence)-1
-            if ckey == 'ninety': print([x.size for x in new_sequence])
+            if k in keys:
+                ind = keys.index(k)
+                x = 1 if wafer_id > 1 else 2
+                nbad_matches[ind] = len(new_sequence)-x
     #for k, sequence in meta_dict['order_solving'][wafer_id].items():
     assert(not (adj_count.diagonal() > 0).any()) # you messed up
 
     if plot_bad_matches:
-        print(nbad_matches)
-        assert(False) # xxx - did not finish implementing this
+        if wafer_ind == 0:
+            all_nbad_matches = [None]*nwafers
+        all_nbad_matches[wafer_ind] = nbad_matches.copy() / region_include_cnts[wafer_id]
+        if wafer_ind == nwafers-1:
+            print(all_nbad_matches)
+            # xxx - meh... kludgey just for a single paper figure
+            x1 = [0.1, 0.15, 0.2, 0.3, 0.5, 1.]
+            x2 = [17.3, 20, 21.5, 24.7, 38.1, 97.7]
+            plt.figure()
+            for wafer_ind in range(nwafers):
+                plt.plot(x1, all_nbad_matches[wafer_ind], 'x-')
+            ax1 = plt.gca()
+            ax2 = ax1.twiny()
+            ax2.plot(x1, np.zeros(len(x1)), 'k', alpha=0.) # Create a dummy plot
+            xticks = np.arange(0.1, 1.01, 0.1)
+            ax1.set_xticks(xticks)
+            ax2.set_xticks(x1)
+            ax2.set_xticklabels(x2)
+            ax2.set_xlabel('runtime (m)')
+            ax1.set_xlabel('% sampled sift features')
+            ax1.set_ylabel('% bad matches')
+            plt.gcf().set_size_inches([8,7])
+            plt.show()
 
     _, labels = sp.csgraph.connected_components(adj_count, directed=False)
     # anything that is not part of the largest component can not be assimilated into the order.
@@ -202,10 +224,15 @@ for wafer_id, wafer_ind in zip(wafer_ids, range(nwafers)):
         with open(order_txt_fn, "w") as text_file:
             text_file.write(' ' + np.array2string(solved_order, separator=' ',
                 formatter={'int_kind':'{:4d}'.format}, max_line_width=120).strip('[]'))
+        exclude_txt_fn = os.path.join(alignment_folder, exclude_txt_fn_str.format(wafer_id))
+        with open(exclude_txt_fn, "w") as text_file:
+            text_file.write(' ' + np.array2string(excluded, separator=' ',
+                formatter={'int_kind':'{:4d}'.format}, max_line_width=120).strip('[]'))
+        print('Excluded count == {}'.format(excluded.size))
     else:
         print(solved_order)
-    print('Excluded (1-based) indices for wafer id {}, modify def_common_params'.format(wafer_id))
-    print(excluded)
+        print('Excluded (1-based) indices for wafer id {}, modify def_common_params'.format(wafer_id))
+        print(excluded)
     np.set_printoptions(threshold=tmp)
 
 #for wafer_id, wafer_ind in zip(wafer_ids, range(nwafers)):

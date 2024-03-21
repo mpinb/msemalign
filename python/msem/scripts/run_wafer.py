@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import os
+os.system('date')
+
 """run_wafer.py
 
 Top level command-line interface for the running the matching for the fine
@@ -31,7 +34,9 @@ import numpy as np
 import dill
 import argparse
 import os
+import sys
 
+os.system('date')
 from msem import wafer
 
 from msem.utils import make_hex_points, PolyCentroid
@@ -49,7 +54,7 @@ from def_common_params import order_txt_fn_str, wafer_format_str, meta_dill_fn_s
 from def_common_params import wafer_template_slice_inds, translate_roi_center
 from def_common_params import region_manifest_cnts, region_include_cnts, total_nwafers
 from def_common_params import delta_rotation_range, delta_rotation_step, template_crop_um
-from def_common_params import roi_polygon_scale, thumbnail_suffix
+from def_common_params import roi_polygon_scale, thumbnail_suffix, custom_roi
 from def_common_params import region_suffix, region_interp_type_deltas
 from def_common_params import rough_bounding_box_xy_spc, rough_grid_xy_spc, fine_grid_xy_spc
 from def_common_params import wafer_solver_bbox_xy_spc, wafer_solver_bbox_trans
@@ -58,19 +63,20 @@ from def_common_params import tissue_mask_path, tissue_mask_fn_str, tissue_mask_
 from def_common_params import tissue_mask_min_edge_um, tissue_mask_min_hole_edge_um, tissue_mask_bwdist_um
 from def_common_params import tears_subfolder, torn_regions, slice_blur_z_indices, slice_blur_factor
 from def_common_params import noblend_subfolder
+os.system('date')
 
 # <<< turn on stack trace for warnings
-import traceback
-import warnings
-import sys
-
-def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
-    log = file if hasattr(file,'write') else sys.stderr
-    traceback.print_stack(file=log)
-    log.write(warnings.formatwarning(message, category, filename, lineno, line))
-
-warnings.showwarning = warn_with_traceback
-#warnings.simplefilter("always")
+#import traceback
+#import warnings
+##import sys
+#
+#def warn_with_traceback(message, category, filename, lineno, file=None, line=None):
+#    log = file if hasattr(file,'write') else sys.stderr
+#    traceback.print_stack(file=log)
+#    log.write(warnings.formatwarning(message, category, filename, lineno, line))
+#
+#warnings.showwarning = warn_with_traceback
+#warnings.simplefilter('error', UserWarning) # have the warning throw an exception
 # turn on stack trace for warnings >>>
 
 ## uncomment to enable all the logging from region / mfov. typically too verbose for wafer.
@@ -133,9 +139,9 @@ parser.add_argument('--contrast-filter', dest='contrast_filter', action='store_t
                     help='use the slices that were exported with the contrast filter')
 parser.add_argument('--rough-export-solve-order', dest='rough_export_solve_order', action='store_true',
                     help='option for rough_export that can specify manual rough bbox for order solving')
-parser.add_argument('--rough-run-str', nargs=1, type=str, default=['none'],
+parser.add_argument('--rough-run-strs', nargs='+', type=str, default=['none'],
                     help='string to differentiate rough alignments with different parameters')
-parser.add_argument('--fine-run-str', nargs=1, type=str, default=['none'],
+parser.add_argument('--fine-run-strs', nargs='*', type=str, default=[],
                     help='string to differentiate fine alignments with different parameters')
 parser.add_argument('--delta-run-str', nargs=1, type=str, default=['none'],
                     help='string to differentiate fine alignment deltas with different parameters')
@@ -216,10 +222,10 @@ fine_blur_only = args['fine_blur_only']
 validate_region_grid = args['validate_region_grid']
 
 # this is an identifier so that multiple rough alignemnts can be exported / loaded easily.
-rough_run_str = args['rough_run_str'][0]
+rough_run_strs = args['rough_run_strs']
 
 # this is an identifier so that multiple fine alignemnts can be exported / loaded easily.
-fine_run_str = args['fine_run_str'][0]
+fine_run_strs = args['fine_run_strs']
 
 # this is an identifier so that multiple fine alignemnt deltas can be exported / loaded easily.
 delta_run_str = args['delta_run_str'][0]
@@ -443,11 +449,19 @@ for i,j in zip(wafer_ids, range(nwafer_ids)):
         region_strs_all[j] = get_paths(i)
     use_alignment_folders[j] = os.path.join(alignment_folders[j], native_subfolder) if native else alignment_folders[j]
 
-rough_dill_fns = [None]*nwafer_ids; fine_dill_fns = [None]*nwafer_ids
+nrough = len(rough_run_strs)
+nfine = len(fine_run_strs)
+rough_run_id = '-'.join(rough_run_strs)
+rough_dills_fns = [[None for x in range(nwafer_ids)] for y in range(nrough)]
+fine_dills_fns = [[None for x in range(nwafer_ids)] for y in range(nfine)]
 limi_dill_fns = [None]*nwafer_ids; order_txt_fns = [None]*nwafer_ids
 for i in range(nwafer_ids):
-    rough_dill_fns[i] = os.path.join(alignment_folders[i], rough_dill_fn_str.format(wafer_ids[i], rough_run_str))
-    fine_dill_fns[i] = os.path.join(alignment_folders[i], fine_dill_fn_str.format(wafer_ids[i], fine_run_str))
+    for j in range(nrough):
+        rough_dills_fns[j][i] = os.path.join(alignment_folders[i],
+                rough_dill_fn_str.format(wafer_ids[i], rough_run_strs[j]))
+    for j in range(nfine):
+        fine_dills_fns[j][i] = os.path.join(alignment_folders[i],
+                fine_dill_fn_str.format(wafer_ids[i], fine_run_strs[j]))
     limi_dill_fns[i] = os.path.join(alignment_folders[i], limi_dill_fn_str.format(wafer_ids[i]))
     order_txt_fns[i] = os.path.join(alignment_folders[i], order_txt_fn_str.format(wafer_ids[i]))
 
@@ -494,6 +508,7 @@ zorder = None
 istorn = False
 load_img_subfolder = override_stack
 is_excluded = False
+use_custom_roi = [None, None]
 if rough_dills_run or get_wafer_stats:
     assert(nwafer_ids == 1) # no multiple wafer rough dills or stats runs
 
@@ -501,24 +516,28 @@ if rough_dills_run or get_wafer_stats:
         alignment_folders = None
         load_stitched_coords = False
 else:
-    rough_dicts = [None]*2 # duplicated below for single wafer case, was easier
+    roughs_dicts = [[None, None] for x in range(nrough)] # duplicated below for single wafer case, was easier
     for i in range(nwafer_ids):
         with open(limi_dill_fns[i], 'rb') as f: limi_dict = dill.load(f)
         if load_rough_alignment:
-            with open(rough_dill_fns[i], 'rb') as f: rough_dicts[i] = dill.load(f)
-            rough_dicts[i]['imaged_order_limi_rotation'] = limi_dict['imaged_order_limi_rotation']
-            rough_dicts[i]['template_roi_points'] = limi_dict['template_roi_points']
-            rough_dicts[i]['imaged_order_region_recon_roi_poly_raw'] = \
-                limi_dict['imaged_order_region_recon_roi_poly_raw']
+            for j in range(nrough):
+                with open(rough_dills_fns[j][i], 'rb') as f: roughs_dicts[j][i] = dill.load(f)
+                roughs_dicts[j][i]['imaged_order_limi_rotation'] = limi_dict['imaged_order_limi_rotation']
+                roughs_dicts[j][i]['template_roi_points'] = limi_dict['template_roi_points']
+                roughs_dicts[j][i]['imaged_order_region_recon_roi_poly_raw'] = \
+                    limi_dict['imaged_order_region_recon_roi_poly_raw']
         else:
-            rough_dicts[i] = limi_dict
-            if load_solved_order:
-                rough_dicts[i]['solved_order'] = \
-                    np.fromfile(order_txt_fns[i], dtype=np.uint32, sep=' ')-1 # saved order is 1-based
+            for j in range(nrough):
+                roughs_dicts[j][i] = limi_dict
+                if load_solved_order:
+                    roughs_dicts[j][i]['solved_order'] = \
+                        np.fromfile(order_txt_fns[i], dtype=np.uint32, sep=' ')-1 # saved order is 1-based
     if nwafer_ids==1:
-        rough_dicts[1] = rough_dicts[0]
+        for j in range(nrough):
+            roughs_dicts[j][1] = roughs_dicts[j][0]
     elif invert_order:
-        rough_dicts = rough_dicts[::-1]
+        for j in range(nrough):
+            roughs_dicts[j] = roughs_dicts[j][::-1]
         # have to invert the arrays pertaining to the regions also in the opposite wafer order
         experiment_folders_all = experiment_folders_all[::-1]
         thumbnail_folders = thumbnail_folders[::-1]
@@ -546,13 +565,13 @@ else:
                 # zorder was put in later for order in full dataset
                 w = 0 if wafer_ids[0] < 2 else cum_include_cnts[wafer_ids[0]-2]
                 zorder = region_inds + w
-                if region_inds < rough_dicts[0]['solved_order'].size:
+                if region_inds < roughs_dicts[0][0]['solved_order'].size:
                     # use the export inds as solved order inds, get corresponding region_inds
-                    region_inds = rough_dicts[0]['solved_order'][region_inds]
+                    region_inds = roughs_dicts[0][0]['solved_order'][region_inds]
                 else:
                     # this confusing codepath allows excluded regions to be exported or to have masks saved.
                     is_excluded = True
-                    i = region_inds - rough_dicts[0]['solved_order'].size
+                    i = region_inds - roughs_dicts[0][0]['solved_order'].size
                     region_inds = np.array([exclude_regions[wafer_ids[0]][x] for x in i]) - 1
                     # xxx - gah, for ease of viewing moved all exclude slices to the end of the stack.
                     #   this makes the z-order "backcalculation" not so easy.
@@ -567,32 +586,35 @@ else:
             assert(not wafer_tears) # not implemented for multiple region export
             region_inds = None
             if load_solved_order:
-                solved_order = rough_dicts[0]['solved_order']
+                solved_order = roughs_dicts[0][0]['solved_order']
             else:
                 # deals with a legacy workflow (no region range specified), allow manifest index to still be added
                 get_export_solved_order = True
                 do_export_solved_order = False
 
         # this is in case the region_stage_coords.csv were not saved during acquisition. (!)
-        backload_roi_polys = rough_dicts[0]['imaged_order_region_recon_roi_poly_raw']
+        backload_roi_polys = roughs_dicts[0][0]['imaged_order_region_recon_roi_poly_raw']
         if region_inds is not None:
             backload_roi_polys = [backload_roi_polys[x] for x in region_inds]
+
+        # optionally define a custom roi that further restricts the acquisition roi
+        use_custom_roi = [custom_roi[wafer_ids[0]] for x in range(region_inds.size)]
     else:
         # integers for which regions to try to align in z, None for all in the experiement folder
         #region_inds = None  # for all in the experiment folder, order is arbitrary
         if invert_order:
-            region_inds = [rough_dicts[0]['solved_order'][iorder+1+skip_slices],
-                          rough_dicts[1]['solved_order'][iorder]]
+            region_inds = [roughs_dicts[0][0]['solved_order'][iorder+1+skip_slices],
+                          roughs_dicts[0][1]['solved_order'][iorder]]
         else:
-            region_inds = [rough_dicts[0]['solved_order'][iorder],
-                          rough_dicts[1]['solved_order'][iorder+1+skip_slices]]
+            region_inds = [roughs_dicts[0][0]['solved_order'][iorder],
+                          roughs_dicts[0][1]['solved_order'][iorder+1+skip_slices]]
 
         # the order is always 0 to 1 since the regions were set above in order, based on the solved order.
         solved_order = [0,1]
 
         # this is in case the region_stage_coords.csv were not saved during acquisition. (!)
-        backload_roi_polys = [rough_dicts[0]['imaged_order_region_recon_roi_poly_raw'][region_inds[0]],
-                              rough_dicts[1]['imaged_order_region_recon_roi_poly_raw'][region_inds[1]]]
+        backload_roi_polys = [roughs_dicts[0][0]['imaged_order_region_recon_roi_poly_raw'][region_inds[0]],
+                              roughs_dicts[0][1]['imaged_order_region_recon_roi_poly_raw'][region_inds[1]]]
 
         # need to be able to load either as tear repairs for the fine alignment
         w = [wafer_ids[0], wafer_ids[0]]
@@ -602,6 +624,11 @@ else:
         load_img_subfolder = [tears_subfolder if istorn[0] else '',
                               tears_subfolder if istorn[1] else '']
         istorn = any(istorn) # leaving as array causes problems with the logic below
+
+        # optionally define a custom roi that further restricts the acquisition roi
+        use_custom_roi = [custom_roi[x] for x in w]
+        if invert_order:
+            use_custom_roi = [use_custom_roi[1], use_custom_roi[0]]
 
         # zorder was put in later for order in full dataset
         if nwafer_ids > 1:
@@ -633,6 +660,8 @@ if native:
 else:
     to_native_scale = 1
     use_use_thumbnails_ds = use_thumbnails_ds
+
+use_custom_roi = [[x*to_native_scale for x in y] if y is not None else None for y in use_custom_roi]
 
 # changed this to the regular alignment folders so that stitched coords are always
 #   loaded from that location (even for native).
@@ -673,7 +702,7 @@ cwafer = wafer(experiment_folders_all, protocol_folders_all, use_alignment_folde
         tissue_mask_min_hole_edge_um=tissue_mask_min_hole_edge_um, tissue_mask_bwdist_um=tissue_mask_bwdist_um,
         init_regions=init_regions, region_manifest_cnts=region_manifest_cnts, region_include_cnts=region_include_cnts,
         zorder=zorder, use_coordinate_based_xforms=use_coordinate_based_xforms, block_overlap_grid_um=blk_ovlp_grid_um,
-        verbose=True)
+        custom_roi=use_custom_roi, verbose=True)
 
 
 # deals with a legacy workflow (no region range specified), allow manifest index to still be added
@@ -798,18 +827,18 @@ if not (get_wafer_stats or rough_dills_run):
     # NOTE: imaged_order_limi_rotation is only actually stored in the limi dicts.
     #   it's copied over to the rough_dict above if this is not rough_dills_run.
     if rough_export_run or fine_export_run:
-        rotations = rough_dicts[0]['imaged_order_limi_rotation'][cwafer.region_inds-1]
+        rotations = roughs_dicts[0][0]['imaged_order_limi_rotation'][cwafer.region_inds-1]
     else:
-        rotations = [d['imaged_order_limi_rotation'][r-1] for d,r in zip(rough_dicts, cwafer.region_inds)]
+        rotations = [d['imaged_order_limi_rotation'][r-1] for d,r in zip(roughs_dicts[0], cwafer.region_inds)]
     cwafer.set_region_rotations_manual(rotations) # these rotations are specified in degrees
 
     # optionally set the angle based on rigid point matching of the roi points to a template slice.
-    if rough_dicts[0]['template_roi_points'] is not None:
+    if roughs_dicts[0][0]['template_roi_points'] is not None:
         if nwafer_ids == 1:
-            roi_points = rough_dicts[0]['template_roi_points']*to_native_scale
+            roi_points = roughs_dicts[0][0]['template_roi_points']*to_native_scale
         else:
-            roi_points = [rough_dicts[0]['template_roi_points']*to_native_scale,
-                    rough_dicts[1]['template_roi_points']*to_native_scale]
+            roi_points = [roughs_dicts[0][0]['template_roi_points']*to_native_scale,
+                    roughs_dicts[0][1]['template_roi_points']*to_native_scale]
         # set doplots=True to show a scatter of the roi points and fit.
         cwafer.set_region_rotations_roi(roi_points, diff_warn_deg=0.1, index_roi_points=nwafer_ids>1, doplots=False)
 
@@ -819,18 +848,20 @@ if not (get_wafer_stats or rough_dills_run):
 
     # unless this is the rough_order export that does not include rough alignment, set rough affines
     if load_rough_alignment:
-        # scale translations if native
-        imaged_order_affines = [None]*len(rough_dicts)
-        for i in range(len(rough_dicts)):
-            if i > 0 and nwafer_ids==1: break # for single wafer there is only one rough_dict copy
-            for j in range(len(rough_dicts[i]['imaged_order_affines'])):
-                if rough_dicts[i]['imaged_order_affines'][j] is not None:
-                    rough_dicts[i]['imaged_order_affines'][j][:2,2] *= to_native_scale
-        if rough_export_run or fine_export_run:
-            for i in range(cwafer.nregions):
-                cwafer.region_affines[i] = rough_dicts[0]['imaged_order_affines'][cwafer.region_inds[i]-1]
-        else:
-            cwafer.region_affines = [d['imaged_order_affines'][r-1] for d,r in zip(rough_dicts, cwafer.region_inds)]
+        cwafer.regions_affines = [[None for x in range(len(roughs_dicts[y]))] for y in range(nrough)]
+        for k in range(nrough):
+            # scale translations if native
+            for i in range(len(roughs_dicts[k])):
+                if i > 0 and nwafer_ids==1: break # for single wafer there is only one rough_dict copy
+                for j in range(len(roughs_dicts[k][i]['imaged_order_affines'])):
+                    if roughs_dicts[k][i]['imaged_order_affines'][j] is not None:
+                        roughs_dicts[k][i]['imaged_order_affines'][j][:2,2] *= to_native_scale
+            if rough_export_run or fine_export_run:
+                for i in range(cwafer.nregions):
+                    cwafer.regions_affines[k][i] = roughs_dicts[k][0]['imaged_order_affines'][cwafer.region_inds[i]-1]
+            else:
+                cwafer.regions_affines[k] = [d['imaged_order_affines'][r-1] \
+                        for d,r in zip(roughs_dicts[k], cwafer.region_inds)]
 
 if rough_export_run:
     if validate_region_grid:
@@ -845,7 +876,7 @@ if rough_export_run:
                 ndsexports == 0 and blending_features and not overlays)
         export_str = ('overlays' if overlays else 'thumbnails') + \
                 ('_native' if native else '') + ('_solved_order' if load_solved_order else '') + \
-                (('_' + rough_run_str + '_aligned') if load_rough_alignment else '') + \
+                (('_' + rough_run_id + '_aligned') if load_rough_alignment else '') + \
                 ('_noblend' if not blending_features else '')
         if solver_thumbs_export:
             i = 1 if tissue_masks else 0
@@ -897,41 +928,45 @@ if rough_export_run:
             inv_xform_control_points=inv_control_points, verbose_load=native)
 
 # load the previous fine alignment results for exporting aligned tiffs
-if fine_export_run and not init_locks:
+if (fine_run and nfine > 0) or (fine_export_run and not init_locks):
     assert(nwafer_ids == 1) # no multiple wafer export runs
 
-    with open(fine_dill_fns[0], 'rb') as f: fine_dict = dill.load(f)
+    cwafer.deformations_points = [None]*nfine
+    cwafer.imaged_order_deformations_vectors = [[None for x in range(cwafer.nregions)] for y in range(nfine)]
+    for j in range(nfine):
+        with open(fine_dills_fns[j][0], 'rb') as f: fine_dict = dill.load(f)
 
-    cwafer.deformation_points = fine_dict['deformation_points']*to_native_scale
-    # The deformations need to be mapping from dst->src. This is what is required
-    #   by basically all coordinate remapping library functions that apply general warping xforms.
-    if 'imaged_order_forward_deformations' in fine_dict:
-        key_str = 'imaged_order_forward_deformations'; sign = -1.
-    else:
-        key_str = 'imaged_order_reverse_deformations'; sign = 1.
-    dataset = 'imaged_order_deltas'
-    h5fn = fine_dill_fns[i] + '.h5'
-    if os.path.isfile(h5fn):
-        shp, dtype = big_img_info(h5fn, dataset=dataset)
-        shp = np.array(shp); shp[0] = 1
-        data = np.empty(shp, dtype=dtype)
-        for i in range(cwafer.nregions):
-            ind = cwafer.region_inds[i]-1
-            big_img_load(h5fn, img_blk=data, dataset=dataset, custom_slc=np.s_[ind:ind+1,:,:])
-            cwafer.imaged_order_deformation_vectors[i] = sign * data.reshape(-1,2) * to_native_scale
-    else:
-        # legacy mode, before fine reslice implemented, where deltas are also stored in the dill
-        for i in range(cwafer.nregions):
-            cwafer.imaged_order_deformation_vectors[i] = \
-                sign*fine_dict[key_str][cwafer.region_inds[i]-1]*to_native_scale
-        fine_dict = None; del fine_dict # with lots of grid points, this can be quite large
+        cwafer.deformations_points[j] = fine_dict['deformation_points']*to_native_scale
+        # The deformations need to be mapping from dst->src. This is what is required
+        #   by basically all coordinate remapping library functions that apply general warping xforms.
+        if 'imaged_order_forward_deformations' in fine_dict:
+            key_str = 'imaged_order_forward_deformations'; sign = -1.
+        else:
+            key_str = 'imaged_order_reverse_deformations'; sign = 1.
+        dataset = 'imaged_order_deltas'
+        h5fn = fine_dills_fns[j][0] + '.h5'
+        if os.path.isfile(h5fn):
+            shp, dtype = big_img_info(h5fn, dataset=dataset)
+            shp = np.array(shp); shp[0] = 1
+            data = np.empty(shp, dtype=dtype)
+            for i in range(cwafer.nregions):
+                ind = cwafer.region_inds[i]-1
+                big_img_load(h5fn, img_blk=data, dataset=dataset, custom_slc=np.s_[ind:ind+1,:,:])
+                cwafer.imaged_order_deformations_vectors[j][i] = sign * data.reshape(-1,2) * to_native_scale
+        else:
+            # legacy mode, before fine reslice implemented, where deltas are also stored in the dill
+            for i in range(cwafer.nregions):
+                cwafer.imaged_order_deformations_vectors[j][i] = \
+                    sign*fine_dict[key_str][cwafer.region_inds[i]-1]*to_native_scale
+            fine_dict = None; del fine_dict # with lots of grid points, this can be quite large
 
 if validate_region_grid and (fine_export_run or fine_run):
     cwafer._validate_region_grid(start=0, per_figure=1, use_solved_order=True, bg_fill_type='noise',
         show_patches=False)
 
 if fine_export_run:
-    export_path = os.path.join(meta_folder, 'fine_alignment_exports', fine_run_str)
+    fine_run_id = '-'.join(fine_run_strs)
+    export_path = os.path.join(meta_folder, 'fine_alignment_exports', fine_run_id)
     img_suffix = '_fine_aligned' # xxx - paramterize?
     if native and not convert_hdf5s:
         dsexports = [1]
@@ -1019,7 +1054,7 @@ if fine_run:
     else:
         # for convenience always use the solved order size to know how many dills to init.
         # the lower value should be based on the max skipped planned to be run.
-        for i in range(fine_init_dills_rng[0],rough_dicts[0]['solved_order'].size-1):
+        for i in range(fine_init_dills_rng[0], roughs_dicts[0][0]['solved_order'].size-1):
             dill_fn = os.path.join(use_alignment_folders[ind], delta_dill_fn_str.format(delta_run_str,
                 wafer_ids[ind], i))
             print(dill_fn)
