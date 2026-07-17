@@ -7,7 +7,7 @@ os.system('date')
 Top level command-line interface for 2D alignment and montaging of image
   tiles within a section.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -49,15 +49,22 @@ import cv2
 # from sklearnex import patch_sklearn
 # patch_sklearn()
 from sklearn.neighbors import NearestNeighbors
+
+import hdf5plugin
+import h5py
+hdf5plugin.FILTERS # avoid linter warning
+
 os.system('date')
 
 from msem import region, zimages
-from msem.utils import big_img_load, big_img_save, big_img_info, big_img_init, gpfs_file_unlock, tile_nblks_to_ranges
+from msem.utils import big_img_load, big_img_save, big_img_info, big_img_init, tile_nblks_to_ranges
 from msem.utils import fill_outside_polygon, block_construct, make_hex_points, mls_rigid_transform, find_histo_mode
+
+from sslock import gpfs_file_unlock, report_job_completed
 
 # all parameters loaded from an experiment-specific import
 from def_common_params import get_paths, native_subfolder, dsstep, use_thumbnails_ds, all_wafer_ids, exclude_regions
-from def_common_params import scale_nm, nimages_per_mfov, legacy_zen_format, region_manifest_cnts, reimage_beg_inds
+from def_common_params import scale_nm, nimages_per_mfov, legacy_zen_format, region_manifest_cnts #, reimage_beg_inds
 from def_common_params import region_suffix, use_roi_poly, def_brightness_use_fit_decay
 from def_common_params import def_brightness_use_mode_ratio, mode_ratio_block_shape_um, brightness_slice_histo_nsat
 from def_common_params import brightness_slice_mode_limits, brightness_slice_absolute_rng
@@ -73,9 +80,12 @@ from def_common_params import order_txt_fn_str, limi_dill_fn_str, wafer_region_p
 from def_common_params import meta_folder, debug_plots_subfolder, meta_dill_fn_str, align_subfolder
 from def_common_params import delta_cutoff, variance_cutoff, weight_default, C_cutoff_soft_nGMM
 from def_common_params import region_stitching_twopass, region_stitching_twopass_nregions, twopass_default_tol_nm
-from def_common_params import tissue_mask_ds, tissue_mask_fn_str, tissue_mask_min_edge_um, tissue_mask_min_hole_edge_um
+from def_common_params import tissue_mask_ds, tissue_mask_fn_str
+from def_common_params import tissue_mask_min_edge_um, tissue_mask_min_hole_edge_um, tissue_mask_bwdist_um
 from def_common_params import tears_subfolder, torn_regions, tear_annotation_ds, tear_grid_density
-from def_common_params import noblend_subfolder
+from def_common_params import noblend_subfolder, allow_empty_mfovs, region_timestamps_all
+from def_common_params import use_tissue_coordinates, tissue_coordinates_centroid
+from def_common_params import interp_inliers
 os.system('date')
 
 
@@ -107,7 +117,7 @@ parser.add_argument('--region-inds-rng', nargs=2, type=int, default=[-1,-1],
 parser.add_argument('--run-type', nargs=1, type=str, default=['align'],
     choices=['align', 'balance', 'export', 'balance-mean-mfov', 'slice-histos', 'slice-balance',
         'slice-brightness-adjust', 'slice-contrast-rescale', 'slice-contrast-match', 'convert-h5-to-tiff',
-        'stitch-tears', 'save-target-histo', 'plot-target-histo', 'save-masks'],
+        'stitch-tears', 'save-target-histo', 'del-target-histo', 'save-masks', 'save-tile-masks', 'upsample-masks'],
     help='the type of run to choose')
 parser.add_argument('--twopass_align_first_pass', dest='twopass_firstpass', action='store_true',
     help='specify this is the first pass when using 2D two pass alignment method')
@@ -167,6 +177,10 @@ parser.add_argument('--stage-coords', dest='stage_coords', action='store_true',
     help='output the alignment based on the stage (zeiss) coordinates')
 parser.add_argument('--overlap-radius', nargs=1, type=int, default=[-1],
     help='override mfov overlap radius, intended for mfov debugging / param adjust')
+parser.add_argument('--save-target-histo-sliding', dest='sliding', action='store_true',
+    help='when saving target histograms, store into sampled indices')
+parser.add_argument('--save-target-histo-sliding-wafers', dest='sliding_wafers', action='store_true',
+    help='when saving sliding target histograms, do not interpolate across wafers')
 # options for blockwise processing, for when slices are memory-limited
 parser.add_argument('--nblocks', nargs=2, type=int, default=[1, 1],
     help='number of partitions per dimension for blockwise processing')
@@ -177,6 +191,8 @@ parser.add_argument('--block-overlap-um', nargs=2, type=float, default=[0., 0.],
 # options for saving the tissue masks into the region hdf5s
 parser.add_argument('--save-masks-in', nargs=1, type=str, default=[''],
     help='input path for the tissue masks')
+parser.add_argument('--copy-masks', dest='copy_masks', action='store_true',
+    help='use with the native export, copy masks from downsampled hdf5s (16nm)')
 
 args = parser.parse_args()
 args = vars(args)
@@ -279,6 +295,12 @@ tissue_masks = args['tissue_masks']
 # when running histos, get the area (in pixels) of the mask used for computing histos
 histos_compute_areas = args['histos_compute_areas']
 
+# when saving target histograms, save as a sliding histogram sample instead of as a single target histogram
+sliding = args['sliding']
+
+# if set when saving sliding histograms, then do not interpolate histograms across wafers
+sliding_wafers = args['sliding_wafers']
+
 # options for blockwise processing, mostly intended for native
 nblks = args['nblocks'][::-1]
 iblk = args['iblock'][::-1]
@@ -336,13 +358,21 @@ run_slice_brightness_adjust = run_type == 'slice-brightness-adjust'
 run_stitch_tears = run_type == 'stitch-tears'
 
 # for saving histogram of specified slice (already computed) into target histo in meta
-run_save_target_histo = (run_type == 'save-target-histo' or run_type == 'plot-target-histo')
+run_save_target_histo = (run_type == 'save-target-histo' or run_type == 'del-target-histo')
 
 # for saving downsampled masks into the region hdf5 files
 run_save_masks = run_type == 'save-masks'
 
 # arguments for saving downsampled masks into the region hdf5 files
 save_masks_in = args['save_masks_in'][0]
+# instead of reloading the original masks from tiffs for native, copy them from the downsampled hdf5s (16nm)
+copy_masks = args['copy_masks']
+
+# this is for the "per tile" tissue or not method driven by the acquisition file Tissue_coordinates.txt
+save_tile_masks = run_type == 'save-tile-masks'
+
+# this is a new mode that upsamples the mask to match the images so they can be used during the fine alignment
+upsample_masks = run_type == 'upsample-masks'
 
 # set wafer_ids to contain all wafers, if specified
 if args['all_wafers']:
@@ -379,6 +409,14 @@ nres_nms = 2
 # This is only used by the remapping done by run-type stitch-tears (slice tear stitching).
 #coordindate_transformations_dtype = np.float32
 xdtype = np.float32
+
+# xxx - probably no need to expose?
+target_histo_key = 'target_histogram' + ('_native' if native else '')
+target_histo_slice_key = target_histo_key + '_slice'
+target_histos_key = 'target_histograms' + ('_native' if native else '')
+target_histos_zinds_key = 'solved_order_zind'
+target_histos_sliding_key = 'target_histogram_use_sliding'
+target_histos_sliding_wafers_key = 'target_histogram_sliding_wafers'
 
 
 ### inits based on params
@@ -421,7 +459,7 @@ else:
 
 assert( not (brightness_use_mode_ratio and brightness_use_fit_decay) ) # do not work together correctly
 
-#nwafers = len(wafer_ids)
+nwafers = len(wafer_ids)
 # for lists that are indexed by wafer_id (and not by wafer index)
 mwafers = max(all_wafer_ids)+1
 
@@ -441,6 +479,88 @@ if not any_slice_histo:
 
 any_slice_histo_adjust = (run_slice_contrast_rescale or run_slice_contrast_match or run_slice_brightness_adjust)
 any_slice_histo_adjust = (any_slice_histo_adjust or run_save_target_histo)
+
+
+### help functions
+
+def load_tissue_mask(fn, tissue_mask_min_size, tissue_mask_min_hole_size, tissue_mask_bwdist=0, dsstep=None,
+        img_shape=None):
+    if img_shape is None: img_shape, _ = big_img_info(fn)
+
+    attrs={'ds':0}; bw, _ = big_img_load(fn, dataset='tissue_mask', attrs=attrs)
+    if dsstep is None: dsstep = attrs['ds']
+    if attrs['ds'] < dsstep:
+        rel_ds = dsstep // attrs['ds']
+        pad = (rel_ds - np.array(bw.shape) % rel_ds) % rel_ds
+        bw = measure.block_reduce(np.pad(bw, ((0,pad[0]), (0,pad[1])), mode='reflect'),
+                block_size=(rel_ds, rel_ds), func=zimages.blkrdc_func).astype(bw.dtype)
+        bw_ds = rel_ds * attrs['ds']
+        rel_ds = 1
+    else:
+        bw_ds = attrs['ds']
+        rel_ds = attrs['ds'] // dsstep
+
+    if tissue_mask_min_size > 0:
+        # remove small components
+        labels, nlbls = nd.label(bw, structure=nd.generate_binary_structure(2,2))
+        if nlbls > 0:
+            sizes = np.bincount(np.ravel(labels))[1:] # component sizes
+            rmv = np.nonzero(sizes < tissue_mask_min_size)[0] + 1
+            if rmv.size == nlbls:
+                # keep the largest label if they are all smaller than cutoff
+                rmv = rmv[rmv != np.argmax(sizes) + 1]
+            if rmv.size > 0:
+                bw[np.isin(labels, rmv)] = 0
+
+    if tissue_mask_min_hole_size > 0:
+        # remove small holes
+        labels, nlbls = nd.label(np.logical_not(bw),
+            structure=nd.generate_binary_structure(2,1))
+        if nlbls > 0:
+            sizes = np.bincount(np.ravel(labels))[1:] # component sizes
+            add = np.nonzero(sizes < tissue_mask_min_hole_size)[0] + 1
+            if add.size > 0:
+                bw[np.isin(labels, add)] = 1
+
+    if tissue_mask_bwdist > 0:
+        bw = (nd.distance_transform_edt(np.logical_not(bw)) < tissue_mask_bwdist)
+
+    # have to crop the image down because of the padding for cubing the regions.
+    shp = np.array(img_shape)
+    crp = (shp + (rel_ds - shp % rel_ds) % rel_ds) // rel_ds
+    bw = bw[:crp[0],:crp[1]]
+
+    return bw, bw_ds, rel_ds
+
+def load_tissue_mask_and_upsample(fn, tissue_mask_min_size, tissue_mask_min_hole_size, tissue_mask_bwdist=0,
+        dsstep=None, img_shape=None, blk_shape=None, blk_rng=None, invert=False, verbose=False):
+    bw, bw_ds, rel_ds = load_tissue_mask(fn, tissue_mask_min_size, tissue_mask_min_hole_size,
+            tissue_mask_bwdist=tissue_mask_bwdist, dsstep=dsstep, img_shape=img_shape)
+    # save memory by inverting the mask before upsampling.
+    if invert: bw = np.logical_not(bw)
+
+    #plt.figure(); plt.gcf().clf()
+    #plt.imshow(bw, cmap='gray')
+    #plt.show()
+
+    if not single_block:
+        if verbose: print('full bw tm is {}x{}'.format(bw.shape[1],bw.shape[0]))
+        # crop is based on original image load before downsampling
+        rng = [[int(np.floor(x[0]/bw_ds)), int(np.ceil(x[1]/bw_ds))] for x in blk_rng]
+        bw = bw[rng[0][0]:rng[0][1],rng[1][0]:rng[1][1]]
+    if verbose: print('bw tm blk is {}x{}'.format(bw.shape[1],bw.shape[0]))
+
+    if rel_ds > 1:
+        if verbose: print('Upsampling mask {}'.format(rel_ds)); t = time.time()
+        bw = block_construct(bw, rel_ds)
+        if verbose: print('\tdone upsampling in %.4f s' % (time.time() - t, ))
+        if verbose: print('bw tm is {}x{}'.format(bw.shape[1],bw.shape[0]))
+    # need to crop again after upsampling because of padding for downsampling
+    if blk_shape is None: blk_shape = img_shape
+    bw = bw[:blk_shape[0], :blk_shape[1]]
+    assert( bw.shape == blk_shape )
+
+    return bw, bw_ds, rel_ds
 
 # for parallelizing slice histogram calculations
 def compute_histos_job(ind, inds, fns, rois_points, use_tissue_mask, tissue_mask_min_size, tissue_mask_min_hole_size,
@@ -462,7 +582,7 @@ def compute_histos_job(ind, inds, fns, rois_points, use_tissue_mask, tissue_mask
                 iblk = np.unravel_index(b, nblks)
                 if use_iblk is not None and not all([x == y for x,y in zip(use_iblk, iblk)]): continue
                 if verbose: print('Loading {}, block {} {}'.format(fns[i],iblk[0],iblk[1])); t = time.time()
-                attrs={'write_mask':None} if write_count_unique < 0 else write_count_unique
+                attrs={'write_mask':None} if write_count_unique < 0 else None
                 img, img_shape, blk_rng = big_img_load(fns[i], nblks=nblks, iblk=iblk, return_rng=True, attrs=attrs)
                 if write_count_unique < 0:
                     write_count_unique = int((attrs['write_mask'] > 0).sum())
@@ -488,61 +608,10 @@ def compute_histos_job(ind, inds, fns, rois_points, use_tissue_mask, tissue_mask
                     if verbose: print('\tdone filling in %.4f s' % (time.time() - t, ))
                 if use_tissue_mask:
                     if verbose: print('Fill 0 outside mask {}'); t = time.time()
-                    attrs={'ds':0}; bw, _ = big_img_load(fns[i], dataset='tissue_mask', attrs=attrs)
-                    if attrs['ds'] < dsstep:
-                        rel_ds = dsstep // attrs['ds']
-                        pad = (rel_ds - np.array(bw.shape) % rel_ds) % rel_ds
-                        bw = measure.block_reduce(np.pad(bw, ((0,pad[0]), (0,pad[1])), mode='reflect'),
-                                block_size=(rel_ds, rel_ds), func=zimages.blkrdc_func).astype(bw.dtype)
-                        bw_ds = rel_ds * attrs['ds']
-                        rel_ds = 1
-                    else:
-                        bw_ds = attrs['ds']
-                        rel_ds = attrs['ds'] // dsstep
 
-                    if tissue_mask_min_size > 0:
-                        # remove small components
-                        labels, nlbls = nd.label(bw, structure=nd.generate_binary_structure(2,2))
-                        if nlbls > 0:
-                            sizes = np.bincount(np.ravel(labels))[1:] # component sizes
-                            rmv = np.nonzero(sizes < tissue_mask_min_size)[0] + 1
-                            if rmv.size == nlbls:
-                                # keep the largest label if they are all smaller than cutoff
-                                rmv = rmv[rmv != np.argmax(sizes) + 1]
-                            if rmv.size > 0:
-                                bw[np.isin(labels, rmv)] = 0
-
-                    if tissue_mask_min_hole_size > 0:
-                        # remove small holes
-                        labels, nlbls = nd.label(np.logical_not(bw),
-                            structure=nd.generate_binary_structure(2,1))
-                        if nlbls > 0:
-                            sizes = np.bincount(np.ravel(labels))[1:] # component sizes
-                            add = np.nonzero(sizes < tissue_mask_min_hole_size)[0] + 1
-                            if add.size > 0:
-                                bw[np.isin(labels, add)] = 1
-
-                    # save memory by inverting the mask before upsampling.
-                    bw = np.logical_not(bw)
-                    # have to crop the image down because of the padding for cubing the regions.
-                    shp = np.array(img_shape)
-                    crp = (shp + (rel_ds - shp % rel_ds) % rel_ds) // rel_ds
-                    bw = bw[:crp[0],:crp[1]]
-
-                    if not single_block:
-                        if verbose: print('full bw tm is {}x{}'.format(bw.shape[1],bw.shape[0]))
-                        # crop is based on original image load before downsampling
-                        rng = [[int(np.floor(x[0]/bw_ds)), int(np.ceil(x[1]/bw_ds))] for x in blk_rng]
-                        bw = bw[rng[0][0]:rng[0][1],rng[1][0]:rng[1][1]]
-                    if verbose: print('bw tm blk is {}x{}'.format(bw.shape[1],bw.shape[0]))
-
-                    if rel_ds > 1:
-                        if verbose: print('Upsampling mask {}'.format(rel_ds)); t = time.time()
-                        bw = block_construct(bw, rel_ds)
-                        if verbose: print('\tdone upsampling in %.4f s' % (time.time() - t, ))
-                        if verbose: print('bw tm is {}x{}'.format(bw.shape[1],bw.shape[0]))
-                    # need to crop again after upsampling because of padding for downsampling
-                    bw = bw[:img.shape[0], :img.shape[1]]
+                    bw, bw_ds, rel_ds = load_tissue_mask_and_upsample(fns[i], tissue_mask_min_size,
+                            tissue_mask_min_hole_size, dsstep=dsstep, img_shape=img_shape, blk_shape=img.shape,
+                            blk_rng=blk_rng, invert=True, verbose=verbose)
 
                     # zero out everything outside of mask (as with polygon)
                     img[bw] = 0
@@ -606,10 +675,164 @@ def downsample_mode_ratio(imgs, ds):
         print('\tdone in %.4f s' % (time.time() - t, ))
     return imgs
 
+# chat-gpt generated with:
+# "Please write a python script with numpy / scipy that takes a series of uint8 image histograms,
+#  shape (nsamples,256), and integer sampling indices, shape (nsamples,), and linearly interpolates
+#  between them at all integer points. For extrapolated values, use the nearest histogram."
+# subsequently modified with cum_bins (for wafer boundaries, do not interpolate across wafers)
+def interpolate_histograms_wafers(hists, sample_idx, output_idx=None, cum_bins=None):
+    """
+    Linearly interpolate uint8 histograms at all integer positions.
+
+    Parameters
+    ----------
+    hists : ndarray, shape (nsamples, 256)
+        Input histograms.
+    sample_idx : ndarray, shape (nsamples,)
+        Integer indices corresponding to each histogram.
+    output_idx : ndarray of int, optional
+        Integer indices to interpolate at. If None, produce full range.
+    cum_bins : ndarray of int, optional
+        Cumulative sum of wafer section counts defining bins for *_idx.
+        Interpolation only occurs within each bin (per wafer).
+
+    Returns
+    -------
+    interpolated : ndarray, shape (n_output, 256)
+        Interpolated histograms.
+    """
+
+    hists = np.asarray(hists)
+    sample_idx = np.asarray(sample_idx)
+
+    # Sort samples by their indices
+    order = np.argsort(sample_idx)
+    sample_idx = sample_idx[order]
+    hists = hists[order]
+
+    # Determine output sampling positions
+    if output_idx is None:
+        output_idx = np.arange(sample_idx[0], sample_idx[-1] + 1)
+    output_idx = np.asarray(output_idx)
+
+    if cum_bins is None:
+        cum_bins = np.array([max([sample_idx[-1], output_idx[-1]]) + 1])
+    else:
+        np.array(cum_bins)
+    bin_starts = np.concatenate(([0], cum_bins[:-1]))
+    bin_ends = cum_bins
+
+    outputs = []
+    for bstart, bend in zip(bin_starts, bin_ends):
+        # Samples eligible for this bin
+        smask = (sample_idx >= bstart) & (sample_idx < bend)
+        csample_idx = sample_idx[smask]
+        chists = hists[smask]
+        assert( csample_idx.size > 0 ) # need at least one sample for each bin (for each wafer)
+
+        # Interpolated samples eligible for this bin
+        omask = (output_idx >= bstart) & (output_idx < bend)
+        coutput_idx = output_idx[omask]
+        if coutput_idx.size < 1: continue
+
+        nsamples = len(csample_idx)
+        #nout = len(coutput_idx)
+
+        # Find left and right sample indices for each output position
+        left = np.searchsorted(csample_idx, coutput_idx, side='right') - 1
+        right = left + 1
+
+        # Clamp for nearest-neighbor extrapolation
+        left = np.clip(left, 0, nsamples - 1)
+        right = np.clip(right, 0, nsamples - 1)
+
+        # Compute interpolation weights
+        x0 = csample_idx[left]
+        x1 = csample_idx[right]
+
+        denom = np.where(x1 != x0, x1 - x0, 1)
+        w = (coutput_idx - x0) / denom       # shape (nout,)
+        w = w[:, None]                       # (nout, 1) for broadcasting
+
+        # Linear interpolation of (nsamples, 256) → (nout, 256)
+        interpolated = (1 - w) * chists[left] + w * chists[right]
+        outputs.append(interpolated)
+
+    return np.vstack(outputs)
+
+
+# chat-gpt generated with:
+# How can I automatically detect remove single sample spikes using in a histogram
+# that result from saturated pixels after adjusting image brightness and replace
+# them with the mean of the neighboring bins? Please provide code in python
+# with numpy/scipy.
+def remove_histogram_spikes(
+    hist,
+    window=3,
+    z_thresh=100.,
+):
+    """
+    Remove single-bin saturation spikes from a histogram using
+    robust statistics and fully vectorized replacement.
+
+    Parameters
+    ----------
+    hist : ndarray
+        Histogram counts
+    window : int
+        Neighborhood size (odd number)
+    z_thresh : float
+        Threshold in robust z-score units
+
+    Returns
+    -------
+    hist_clean : ndarray
+        Histogram with spikes removed
+    spike_mask : ndarray (bool)
+        Locations of removed spikes
+    """
+
+    hist = np.asarray(hist, dtype=float)
+
+    if window % 2 == 0:
+        raise ValueError("window must be odd")
+
+    # 1) Robust local background via median filter
+    background = nd.median_filter(hist, size=window, mode="reflect")
+
+    # 2) Robust deviation (MAD-based z-score)
+    resid = hist - background
+    mad = np.median(np.abs(resid)) + 1e-12
+    z = resid / mad
+
+    # 3) Detect positive single-bin spikes
+    spike_mask = z > z_thresh
+
+    # 4) Vectorized replacement: mean of neighbors
+    kernel = np.ones(window, dtype=float)
+    kernel[window // 2] = 0.0
+    kernel /= kernel.sum()
+
+    neighbor_mean = nd.convolve1d(hist, kernel, mode="reflect")
+
+    hist_clean = np.where(spike_mask, neighbor_mean, hist)
+
+    return hist_clean, spike_mask
+
 
 ### precompute the histo_dill_fns names
 # this is for modes that use the order information for brightness balancing
 load_order = brightness_balance_slices_whole and brightness_balance_slices_whole_tiles_nslices > 1
+load_order = load_order or (run_save_target_histo and sliding)
+meta_d = None
+if run_slice_contrast_match or run_save_target_histo:
+    # load the pre-saved target histogram
+    if os.path.isfile(meta_dill_fn):
+        with open(meta_dill_fn, 'rb') as f: d = dill.load(f)
+    else:
+        d = {}
+    load_order = load_order or (target_histos_sliding_key in d and d[target_histos_sliding_key])
+    meta_d = d
 histo_dill_fns = [None]*mwafers
 cum_missing_region_inds = np.zeros((0,), dtype=np.int64)
 if load_order:
@@ -619,7 +842,8 @@ if load_order:
     cum_nregions = 0
     cum_to_solved_order = np.zeros((0,), dtype=np.int64)
     cum_from_solved_order = np.zeros((0,), dtype=np.int64)
-for wafer_id in all_wafer_ids:
+    solved_order_nregions = np.zeros((mwafers-1,), dtype=np.int32)
+for i,wafer_id in enumerate(all_wafer_ids):
     experiment_folders, thumbnail_folders, protocol_folders, alignment_folder, _, region_strs = get_paths(wafer_id)
     nregions = sum([len(x) for x in region_strs])
     # region_strs is a list of lists unfortunately, seperated by experiment folders. flatten.
@@ -631,8 +855,10 @@ for wafer_id in all_wafer_ids:
     order_txt_fn = os.path.join(alignment_folder, order_txt_fn_str.format(wafer_id))
 
     if load_order:
-        # save the tile histograms for each region in the solved order.
-        solved_order = np.fromfile(order_txt_fn, dtype=np.uint32, sep=' ')-1 # saved order is 1-based
+        if not os.path.isfile(order_txt_fn):
+            solved_order = np.arange(nregions)
+        else:
+            solved_order = np.fromfile(order_txt_fn, dtype=np.uint32, sep=' ')-1 # saved order is 1-based
         # get the inverse lookup for the solved order, put -1's for missing regions
         region_ind_to_solved_order[wafer_id] = -np.ones(nregions, np.int64)
         region_ind_to_solved_order[wafer_id][solved_order] = np.arange(solved_order.size)
@@ -651,6 +877,9 @@ for wafer_id in all_wafer_ids:
                 missing_region_inds[wafer_id]+cum_nregions))
         cum_nregions += nregions
 
+        solved_order_nregions[i] = solved_order.size
+if load_order:
+    cum_solved_order_nregions = np.cumsum(solved_order_nregions)
 
 ### the iteration over wafers is intended mostly for intraslice brightness balancing.
 slices_histos_doinit = True
@@ -664,6 +893,8 @@ for wafer_id in wafer_ids:
     #slice_histos_mask_fns = [None]*nregions
     # region_strs is a list of lists unfortunately, seperated by experiment folders. flatten.
     region_strs_flat = [item for sublist in region_strs for item in sublist]
+    region_timestamps = region_timestamps_all[wafer_id]
+    ctissue_coordinates_centroid = tissue_coordinates_centroid[wafer_id]
 
     # skip the region loop entirely for slice brightness balancing
     # in this mode region_ind is interpreted as a 1-based index
@@ -710,8 +941,10 @@ for wafer_id in wafer_ids:
             false_color_montage=false_color_montage, D_cutoff=delta_cutoff, V_cutoff=variance_cutoff,
             W_default=weight_default, legacy_zen_format=legacy_zen_format, scale_nm=scale_nm,
             tissue_mask_ds=use_tissue_mask_ds, tissue_mask_min_edge_um=tissue_mask_min_edge_um,
-            tissue_mask_min_hole_edge_um=tissue_mask_min_hole_edge_um, C_cutoff_soft_nGMM=C_cutoff_soft_nGMM,
-            verbose=True)
+            tissue_mask_min_hole_edge_um=tissue_mask_min_hole_edge_um, tissue_mask_bwdist_um=tissue_mask_bwdist_um,
+            C_cutoff_soft_nGMM=C_cutoff_soft_nGMM, allow_empty_mfovs=allow_empty_mfovs,
+            use_tissue_coordinates=use_tissue_coordinates, tissue_coordinates_centroid=ctissue_coordinates_centroid,
+            median_filter=(use_thumbnails_ds-1) if native else None, verbose=True)
         if cregion.imfov_diameter <= 1:
             print('WARNING: skipping region {}, bad number of mfovs {}'.format(cregion.region_str,
                 cregion.imfov_diameter))
@@ -734,12 +967,10 @@ for wafer_id in wafer_ids:
         # output / input files per-region depending on run-type
         prefix = wafer_region_prefix_str.format(wafer_id, cregion.region_str)
         mfov_str = '' if mfov_id < 1 else ('_mfov{}'.format(mfov_id))
-        use_region_suffix = (custom_suffix if custom_suffix else region_suffix) #\
-        #    if blending_features else region_suffix_noblend
-        if stage_coords:
-            coords_fn = os.path.join(cregion.region_folder, "full_image_coordinates.txt")
-        else:
-            coords_fn = os.path.join(alignment_folder, prefix + mfov_str + '_coords.txt')
+        use_region_suffix = (custom_suffix if custom_suffix else region_suffix)
+        microscope_coords_fn = os.path.join(cregion.region_folder, "full_image_coordinates.txt")
+        alignment_coords_fn = os.path.join(alignment_folder, prefix + mfov_str + '_coords.txt')
+        coords_fn = microscope_coords_fn if stage_coords else alignment_coords_fn
         slice_mean_mfovs_fn = os.path.join(alignment_folder, prefix + '_mmfov.tiff')
         thumb_brightness_fn = os.path.join(alignment_folder, prefix + '_brightness.txt')
         thumb_slice_mode_ratio_fn = os.path.join(alignment_folder, prefix + '_scale.tiff')
@@ -761,6 +992,7 @@ for wafer_id in wafer_ids:
             stitched_slice_bfn = os.path.join(native_alignment_folder, tears_subfolder, prefix + use_region_suffix)
             src_brightness_fn = dst_brightness_fn = native_brightness_fn
             src_slice_mode_ratio_fn = dst_slice_mode_ratio_fn = native_slice_mode_ratio_fn
+            slice_image_ds_fn = os.path.join(alignment_folder, prefix + use_region_suffix) + '.h5'
 
             if native_exchange_src:
                 src_brightness_fn = thumb_brightness_fn
@@ -780,13 +1012,12 @@ for wafer_id in wafer_ids:
             if native_exchange_dst:
                 dst_brightness_fn = native_brightness_fn
                 dst_slice_mode_ratio_fn = native_slice_mode_ratio_fn
-        #microscope_coords_fn = os.path.join(cregion.region_folder, "full_image_coordinates.txt")
         slice_image_fn = slice_image_bfn + '.h5'
         stitched_slice_fn = stitched_slice_bfn + '.h5'
         # SO 45211650/very-slow-writing-of-a-slice-into-an-existing-hdf5-datased-using-h5py
         slice_image_rewrite_fn = slice_image_bfn + '.new.h5'
 
-        if not run_stitch_tears and region_ind in torn_regions[wafer_id]:
+        if not run_stitch_tears and not export_montage and region_ind in torn_regions[wafer_id]:
             slice_image_fn = stitched_slice_bfn + '.h5'
             slice_image_rewrite_fn = stitched_slice_bfn + '.new.h5'
 
@@ -800,6 +1031,19 @@ for wafer_id in wafer_ids:
             if use_roi_poly and roi_polygon_scale > 0:
                 print('WARNING: no roi polygon (maybe missing coords file?)')
             croi_poly = None
+
+        if use_tissue_coordinates:
+            if cregion.tissue_poly is None:
+                print('ERROR: no tissue polygon, Tissue_coordinates.txt likely missing for region')
+                assert(False) # need to fix this or set use_tissue_coordinates==False
+            scl = roi_polygon_scale if roi_polygon_scale > 0 else 1.
+            if region_ind == cregion_inds[0]:
+                print('Using tissue poly with scale factor {}'.format(scl))
+            # for the options that use the polygons, scale it by the specified factor parameter
+            pts = cregion.tissue_poly; ctr = cregion.tissue_poly.mean(0)
+            ctissue_poly = (pts - ctr)*scl + ctr
+        else:
+            ctissue_poly = None
 
         if slice_balance or run_slice_brightness_adjust:
             loaded_slice_adjust = zimages.load_slice_balance_file(slice_balance_fns[wafer_id], cregion.region_slcstr)
@@ -821,7 +1065,7 @@ for wafer_id in wafer_ids:
                 print('Initializing h5 and h5 locks files for region export')
                 big_img_init(slice_image_fn)
                 print('exiting')
-                print('Twas brillig, and the slithy toves') # for --check-msg not to report failure
+                report_job_completed()
                 sys.exit(0)
 
             print('Montaging region from saved coords at:')
@@ -866,6 +1110,7 @@ for wafer_id in wafer_ids:
 
             # nmfovs, tiles per mfov, ndims
             cregion.create_region_coords_from_inner_rect_coords(cregion.region_coords)
+            del cregion.mfov_scale_adjust, cregion.mfov_scale_adjust_rect # no longer needed, save memory
             if native and first_block:
                 # write out image coordinates to text file in zeiss format
                 # this is mostly here for ease for wafer, so that wafer itself does not have to be aware of native,
@@ -878,23 +1123,31 @@ for wafer_id in wafer_ids:
             image, corners, crop_info, overlap_sum = cregion.montage(dsstep=dsstep, blending_mode=blending_mode,
                     get_overlap_sum=True, res_nm=res_nm, nblks=nblks, iblk=iblk, novlp_pix=blk_ovlp_pix)
 
+            # if there are empty mfovs, then they need to be zero'ed because the tile balancing is applied to
+            #   them even though they are empty during the montage. it was easier to just zero them here than
+            #   to try and disable the balancing in zimages.montage
+            image_background = (overlap_sum==0)
+            if allow_empty_mfovs: image[image_background] = 0
+
             if mfov_id < 1:
                 img_shape = crop_info['noncropped_size'][::-1]
                 print('Saving image {}x{}, background (and empty histogram)'.format(img_shape[0],img_shape[1]))
                 t = time.time()
                 write_count, f1, f2 = big_img_save(slice_image_fn, image, img_shape, nblks=nblks, iblk=iblk,
                         novlp_pix=blk_ovlp_pix, compression=True, recreate=True, lock=lock, keep_locks=lock, wait=True)
-                big_img_save(slice_image_fn, overlap_sum==0, img_shape, nblks=nblks, iblk=iblk, novlp_pix=blk_ovlp_pix,
+                big_img_save(slice_image_fn, image_background, img_shape, nblks=nblks, iblk=iblk, novlp_pix=blk_ovlp_pix,
                         dataset='background', compression=True, recreate=True, f1=f1, f2=f2)
                 big_img_save(slice_image_fn, overlap_sum, img_shape, nblks=nblks, iblk=iblk, novlp_pix=blk_ovlp_pix,
                         dataset='overlap_count', compression=True, recreate=True, f1=f1, f2=f2)
                 if first_block:
                     # create the histogram dataset now. it will be computed more than once after image transformations.
                     histo = np.zeros((np.iinfo(image.dtype).max+1), dtype=np.int64)
-                    big_img_save(slice_image_fn, histo, histo.shape, dataset='histogram', recreate=True)
+                    big_img_save(slice_image_fn, histo, histo.shape, dataset='histogram', recreate=True,
+                        overwrite_dataset=True)
                     # xxx - hacky, save slots for downsampled image histograms
                     for ds in [2,4,8,16,32,64]:
-                        big_img_save(slice_image_fn, histo, histo.shape, dataset='histogram_'+str(ds), recreate=True)
+                        big_img_save(slice_image_fn, histo, histo.shape, dataset='histogram_'+str(ds), recreate=True,
+                            overwrite_dataset=True)
                 if lock: gpfs_file_unlock(f1,f2)
                 print('\tdone in %.4f s' % (time.time() - t, ))
             else:
@@ -971,14 +1224,25 @@ for wafer_id in wafer_ids:
                 cmp_method='res' # seems to work better
                 #cmp_method='C'
 
+                if tissue_masks:
+                    # this is a second entire iteration of the 2D alignment (on top of region_stitching_twopass).
+                    # the first iteration is used to create the tissue masks, which are then converted to tile-based
+                    #   masks (boolean that each tile is mostly tissue or not), which is used to reject comparisons
+                    #   from non-tissue areas immediately during the first pass.
+                    # xxx - there is some consequence here, because the then default coordinates are no longer the
+                    #   "zeiss" or stage coordinates, but the stitched ones... not sure how much this matters
+                    cregion.load_stitched_region_image_coords(coords_fn, load_tile_masks=True,
+                            scale=to_native_scale, rmv_thb=native)
+
                 # whether this is two pass and if so, which pass we are running.
                 cregion_stitching_twopass = region_stitching_twopass and (cregion.nmfov_ids > 1)
                 ctwopass_multiple_regions = cregion_stitching_twopass and region_stitching_twopass_nregions > 1
                 ctwopass_firstpass = twopass_firstpass and ctwopass_multiple_regions
 
                 if ctwopass_firstpass:
-                    mfovDx, mfovDy, mfovC, delta_coords = cregion.align_and_stitch_mfovs(twopass=True,
-                            twopass_firstpass=True, cmp_method=cmp_method, default_tol=twopass_default_tol,
+                    # default_tol is not used for the first pass, so do not pass it here to avoid confusion
+                    mfovDx, mfovDy, mfovC, delta_coords = cregion.align_and_stitch_mfovs(
+                            twopass=True, twopass_firstpass=True, cmp_method=cmp_method,
                             nworkers=arg_nworkers, doplots=doplots, dosave_path=dosave_path)
 
                     d = {
@@ -1010,20 +1274,30 @@ for wafer_id in wafer_ids:
                             region_nums = [int(x.split('_')[1][1:].split('R')[0]) for x in region_strs_fn]
                             region_num = int(cregion.region_str.split('_')[1][1:].split('R')[0])
                         else:
-                            region_nums = [int(x.split('_')[0]) for x in region_strs_fn]
-                            region_num = int(cregion.region_numstr)
-                        if reimage_beg_inds is not None:
-                            lims_reimage_beg_inds = np.concatenate(([0], reimage_beg_inds[wafer_id],
-                                    [nregions + reimage_beg_inds[wafer_id][-1]]))
-                            ireimage = np.nonzero(region_num < lims_reimage_beg_inds)[0][0]
-                            region_nums = [x for x in region_nums if x >= lims_reimage_beg_inds[ireimage-1]]
-                            region_nums = [x for x in region_nums if x < lims_reimage_beg_inds[ireimage]]
+                            # xxx - decided to ditch the old reimage method because if there are less than
+                            #   region_stitching_twopass_nregions reimages in a reimage set, then the medians
+                            #   will be likely worse than averaging over previous or subsequent reimage sets.
+                            # rely entirely on the timestamps to know which regions to use for computing medians.
+                            region_nums = region_timestamps
+                            region_num = region_timestamps[region_ind - 1]
+                        # old method based on the region_nums / reimages
+                        # else: # if legacy_zen_format:
+                        #     region_nums = [int(x.split('_')[0]) for x in region_strs_fn]
+                        #     region_num = int(cregion.region_numstr)
+                        # if reimage_beg_inds is not None:
+                        #     lims_reimage_beg_inds = np.concatenate(([0], reimage_beg_inds[wafer_id],
+                        #             [nregions + reimage_beg_inds[wafer_id][-1]]))
+                        #     ireimage = np.nonzero(region_num < lims_reimage_beg_inds)[0][0]
+                        #     region_nums = [x for x in region_nums if x >= lims_reimage_beg_inds[ireimage-1]]
+                        #     region_nums = [x for x in region_nums if x < lims_reimage_beg_inds[ireimage]]
+
                         region_nums = np.array(region_nums)
                         region_num = np.array(region_num)
                         assert( region_nums.shape == np.unique(region_nums).shape )
                         knbrs = NearestNeighbors(n_neighbors=n, algorithm='kd_tree').fit(region_nums.reshape((-1,1)))
                         knnbrs = knbrs.kneighbors(region_num.reshape((-1,1)), return_distance=False).reshape(-1)
                         knnbrs = np.sort(knnbrs); knnbrs = knnbrs[region_nums[knnbrs] != region_num]
+                        print('Using these "imaged order neighbors" for computing medians:')
                         for i in range(n-1):
                             cslice_twopass_dill_fn = os.path.join(alignment_folder, align_subfolder,
                                     wafer_region_prefix_str.format(wafer_id, region_strs_fn[knnbrs[i]]) + \
@@ -1060,7 +1334,7 @@ for wafer_id in wafer_ids:
                     else:
                         # comment for debug see region.py comments - xxxalgnbypass
                         cregion.align_and_stitch_mfovs(twopass=region_stitching_twopass, cmp_method=cmp_method,
-                            default_tol=twopass_default_tol,  mfovDx=mfovDx, mfovDy=mfovDy, mfovC=mfovC,
+                            default_tol=twopass_default_tol, mfovDx=mfovDx, mfovDy=mfovDy, mfovC=mfovC,
                             delta_coords=delta_coords, mfovDx_med=mfovDx_med, mfovDy_med=mfovDy_med,
                             nworkers=arg_nworkers, doplots=doplots, dosave_path=dosave_path)
                         cregion.mfov_stitch()
@@ -1147,23 +1421,46 @@ for wafer_id in wafer_ids:
                 slice_histos_include_fns[region_ind-1] = slice_image_fn
 
             if run_save_masks:
-                # create the full filename for the masks
-                # have to do this if you did not sort the region exports by manifest index before cubing.
-                #use_region_ind = argsort(region_strs_flat).index(region_ind-1)
-                # or if they were
-                use_region_ind = region_ind-1
-                tind = use_region_ind if wafer_id < 2 else use_region_ind + cum_manifest_cnts[wafer_id-2]
-                pfn = tissue_mask_fn_str.format(tind) if tissue_mask_fn_str else slice_dsimage_pfn
-                fn = os.path.join(save_masks_in, pfn)
-                bw = tifffile.imread(fn).astype(bool)
-                # have to crop the image down because of the padding for cubing the regions.
-                rel_ds = use_tissue_mask_ds // dsstep
-                img_shape, _ = big_img_info(slice_image_fn)
-                shp = np.array(img_shape)
-                crp = (shp + (rel_ds - shp % rel_ds) % rel_ds) // rel_ds
-                bw = bw[:crp[0],:crp[1]]
+                if copy_masks:
+                    assert( native )
+                    attrs={'ds':0}; bw, _ = big_img_load(slice_image_ds_fn, dataset='tissue_mask', attrs=attrs)
+                    use_tissue_mask_ds = attrs['ds'] * use_thumbnails_ds
+                    print("Copying mask from '{}' to '{}'".format(slice_image_ds_fn, slice_image_fn))
+                else:
+                    # create the full filename for the masks
+                    # have to do this if you did not sort the region exports by manifest index before cubing.
+                    #use_region_ind = argsort(region_strs_flat).index(region_ind-1)
+                    # or if they were
+                    use_region_ind = region_ind-1
 
-                print("Saving mask '{}' to '{}'".format(fn, slice_image_fn))
+                    # if the regions were exported for all wafers at once (normal workflow)
+                    tind = use_region_ind if wafer_id < 2 else use_region_ind + cum_manifest_cnts[wafer_id-2]
+                    # if the regions were exported for each wafer individually.
+                    # this can happen if workflow is pipelined as it is being imaged or copied.
+                    #tind = use_region_ind
+
+                    if tissue_mask_fn_str:
+                        # automatically detect if the masks were saved base-1 indexed
+                        if not os.path.isfile(os.path.join(save_masks_in, tissue_mask_fn_str.format(0))):
+                            tind += 1
+                        pfn = tissue_mask_fn_str.format(tind)
+                    else:
+                        pfn = slice_dsimage_pfn
+                    fn = os.path.join(save_masks_in, pfn)
+                    # xxx - there are multiple class options for some datasets, i.e.,
+                    #   also predicting tears or epon or iron, etc.
+                    #   this really should be defined in def_common_params, which value is tissue
+                    #bw = tifffile.imread(fn).astype(bool)
+                    tissue_class_id = 1
+                    bw = (tifffile.imread(fn) == tissue_class_id)
+                    # have to crop the image down because of the padding for cubing the regions.
+                    rel_ds = use_tissue_mask_ds // dsstep
+                    img_shape, _ = big_img_info(slice_image_fn)
+                    shp = np.array(img_shape)
+                    crp = (shp + (rel_ds - shp % rel_ds) % rel_ds) // rel_ds
+                    bw = bw[:crp[0],:crp[1]]
+                    print("Saving mask '{}' to '{}'".format(fn, slice_image_fn))
+
                 big_img_save(slice_image_fn, bw, img_shape=bw.shape, dataset='tissue_mask',
                     compression=True, recreate=True, overwrite_dataset=True, attrs={'ds':use_tissue_mask_ds})
 
@@ -1172,7 +1469,7 @@ for wafer_id in wafer_ids:
                 print('Initializing h5 and h5 locks files for region histo adjustments')
                 big_img_init(slice_image_rewrite_fn)
                 print('exiting')
-                print('Twas brillig, and the slithy toves') # for --check-msg not to report failure
+                report_job_completed()
                 sys.exit(0)
 
             print('Loading slice, background and overlap'); t = time.time()
@@ -1180,13 +1477,18 @@ for wafer_id in wafer_ids:
                 img, img_shape = big_img_load(slice_image_fn, nblks=nblks, iblk=iblk)
                 bg, _ = big_img_load(slice_image_fn, nblks=nblks, iblk=iblk, dataset='background')
                 #overlap, _ = big_img_load(slice_image_fn, nblks=nblks, iblk=iblk, dataset='overlap_count')
-            histo, histo_shape = big_img_load(slice_image_fn, dataset='histogram')
+            dsstr = ('_'+str(dsstep)) if dsstep > 1 else ''
+            histo, histo_shape = big_img_load(slice_image_fn, dataset='histogram'+dsstr)
             print('\tdone in %.4f s' % (time.time() - t, ))
 
             rescale_range_histo = all([x <= 1 for x in slice_rescale_range])
             if (run_slice_contrast_rescale and rescale_range_histo) or \
                     run_slice_contrast_match or run_save_target_histo:
-                assert(histo.sum() > 0) # you probably forgot to run slice-histos, or (xxx) this is an excluded slice
+                if not show_plots:
+                    assert(histo.sum() > 0) # you forgot to run slice-histos or this is an excluded slice
+
+                # remove pixels that saturated during possible brightness adjustment.
+                histo, _ = remove_histogram_spikes(histo)
 
                 # remove saturated pixels at ends.
                 histo_nsat = brightness_slice_histo_nsat
@@ -1197,9 +1499,19 @@ for wafer_id in wafer_ids:
                 # histo[:histo_nsat[0]] = 0; histo[-histo_nsat[1]:] = 0
 
                 if run_slice_contrast_match:
-                    # load the pre-saved target histogram
-                    with open(meta_dill_fn, 'rb') as f: d = dill.load(f)
-                    target_histogram = d['target_histogram' + ('_native' if native else '')]
+                    d = meta_d
+                    if target_histos_sliding_key not in d or not d[target_histos_sliding_key]:
+                        target_histogram = d[target_histo_key]
+                    else:
+                        #sections = d[target_histos_key][target_histo_slice_key]
+                        histos = d[target_histos_key][target_histo_key]
+                        zinds = d[target_histos_key][target_histos_zinds_key]
+                        zind = region_ind_to_solved_order[wafer_id][region_ind-1]
+                        cum_bins = cum_solved_order_nregions if d[target_histos_sliding_wafers_key] else None
+                        target_histogram = interpolate_histograms_wafers(histos, np.array(zinds),
+                                output_idx=[zind], cum_bins=cum_bins)
+                        target_histogram = target_histogram.reshape(-1)
+
                 # optionally and heuristically deal with double peaked histograms.
                 # this can happen for example if part of the slice is missing and bare wafer
                 #   is imaged where the slice is missing.
@@ -1267,27 +1579,84 @@ for wafer_id in wafer_ids:
 
             elif run_save_target_histo:
                 pdf = histo/histo.sum()
-                print(histo.sum()); plt.figure(); plt.plot(histo)
-                print(pdf.sum()); plt.figure(); plt.plot(pdf)
                 if os.path.isfile(meta_dill_fn):
                     with open(meta_dill_fn, 'rb') as f: d = dill.load(f)
                 else:
                     d = {}
-                target_histo_key = 'target_histogram' + ('_native' if native else '')
-                target_histo_slice_key = target_histo_key + '_slice'
-                if run_type == 'plot-target-histo':
-                    plt.plot(d[target_histo_key], 'r')
+
+                # legacy approach, single template histogram for the entire stack
+                if target_histo_slice_key in d:
                     print('Current saved histo template slice ' + d[target_histo_slice_key])
-                plt.show()
-                if run_type != 'plot-target-histo':
-                    print('Saving histo template slice "' + target_histo_slice_key + '"')
-                    d[target_histo_key] = pdf
-                    d[target_histo_slice_key] = prefix
+                # for the sliding histogram approach
+                has_sliding = (target_histos_key in d)
+                if has_sliding:
+                    sections = d[target_histos_key][target_histo_slice_key]
+                    histos = d[target_histos_key][target_histo_key]
+                    zinds = d[target_histos_key][target_histos_zinds_key]
+                    print('Current saved sliding histo template slices:'); print(sections)
+                    print('Current saved sliding histo template zinds:'); print(zinds)
+                else:
+                    sections = []
+                    histos = np.zeros((0, pdf.size), dtype=np.double)
+                    zinds = np.zeros((0), dtype=np.int64)
+                save_meta = True
+                if run_type == 'del-target-histo':
+                    print('deleting current target histo info')
+                    ks = [target_histo_key, target_histo_slice_key, target_histos_key, target_histos_sliding_key,
+                            target_histos_sliding_wafers_key]
+                    for k in ks:
+                        if k in d: del d[k]
+                else:
+                    if region_inds[0] > -1:
+                        # show the current histogram specified to be saved before saving it
+                        plt.figure(); plt.plot(pdf)
+                    if show_plots:
+                        if target_histo_slice_key in d: plt.plot(d[target_histo_key], 'r')
+                        if has_sliding:
+                            plt.figure(); plt.plot(d[target_histos_key][target_histo_key].T); plt.legend(sections)
+                            idxs = list(range(0,cum_solved_order_nregions[-1],100))
+                            cum_bins = cum_solved_order_nregions if d[target_histos_sliding_wafers_key] else None
+                            thistos = interpolate_histograms_wafers(histos, np.array(zinds),
+                                    output_idx=idxs, cum_bins=cum_bins)
+                            plt.figure(); plt.plot(thistos.T)
+                        save_meta = False
+                    if show_plots or region_inds[0] > -1: plt.show()
+                    if not show_plots:
+                        print('Saving histo template slice "' + target_histo_slice_key + '"')
+                        if not sliding:
+                            d[target_histo_key] = pdf
+                            d[target_histo_slice_key] = prefix
+                            d[target_histos_sliding_key] = False
+                        else:
+                            if not has_sliding:
+                                d[target_histos_key] = {}
+                            zind = region_ind_to_solved_order[wafer_id][region_ind-1]
+                            if zind in zinds:
+                                print('Template at zind {} already saved into sliding histos templates'.format(zind))
+                            else:
+                                sections.append(prefix)
+                                histos = np.vstack((histos, pdf[None,:]))
+                                zinds = np.concatenate((zinds, [zind]))
+                                # keep the samples sorted by solved-order zindex
+                                inds = np.argsort(zinds)
+                                sections = [sections[x] for x in inds]
+                                histos, zinds = histos[inds,:], zinds[inds]
+                                d[target_histos_key][target_histo_slice_key] = sections
+                                d[target_histos_key][target_histo_key] = histos
+                                d[target_histos_key][target_histos_zinds_key] = zinds
+                                d[target_histos_sliding_key] = True
+                                if target_histos_sliding_wafers_key in d:
+                                    sliding_wafers = d[target_histos_sliding_wafers_key] or sliding_wafers
+                                d[target_histos_sliding_wafers_key] = sliding_wafers
+                if save_meta:
                     with open(meta_dill_fn, 'wb') as f: dill.dump(d, f)
                     print('target histo saved to ' + meta_dill_fn)
-                print('exiting')
-                print('Twas brillig, and the slithy toves') # for --check-msg not to report failure
-                sys.exit(0)
+                if run_type != 'del-target-histo' and region_inds[0] > -1 and region_ind != cregion_inds[-1]:
+                    continue
+                else:
+                    print('exiting')
+                    report_job_completed()
+                    sys.exit(0)
 
             # SO 45211650/very-slow-writing-of-a-slice-into-an-existing-hdf5-datased-using-h5py
             # have to write adjusted data to a new hdf5.
@@ -1310,13 +1679,13 @@ for wafer_id in wafer_ids:
                         recreate=True)
                 # copy the tissue mask if it has been saved
                 try:
-                    bw, _ = big_img_load(slice_image_fn, dataset='tissue_mask')
+                    attrs={'ds':0}; bw, _ = big_img_load(slice_image_fn, dataset='tissue_mask', attrs=attrs)
                     save_tissue_mask = True
                 except:
                     save_tissue_mask = False
                 if save_tissue_mask:
                     big_img_save(slice_image_rewrite_fn, bw, img_shape=bw.shape, dataset='tissue_mask',
-                        compression=True, recreate=True, overwrite_dataset=True, attrs={'ds':use_tissue_mask_ds})
+                        compression=True, recreate=True, overwrite_dataset=True, attrs={'ds':attrs['ds']})
             if lock: gpfs_file_unlock(f1,f2)
             print('\tdone in %.4f s' % (time.time() - t, ))
             # if we just wrote the last block, delete the original h5 and move the new h5 to the original h5.
@@ -1337,7 +1706,7 @@ for wafer_id in wafer_ids:
             else:
                 image, _ = big_img_load(slice_image_fn, dataset='background' if export_fg else 'image')
                 overlay_count = True # overlay scaled count on red channel, False for boolean overlap only
-                if overlap_overlay:
+                if overlap_overlay and region_ind not in torn_regions[wafer_id]:
                     overlap, _ = big_img_load(slice_image_fn, dataset='overlap_count')
 
             print('\tdone in %.4f s' % (time.time() - t, ))
@@ -1349,7 +1718,8 @@ for wafer_id in wafer_ids:
             if tissue_masks:
                 export_root = os.path.join(export_root, 'masks')
             native_str = 'native' if native else ''
-            noblend_str = '' if blending_features else '_noblend'
+            #noblend_str = '' if blending_features else '_noblend' # xxx - this was removed from run_wafer.py
+            noblend_str = ''
             for j in range(len(dsexports)):
                 dsthumbnail = dsexports[j]
                 export_str = 'wafer{:02d}{}{}_{}ds{:d}'.format(wafer_id, use_region_suffix, noblend_str, native_str,
@@ -1375,38 +1745,44 @@ for wafer_id in wafer_ids:
                     # modify shape to match expected shape of downsampled image
                     cimg_shape = np.ceil(img_shape / dsthumbnail).astype(np.uint64)
                     oimg = bw[:cimg_shape[0], :cimg_shape[1]]
-                    if (np.array(bw.shape) != cimg_shape).any():
+                    if (np.array(oimg.shape) != cimg_shape).any():
                         oimg = np.zeros(cimg_shape, dtype=bw.dtype)
                         oimg[:bw.shape[0], :bw.shape[1]] = bw
                 elif dsthumbnail > 1:
                     pad = (dsthumbnail - np.array(image.shape) % dsthumbnail) % dsthumbnail
                     oimg = np.round(measure.block_reduce(np.pad(image, ((0,pad[0]), (0,pad[1])), mode='reflect'),
                             block_size=(dsthumbnail, dsthumbnail), func=zimages.blkrdc_func)).astype(image.dtype)
-                    if overlap_overlay:
+                    if overlap_overlay and region_ind not in torn_regions[wafer_id]:
                         ovlp = measure.block_reduce(np.pad(overlap, ((0,pad[0]), (0,pad[1])), mode='reflect'),
                                 block_size=(dsthumbnail, dsthumbnail), func=np.max).astype(image.dtype)
                 else:
                     oimg = image
                     if overlap_overlay: ovlp = overlap
                 if overlap_overlay:
-                    print('\tadding overlap overlay')
-                    oimg = cv2.cvtColor(oimg, cv2.COLOR_GRAY2RGB)
-                    tmp = np.zeros(ovlp.shape + (3,), dtype=np.uint8)
-                    if overlay_count:
-                        ovlp[ovlp > 0] -= 1
-                        ovlp = (ovlp / ovlp.max() * 255).astype(np.uint8)
-                        print(ovlp.min(), ovlp.max(), np.unique(ovlp))
-                        tmp[:,:,0] = ovlp
-                    else:
-                        ovlp = (ovlp > 1); tmp[ovlp,0] = 255
-                    ovlp = tmp
-                    oimg = cv2.addWeighted(ovlp, 0.6 if overlay_count else 0.25, oimg, 1, 0.0)
-                    #oimg = cv2.addWeighted(ovlp, 1.2, oimg, 1, 0.0)
+                    if region_ind not in torn_regions[wafer_id]:
+                        print('\tadding overlap overlay')
+                        oimg = cv2.cvtColor(oimg, cv2.COLOR_GRAY2RGB)
+                        tmp = np.zeros(ovlp.shape + (3,), dtype=np.uint8)
+                        if overlay_count:
+                            ovlp[ovlp > 0] -= 1
+                            ovlp = (ovlp / ovlp.max() * 255).astype(np.uint8)
+                            print(ovlp.min(), ovlp.max(), np.unique(ovlp))
+                            tmp[:,:,0] = ovlp
+                        else:
+                            ovlp = (ovlp > 1); tmp[ovlp,0] = 255
+                        ovlp = tmp
+                        oimg = cv2.addWeighted(ovlp, 0.6 if overlay_count else 0.25, oimg, 1, 0.0)
+                        #oimg = cv2.addWeighted(ovlp, 1.2, oimg, 1, 0.0)
 
                     # also overlay the roi polygon
-                    line_thickness = 3 #; circle_rad = 5
+                    line_thickness = 20 #; circle_rad = 5
                     iroi_points = np.round(croi_poly/dsthumbnail).astype(np.int32)
                     cv2.polylines(oimg, [iroi_points.reshape((-1,1,2))], True, (255,0,0), line_thickness)
+
+                    if ctissue_poly is not None:
+                        line_thickness = 20 #; circle_rad = 5
+                        iroi_points = np.round(ctissue_poly/dsthumbnail).astype(np.int32)
+                        cv2.polylines(oimg, [iroi_points.reshape((-1,1,2))], True, (0,255,0), line_thickness)
 
                 # xxx - add another parameter?
                 ## export foreground by also applying roi polygon
@@ -1425,7 +1801,7 @@ for wafer_id in wafer_ids:
                 print(stitched_slice_fn)
                 big_img_init(stitched_slice_fn)
                 print('exiting')
-                print('Twas brillig, and the slithy toves') # for --check-msg not to report failure
+                report_job_completed()
                 sys.exit(0)
 
             img_shape, img_dtype = big_img_info(slice_image_fn)
@@ -1541,18 +1917,16 @@ for wafer_id in wafer_ids:
                 sel_grid_pts_flat = grid_pts_flat[:,sel_pts_flat].T
                 if not single_block:
                     if sel_grid_pts_flat.shape[0] < 2:
-                        print('\tSkipping, no overlap')
+                        print('\tSkipping, no block overlap')
                         continue
                     rng = sel_grid_pts_flat.max(0) - sel_grid_pts_flat.min(0)
-                    if (rng < blk_ovlp_pix).any():
-                        print('\tSkipping, segment range {} {} < overlap pix {} {}'.format(rng[0], rng[1],
-                            blk_ovlp_pix[0], blk_ovlp_pix[1]))
-                        continue
                     cgrid[i] -= blk_corner
                     sel = np.logical_and(cgrid[i] >= 0, cgrid[i] < np.array(blk_shape)[None,::-1]).all(1)
                     cgrid[i] = cgrid[i][sel,:]; deltas[i] = deltas[i][sel,:]
-                    if cgrid[i].shape[0] < 1:
-                        print('\tSkipping, no block overlap')
+                    # Need minimum number of points for interpolation.
+                    # Use the same value as used for the fine alignment grids.
+                    if cgrid[i].shape[0] < interp_inliers:
+                        print('\tSkipping, not enough grid overlap')
                         continue
                 print('Interpolating with griddata'); t = time.time()
                 vx[sel_pts_flat] = interp.griddata(cgrid[i], deltas[i][:,0], sel_grid_pts_flat,
@@ -1572,10 +1946,8 @@ for wafer_id in wafer_ids:
             # use the same method as in the wafer fine alignment transformation coordinate xform version.
             # get a bounding box on the transformed coords and use this to load from the original region image.
             vx = vx.reshape(blk_shape); vy = vy.reshape(blk_shape)
-            if blk_corner[0] != 0:
-                grid_pts[0,:,:] += (vx + blk_corner[0].astype(xdtype))
-            if blk_corner[1] != 0:
-                grid_pts[1,:,:] += (vy + blk_corner[1].astype(xdtype))
+            grid_pts[0,:,:] += (vx + blk_corner[0].astype(xdtype))
+            grid_pts[1,:,:] += (vy + blk_corner[1].astype(xdtype))
             del vx, vy
             grid_pts = grid_pts[::-1,:,:] # swap x/y for remap
 
@@ -1593,7 +1965,8 @@ for wafer_id in wafer_ids:
             # if the coordinates are all out of bounds, then just query for the datatype.
             # xxx - just setting a single pixel so that the _region_load_load_imgs code path
             #   that determines whether the background / tissue mask should be loaded or not is presevered.
-            if (coords_max <= 0).any() or (coords_min >= img_shape).any():
+            if (coords_max <= 0).any() or (coords_min >= img_shape).any() or \
+                    any([(x[1] - x[0]) == 0 for x in custom_rng]):
                 out_of_bounds = True
                 custom_rng = [[0,1], [0,1]]
             else:
@@ -1617,16 +1990,20 @@ for wafer_id in wafer_ids:
             big_img_save(stitched_slice_fn, img, img_shape, nblks=nblks, iblk=iblk, novlp_pix=blk_ovlp_pix,
                 dataset='background', compression=True, recreate=True, f1=f1, f2=f2)
             print('\tdone in %.4f s' % (time.time() - t, ))
-            print('Loading overlap, applying remap and saving'); t = time.time()
-            img, _ = big_img_load(slice_image_fn, custom_rng=custom_rng, dataset='overlap_count')
-            if not out_of_bounds:
-                img = nd.map_coordinates(img, grid_pts, order=1, mode='constant', cval=0.0, prefilter=False)
-            else:
-                img = np.zeros(blk_shape, dtype=img.dtype)
+            fh = h5py.File(slice_image_fn, 'r+')
+            has_overlap = ('overlap_count' in fh)
+            fh.close()
+            if has_overlap:
+                print('Loading overlap, applying remap and saving'); t = time.time()
+                img, _ = big_img_load(slice_image_fn, custom_rng=custom_rng, dataset='overlap_count')
+                if not out_of_bounds:
+                    img = nd.map_coordinates(img, grid_pts, order=1, mode='constant', cval=0.0, prefilter=False)
+                else:
+                    img = np.zeros(blk_shape, dtype=img.dtype)
+                big_img_save(stitched_slice_fn, img, img_shape, nblks=nblks, iblk=iblk, novlp_pix=blk_ovlp_pix,
+                    dataset='overlap_count', compression=True, recreate=True, f1=f1, f2=f2)
+                print('\tdone in %.4f s' % (time.time() - t, ))
             del grid_pts
-            big_img_save(stitched_slice_fn, img, img_shape, nblks=nblks, iblk=iblk, novlp_pix=blk_ovlp_pix,
-                dataset='overlap_count', compression=True, recreate=True, f1=f1, f2=f2)
-            print('\tdone in %.4f s' % (time.time() - t, ))
             if first_block:
                 histo_shape, histo_dtype = big_img_info(slice_image_fn, dataset='histogram')
                 # create the histogram dataset now, as it will be computed more than once after image transformations.
@@ -1636,6 +2013,56 @@ for wafer_id in wafer_ids:
                 for ds in [2,4,8,16,32,64]:
                     big_img_save(stitched_slice_fn, histo, histo.shape, dataset='histogram_'+str(ds), recreate=True)
             if lock: gpfs_file_unlock(f1,f2)
+        elif save_tile_masks:
+            print('Loading coords from and saving tile masks to:')
+            print(coords_fn)
+            cregion.load_stitched_region_image_coords(coords_fn, scale=to_native_scale, rmv_thb=native)
+
+            # xxx - just operate at the same resolution as the tissue masks,
+            #   could set dsstep again, driven from command line
+            bw, bw_ds, rel_ds = load_tissue_mask(slice_image_fn,
+                    cregion.tissue_mask_min_size, cregion.tissue_mask_min_hole_size)
+            assert( rel_ds == 1 )
+
+            cutoff = 0.2 # xxx - parameterize cutoff?
+            image_size = np.array(cregion.images[0].shape)[::-1]
+            ds_image_size = image_size // bw_ds
+            grid_y, grid_x = np.indices((ds_image_size[1], ds_image_size[0]))
+            coords = np.concatenate((grid_x.reshape(-1)[:,None], grid_y.reshape(-1)[:,None]), axis=1)
+            # (nmfovs,nimgs_per_mfov,ndims)
+            region_coords = ((cregion.region_coords - \
+                    cregion.region_coords.reshape((-1,2)).min(0)) / bw_ds).astype(np.int64)
+            tiles_tissue_mask = np.empty(cregion.region_coords.shape[:-1], dtype=bool)
+            for _mfov_id,cnt in zip(cregion.mfov_ids, range(cregion.nmfov_ids)):
+                for i in range(cregion.niTiles):
+                    ccoords = (coords + region_coords[cnt,i,:])[:,::-1]
+                    p_tm = bw[tuple(ccoords.T)].sum() / coords.shape[0]
+                    tiles_tissue_mask[cnt,i] = (p_tm > cutoff)
+            #print(region_coords.reshape(-1,2).shape[0], tiles_tissue_mask.sum())
+            #print(tiles_tissue_mask.sum() / region_coords.reshape(-1,2).shape[0])
+
+            cregion.load_stitched_region_image_coords(coords_fn, raw=True)
+            region_coords = np.concatenate((cregion.region_coords,
+                    tiles_tissue_mask[:,:,None].astype(cregion.region_coords.dtype)), axis=2)
+            cregion.create_region_coords_from_inner_rect_coords(region_coords)
+            zimages.write_image_coords(coords_fn, cregion.stitched_region_fns, cregion.stitched_region_coords)
+        elif upsample_masks:
+            print('Loading tissue mask and processing/upsampling from:')
+            print(slice_image_fn)
+            assert( single_block ) # xxx - umimplemented, did not see the need
+            img_shape, _ = big_img_info(slice_image_fn)
+            bw, bw_ds, rel_ds = load_tissue_mask_and_upsample(slice_image_fn, cregion.tissue_mask_min_size,
+                    cregion.tissue_mask_min_hole_size, tissue_mask_bwdist=cregion.tissue_mask_bwdist, dsstep=dsstep,
+                    img_shape=img_shape, verbose=True)
+            if rel_ds > 1: # do nothing if tissue mask was already upsampled
+                # save space by removing the overlap_count dataaset which is unnecessary for rough / fine alignment
+                fh = h5py.File(slice_image_fn, 'r+')
+                dataset = 'overlap_count'
+                if dataset in fh: del fh[dataset]
+                fh.close()
+                print('Saving back upsampled tissue mask')
+                big_img_save(slice_image_fn, bw, img_shape=bw.shape, dataset='tissue_mask',
+                    compression=True, recreate=True, overwrite_dataset=True, attrs={'ds':dsstep})
         # run-type if/elif
     #for region_ind in cregion_inds:
 
@@ -1760,7 +2187,4 @@ if brightness_balance_slices_whole:
         cum_nregions += nregions
 
 
-# do not delete this, is used at a minimum for addressing "timed-out" when running on the cluster (to be re-run).
-# can also grep to count how many jobs of a particular run have completed without fatal error.
-print('JOB FINISHED: run_regions.py')
-print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+report_job_completed()

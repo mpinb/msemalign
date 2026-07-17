@@ -1,8 +1,30 @@
 #!/usr/bin/env python3
 
-# take multiple solved orders created by run_wafer_solver.py and automatically "assimilate" them into
-#   a single coherent solved order. essentially the method uses a majority method based on neighbor edges,
-#   and runs this again through a TSP optimal solver.
+"""run_wafer_meta_solver.py
+
+Takes multiple solved orders created by run_wafer_solver.py and automatically
+  "assimilates" them into a single solved order. Done with a majority method
+  based on solved-order neighbor edges, and solving again with TSP solver.
+This process should not be required for most datasets.
+
+# Convert a downloaded webknossos tear annotation file into stored dills.
+#   and preprocess tear annotations into format required for the tear fixing.
+
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see <http://www.gnu.org/licenses/>.
+"""
+
 
 import numpy as np
 import scipy.sparse as sp
@@ -13,6 +35,8 @@ import argparse
 import os
 import sys
 import time
+
+from sslock import report_job_completed
 
 try:
     from def_common_params import get_paths, order_txt_fn_str, exclude_txt_fn_str, region_include_cnts
@@ -117,7 +141,7 @@ if len(meta_dills_merge) > 0:
     with open(meta_dill_fn, 'wb') as f: dill.dump(meta_dict, f)
     print('merged meta dills and saved to ' + meta_dill_fn)
     print('exiting')
-    print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+    report_job_completed()
     sys.exit(0)
 
 if plot_bad_matches:
@@ -237,4 +261,4 @@ for wafer_id, wafer_ind in zip(wafer_ids, range(nwafers)):
 
 #for wafer_id, wafer_ind in zip(wafer_ids, range(nwafers)):
 
-print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+report_job_completed()

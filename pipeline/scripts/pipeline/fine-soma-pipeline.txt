@@ -1,0 +1,59 @@
+#name       deps       swarm                                     part            nproc    ngpu time p  mroll maxr s
+ifine       ,          run_wafer-fine-init                       CPU/GPU/CPU-72c 12/12/18 0     0   0  0
+
+# IMPORTANT BEFORE CONTINUING: make sure you went over the possible swaps list after fine-i1.
+#   if you forget, then you have to start over with the rough alignment.
+
+# gpus jobs need to be packed in order to share gpus. cpu nodes also packed just for consistency.
+#   (hybrid packing / no packing is possible however with mroll, if needed for any reason).
+# IMPORTANT: test the packing FIRST by running a single example job on CPU/GPU and measure memory usage
+#   or request the amount of memory per core based on packing and make sure job is not OOM killed.
+# NOTE: going to full node packing is not always advised depending on ratio of block overlap to block
+#   and on how many cross correlations will be computed per block.
+# IMPORTANT: remember to change the number of workers when creating swarms, depending on the packing.
+#   this is now controlled by variable fnt in the bash workflow parameter file.
+# NOTE: the last line is the psplit mode that packs jobs into portions of nodes (split packing).
+#   When lots of users are running single gpu jobs (on 4 gpu nodes for example) these schedule more efficiently,
+#   and in the case of soma faster (was not fully proven to the admins that it's a scheduling issue).
+#   It also makes it easier for slurm to keep up in the case of lots of shorter running jobs.
+# IMPORTANT: if split packing is used set split_gpu_packing=1 in the pipeline script and split_gpu_packing=0 if not
+#fine        ifine      run_wafer-fine-all-gpuind                 CPU/GPU/CPU-72c 24/48/32 0/4/0 4   1  1728  0   4
+fine        ifine      run_wafer-fine-all-gpuind                 CPU/GPU/CPU-72c 48/48/72 0/4/0 4   1  1728  0   4
+
+ioutliers   fine       run_wafer_aggregator-fine-outliers-init   CPU/GPU/CPU-72c 12/12/18 0     1   0     0
+outliers    ioutliers  run_wafer_aggregator-fine-outliers        CPU/GPU/CPU-72c 12/12/18 0     6   0  1750
+# NOTE: if you change nsections_per_proc for interp, do it after outliers
+#   the merge step now has it's own variable for number of processes, ${npom}
+moutliers   outliers   run_wafer_aggregator-fine-outliers-merge  CPU/GPU/CPU-72c 24/24/36 0     2   0     0
+interp      moutliers  run_wafer_aggregator-fine-interp          CPU/GPU/CPU-72c 24/24/36 0     4   0  1750
+# for ultrafine
+#interp      moutliers  run_wafer_aggregator-fine-interp          CPU/GPU/CPU-72c 12/12/18 0     6   0  1750
+
+# optionally use deltas to re-iterate on the rough alignment (with global affines)
+# NOTE: need to change affine_rigid_type in def_common_params before running fine_to_rough
+# IMPORTANT: xxx - rough alignment iter 2 and fine alignment iter 1 process is not well automated.
+#   basically run up to this point, change defs, run this step, change defs, run rough, change defs,
+#     re-generate fine swarms and then continue at filter.
+#fine_rough  interp     run_wafer_aggregator-fine-to-rough        CPU/GPU/CPU-72c 12/24/16 0     1   0     0
+# currently this step is unused, as process splitting of fine-to-rough was so far unnecessary
+##mfine_rough interp     run_wafer_aggregator-fine-to-rough-merge  CPU/GPU/CPU-72c 1/1/1    0     1   0     0
+
+filter      interp     run_wafer_aggregator-fine-filter          CPU/GPU/CPU-72c 24/24/36 0     4   0     0
+ireslice    filter     run_wafer_aggregator-fine-reslice-init    CPU/GPU/CPU-72c 24/24/36 0     1   0     0
+reslice     ireslice   run_wafer_aggregator-fine-reslice         CPU/GPU/CPU-72c 1/1/1    0     4   0     0
+# for ultrafine
+#reslice     ireslice   run_wafer_aggregator-fine-reslice         CPU/GPU/CPU-72c 8/16/10  0     4   0     0
+recon       reslice    run_wafer_aggregator-fine-reconcile       CPU/GPU/CPU-72c 1/1/1    0     8   0     0
+mrecon      recon      run_wafer_aggregator-fine-reconcile_merge CPU/GPU/CPU-72c 1/1/1    0     4   0     0
+iexport     mrecon     run_wafer-fine_export_init                CPU/GPU/CPU-72c 48/48/72 0     1   0  1750  875
+export      iexport    run_wafer-fine_export                     CPU/GPU/CPU-72c 48/48/72 0     2   1  1728  0  8/8/12
+# xxx - basically not exporting tiffs anymore, just cube the export to wkw instead
+#dstiffs     export     run_wafer-fine_export_tiffs               CPU/GPU/CPU-72c 48/48/72 0     1   0  1750  1225
+
+# to export the masks
+# NOTES: re-save and re-upsample the masks (regions) without any mask processing.
+#   Export at a higher downsampling, suggest ds16, then run run_tiff_downsample_z.py to majority vote in size 8 z-bins.
+#   Cube these tiffs and then link it, so that 16-16-8 in ufine masks layer links to mag 1 of the cubed tiffs.
+#imexport    export     run_wafer-fine_iexport_masks              CPU/GPU/CPU-72c 48/48/72 0     1   0  1750  875
+#mexport     imexport   run_wafer-fine_export_masks               CPU/GPU/CPU-72c 48/48/72 0     2   1  1728  0  8/8/12
+#mdstiffs    mexport    run_wafer-fine_export_masks_tiffs         CPU/GPU/CPU-72c 12/24/18 0     1   0  1750  1225

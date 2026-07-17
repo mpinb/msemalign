@@ -3,7 +3,7 @@
 Base class for the msemalign package. Implements much of the mSEM tile
   and acquisition parameter file loading and also tile montaging.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -44,7 +44,8 @@ from sklearn import preprocessing
 from sklearn.linear_model import LogisticRegression #, LinearRegression
 from scipy.special import expit
 
-from .utils import get_num_threads, get_gpu_index, get_fft_types, get_fft_backend, get_cache_dir, get_block_reduce_func
+from .utils import get_num_threads, get_gpu_index, get_fft_types, get_fft_backend, get_cache_dir
+from .utils import get_block_reduce_func, get_registration_mode
 from .utils import get_delta_interp_method, tile_nblks_to_ranges
 
 import logging
@@ -98,9 +99,15 @@ class zimages(object):
     # which method to use for interpolating / extrapolating deformation deltas
     delta_interp_method = get_delta_interp_method()
 
+    # kludgy method to register two different alignments instead of aligning a stack
+    run_registration = get_registration_mode()
+
     # this is the timeout for multiprocessing queues before checking for dead workers.
     # did not see a strong need for this to be drive from command line.
     queue_timeout = 180 # in seconds
+
+    # used for filling in image tiles in emtpy mfovs (for discontiguous tissue section aquisition)
+    blank_image = [None]
 
     def __init__(self, verbose=False):
         self.zimages_verbose = verbose
@@ -325,18 +332,27 @@ class zimages(object):
             d = image_load
             if isinstance(cur, str) and len(image_load) > 0:
                 fn = os.path.join(d['folder'], cur)
-                if cache_dn:
-                    bfn = os.path.basename(fn)
-                    fnload = os.path.join(cache_dn, uuid.uuid4().hex + '_' + bfn)
-                    shutil.copyfile(fn, fnload)
+                if os.path.isfile(fn):
+                    if cache_dn:
+                        bfn = os.path.basename(fn)
+                        fnload = os.path.join(cache_dn, uuid.uuid4().hex + '_' + bfn)
+                        shutil.copyfile(fn, fnload)
+                    else:
+                        fnload = fn
+                    #_pil = Image.open(fnload); _img = np.asanyarray(_pil); _pil.close()
+                    _img = imageio.imread(fnload)
+                    if cache_dn: os.remove(fnload)
+                    _exists = True
                 else:
-                    fnload = fn
-                #_pil = Image.open(fnload); _img = np.asanyarray(_pil); _pil.close()
-                _img = imageio.imread(fnload)
-                if cache_dn: os.remove(fnload)
+                    _img = zimages.blank_image[0]
+                    assert( _img is not None ) # empty mfov dataset? set allow_empty_mfovs==True
+                    _exists = False
 
                 tl = d['crop']; br = np.array(_img.shape) - d['crop']
                 if d['crop'] is not None: _img = _img[tl[0]:br[0], tl[1]:br[1]]
+
+                if d['median_filter'] is not None:
+                    _img = nd.median_filter(_img, size=d['median_filter'])
 
                 # max delta is computed in the downsampled space, since this is the size in which
                 #   the images are processed (this load is at the loweest level). so, scale up the
@@ -364,16 +380,23 @@ class zimages(object):
                     _imgmax = np.iinfo(_img.dtype).max
                     _img = np.clip(np.round(_img / d['scale_adjust']), 0, _imgmax).astype(_img.dtype)
 
-                return _img
-            else:
-                return cur
+                # make sure image is still zeros after post-load processing
+                if not _exists: _img.fill(0)
+
+                return _img, _exists
+            else: # if isinstance(cur, str) and len(image_load) > 0:
+                # xxx - could have _exists depend on whether the image is all zeros or not
+                #   when sections are montaged in emalign, it's called using the filenames,
+                #   so there is not currently a use case.
+                _exists = True
+                return cur, _exists
 
         # get the datatype and shape of the images depending on what parameters were passed
         if img_dtype is None:
             # all images must be same datatype
             if isinstance(images[fnz], str):
                 # load the first image to get datatype
-                first_img = load_image(images[fnz], fnz)
+                first_img, _ = load_image(images[fnz], fnz)
                 img_dtype = first_img.dtype
             else:
                 img_dtype = images[fnz].dtype
@@ -384,7 +407,7 @@ class zimages(object):
         if img_shape is None:
             if isinstance(images[fnz], str):
                 # for this case all the images must be the same shape
-                if first_img is None: first_img = load_image(images[fnz], fnz)
+                if first_img is None: first_img, _ = load_image(images[fnz], fnz)
                 img_shape = first_img.shape
                 img_shapes = np.tile(np.array(img_shape)[None,:], (nimgs,1))
             else:
@@ -483,7 +506,7 @@ class zimages(object):
             cimax = csz.copy(); cimax[sel] = (cimax - (imax - cmax))[sel]
             imax = imax - cmin; imax[sel] = sz_out[sel]
 
-            img = load_image(images[i], i)
+            img, image_exists = load_image(images[i], i)
             assert( (img_shapes[i,:] == np.array(img.shape)).all() ) # an image shape did not match
 
             if img_decay_params is not None:
@@ -562,7 +585,8 @@ class zimages(object):
                     #histos[i,:], bins = np.histogram(img, bins)
                     histos[i,:] = np.bincount(np.ravel(img), minlength=imgmax+1)
             elif get_overlap_sum_only:
-                image[c[0]:c[0]+s[0],c[1]:c[1]+s[1]] += 1
+                if image_exists:
+                    image[c[0]:c[0]+s[0],c[1]:c[1]+s[1]] += 1
             else:
 
                 if color_coords is None:
@@ -575,12 +599,18 @@ class zimages(object):
                         image_crp = image[c[0]:c[0]+s[0],c[1]:c[1]+s[1]]
                         overlap_sum_crp = overlap_sum[c[0]:c[0]+s[0],c[1]:c[1]+s[1]]
                         feather_sum_crp = feather_sum[c[0]:c[0]+s[0],c[1]:c[1]+s[1]]
-                        assert( (overlap_sum_crp == 0).sum() == 0 )
+
+                        # with empty mfovs, this can happen. just rectify at zero.
+                        #assert( (overlap_sum_crp == 0).sum() == 0 )
+                        overlap_sum_crp_minus_one = overlap_sum_crp.copy()
+                        overlap_sum_crp_minus_one[overlap_sum_crp == 0] = 1
+                        overlap_sum_crp_minus_one -= 1
 
                         # count down the overlap sum so that only the last image is used in the overlap regions.
                         # xxx - parameter for first or last? currently this order is set in mfov and region,
                         #   so that the tiles that were imaged first are on top.
-                        overlap_sum[c[0]:c[0]+s[0],c[1]:c[1]+s[1]] = overlap_sum_crp - 1
+                        #overlap_sum[c[0]:c[0]+s[0],c[1]:c[1]+s[1]] = overlap_sum_crp - 1
+                        overlap_sum[c[0]:c[0]+s[0],c[1]:c[1]+s[1]] = overlap_sum_crp_minus_one
 
                         # get the overlapping and non-overlapping selects
                         novlp = (overlap_sum_crp < feathering_min_ovlp_cnt); ovlp = np.logical_not(novlp)
@@ -622,11 +652,9 @@ class zimages(object):
 
     # load_subset, map_subset and images used for loading subset of images, typically for neighboring mfov
     @staticmethod
-    def read_images(folder, filenames, crop=None, dsstep=1, reduce=zimages_blkrdc_func, load_subset=None,
-                    map_subset=None, images=None, invert=False, init_only=False, cache_dn=''):
+    def read_images(folder, filenames, crop=None, dsstep=1, blkrdc_func=zimages_blkrdc_func, load_subset=None,
+                    map_subset=None, images=None, median_filter=None, invert=False, init_only=False, cache_dn=''):
         assert((load_subset is None and map_subset is None) or (load_subset.size == map_subset.size))
-
-        #logger.debug('read_images: filenames: %s', filenames)
 
         if load_subset is None:
             nimgs = len(filenames)
@@ -637,13 +665,14 @@ class zimages(object):
 
         # return the images in their zeiss mfov tile ordering, or a specified ordering
         if images is None: images = [None]*nimgs
+        flat_image_value = None
+        flat_mfov = (not init_only)
+        imgs_cnt = 0
         for i in irng:
             cfn = os.path.splitext(os.path.basename(filenames[i].replace("\\","/")))[0]
 
             if load_subset is None:
-                #ind = imgno-1
                 ind = i
-                assert(ind == i) # filenames expected to be ordered by image number
             else:
                 # NOTE: this is dangerous here, as it depends specifically on the formatting of the Zeiss image
                 #   filenames. I guess for a general way for this to work, the images need to be parsed along with
@@ -655,25 +684,44 @@ class zimages(object):
                 if ind.size == 0: continue
                 assert(ind.size == 1)
                 ind = map_subset[ind[0]]
-            if i==irng[0]: first_ind = ind
+            # if i==irng[0]: first_ind = ind
 
             if init_only and (i != irng[0]):
                 # put a blank image the same size/dtype as the first image as a placeholder
-                _img = np.empty(images[first_ind].shape, dtype=images[first_ind].dtype)
+                # _img = np.empty(images[first_ind].shape, dtype=images[first_ind].dtype)
+                _img = zimages.blank_image[0]
+                assert( _img is not None ) # empty mfov dataset? set allow_empty_mfovs==True
+                imgs_cnt += 1
             else:
                 fn = os.path.join(folder,filenames[i])
-                if cache_dn:
-                    bfn = os.path.basename(fn)
-                    fnload = os.path.join(cache_dn, uuid.uuid4().hex + '_' + bfn)
-                    shutil.copyfile(fn, fnload)
+                if os.path.isfile(fn):
+                    if cache_dn:
+                        bfn = os.path.basename(fn)
+                        fnload = os.path.join(cache_dn, uuid.uuid4().hex + '_' + bfn)
+                        shutil.copyfile(fn, fnload)
+                    else:
+                        fnload = fn
+                    #_pil = Image.open(fnload; _img = np.asanyarray(_pil); _pil.close()
+                    _img = imageio.imread(fnload)
+                    if cache_dn: os.remove(fnload)
+                    image_exists = True
+                    imgs_cnt += 1
                 else:
-                    fnload = fn
-                #_pil = Image.open(fnload; _img = np.asanyarray(_pil); _pil.close()
-                _img = imageio.imread(fnload)
-                if cache_dn: os.remove(fnload)
+                    _img = zimages.blank_image[0]
+                    assert( _img is not None ) # empty mfov dataset? set allow_empty_mfovs==True
+                    image_exists = False
+
+                if flat_image_value is None: flat_image_value = _img.flat[0]
+                flat_mfov = (flat_mfov and (_img == flat_image_value).all())
+
+                if init_only and zimages.blank_image[0] is None and (i == irng[0]):
+                    zimages.blank_image[0] = np.zeros(_img.shape, dtype=_img.dtype)
 
                 tl = crop; br = np.array(_img.shape) - crop
                 if crop is not None: _img = _img[tl[0]:br[0], tl[1]:br[1]]
+
+                if median_filter is not None:
+                    _img = nd.median_filter(_img, size=median_filter)
 
                 if invert:
                     _img = np.iinfo(_img.dtype).max - _img
@@ -681,24 +729,53 @@ class zimages(object):
                 if dsstep > 1:
                     pad = (dsstep - np.array(_img.shape) % dsstep) % dsstep
                     _img = measure.block_reduce(np.pad(_img, ((0,pad[0]), (0,pad[1])), mode='reflect'),
-                            block_size=(dsstep, dsstep), func=reduce).astype(_img.dtype)
+                            block_size=(dsstep, dsstep), func=blkrdc_func).astype(_img.dtype)
+
+                # make sure image is still zeros after post-load processing
+                if not image_exists: _img.fill(0)
+            # else - if init_only and (i != irng[0]):
 
             images[ind] = _img
+        #for i in irng:
 
-        return images
+        if load_subset is None and imgs_cnt > 0 and imgs_cnt != nimgs:
+            print(os.path.join(folder,filenames[0]))
+            print(f'associated mfov is missing some but not all image tiles, {imgs_cnt=}')
+            assert(False) # non-empty mfov missing tiles
+
+        if flat_mfov:
+            # count any mfovs that contain only a single grayscale value as empty mfovs.
+            # set all the images to zeros, instead of whatever the flat grayscale value was.
+            for i in range(nimgs):
+                if images[i] is not None: images[i].fill(0)
+            is_empty_mfov = True
+            #print(f'{flat_image_value=}')
+            # xxx - gah, of course this ends up happening in the raw data, add another flag?
+            #is_empty_mfov = False
+        else:
+            # mfovs with no images stored on disk are empty mfovs.
+            is_empty_mfov = (imgs_cnt == 0)
+
+        return images, is_empty_mfov
 
     @staticmethod
     def read_images_neighbors(folder, all_filenames_imgs, all_coords_imgs, total_nimgs, mfov_nimgs, mfov, neighbors,
                               neighbors_edge, to_neighbor_tiles, from_neighbor_tiles, init_only=False,
-                              crop=None, dsstep=1, reduce=zimages_blkrdc_func, invert=False, cache_dn=''):
+                              crop=None, dsstep=1, blkrdc_func=zimages_blkrdc_func, median_filter=None, invert=False,
+                              cache_dn='', all_tile_masks=None):
         # first process the mfov being loaded
         coords_imgs = np.zeros((total_nimgs,2), dtype=all_coords_imgs.dtype)
         coords_imgs[:mfov_nimgs,:]  = all_coords_imgs[mfov,:,:]
+        if all_tile_masks is not None:
+            tile_masks_imgs = np.zeros((total_nimgs,), dtype=all_tile_masks.dtype)
+            tile_masks_imgs[:mfov_nimgs] = all_tile_masks[mfov,:]
+        else:
+            tile_masks_imgs = None
         filenames_imgs = [None]*total_nimgs
         filenames_imgs[:mfov_nimgs] = all_filenames_imgs[mfov]
         images = [None]*total_nimgs
-        images[:mfov_nimgs] = zimages.read_images(folder, all_filenames_imgs[mfov], crop, dsstep, reduce,
-                invert=invert, init_only=init_only)
+        images[:mfov_nimgs], is_empty_mfov = zimages.read_images(folder, all_filenames_imgs[mfov], crop, dsstep,
+                blkrdc_func, median_filter=median_filter, invert=invert, init_only=init_only)
         # which mfov id that each image was loaded from
         mfov_ids = np.zeros((total_nimgs,), dtype=np.int64)
         mfov_ids[:mfov_nimgs] = mfov
@@ -714,14 +791,16 @@ class zimages(object):
                 for j,k in zip(ctiles,cntiles):
                     filenames_imgs[j] = all_filenames_imgs[n][k]
                 coords_imgs[ctiles,:] = all_coords_imgs[n][cntiles,:]
+                if all_tile_masks is not None:
+                    tile_masks_imgs[ctiles] = all_tile_masks[n][cntiles]
                 # keep track of mfov and mfov tile number for each image tile.
                 mfov_ids[ctiles] = n; mfov_tile_ids[ctiles] = cntiles
 
-                zimages.read_images(folder, filenames_imgs, crop=crop, dsstep=dsstep, reduce=reduce,
+                zimages.read_images(folder, filenames_imgs, crop=crop, dsstep=dsstep, blkrdc_func=blkrdc_func,
                     init_only=init_only, load_subset=cntiles, map_subset=ctiles, images=images, invert=invert,
-                    cache_dn=cache_dn)
+                    median_filter=median_filter, cache_dn=cache_dn)
 
-        return images, filenames_imgs, coords_imgs, mfov_ids, mfov_tile_ids
+        return images, filenames_imgs, coords_imgs, mfov_ids, mfov_tile_ids, is_empty_mfov, tile_masks_imgs
 
     # xxx - maybe delete? only the old code path that allowed reading of an individual mfov coordinates
     #   was using this anymore. commented this for now, also delete that spot if we abondon this entirely.
@@ -878,8 +957,10 @@ class zimages(object):
         return pts
 
     @staticmethod
-    def load_slice_balance_file(fn, region_slcstr=None):
+    def load_slice_balance_file(fn, region_slcstr=None, return_region_strs=False):
         adj = np.zeros((0,), dtype=np.double) if region_slcstr is None else 0.
+        if return_region_strs:
+            region_strs = [] if region_slcstr is None else ''
         if os.path.isfile(fn):
             with open(fn, 'r') as f:
                 for line in f:
@@ -889,9 +970,10 @@ class zimages(object):
                         if len(tmp) > 1:
                             if region_slcstr is None:
                                 adj = np.concatenate((adj, [float(line[1])]))
+                                region_strs.append(line[0])
                             elif tmp[-1] == region_slcstr:
-                                adj = float(line[1]); break
-        return adj
+                                adj = float(line[1]); region_strs = line[0]; break
+        return (adj, region_strs) if return_region_strs else adj
 
     @classmethod
     def zimages_args(cls, args):

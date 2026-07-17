@@ -1,0 +1,36 @@
+#name       deps             swarm                               part            nproc    ngpu  time pack    mroll maxr
+# 2D alignment iteration 2, IMPORTANT: run masks and tmasks steps in region workflow first
+# xxx - gpus are almost full with 3 processes each (12 per node), would need to memory profile to do better.
+align1      ,                run_regions-align-pass1-gpuind      CPU/GPU/CPU-72c 24/12/36 0/4/0 8       1    432
+align2      align1           run_regions-align                   CPU/GPU/CPU-72c 48/48/72 0     6       0    1750  1225
+# xxx - currently for very large sections the linear systems solver is memory limited
+#align2      align1           run_regions-align                   CPU/GPU/CPU-72c 2/4/2    0     6       0    1750  1225
+bal-mfov1   ,                run_regions-balance-mean-mfov       CPU/GPU/CPU-72c 48/48/72 0     4       0    1750  1225
+bal-mfov2   bal-mfov1        run_regions-balance-mean-mfov-pass2 CPU/GPU/CPU-72c 24/48/36 0     4       0    1750  1225
+# xxx - tempting to further optimize the packing here, but you will encounter OOM for some datasets / sections
+#   likely culprit is the linear systems solver for the balancing
+balance     bal-mfov2,align2 run_regions-balance                 CPU/GPU/CPU-72c 4/8/6    0     4       0    1750
+iexport     balance          run_regions-export-init             CPU/GPU/CPU-72c 48/48/72 0     1       0    1750  875
+# 2D alignment iteration 2 (and comment out balancing steps)
+#iexport     align2           run_regions-export-init             CPU/GPU/CPU-72c 48/48/72 0     1       0    1750  875
+#name       deps      swarm                                  part             nproc     ngpu time pack mroll maxrun  s
+export      iexport    run_regions-export                    CPU/GPU/CPU-72c  48/48/72  0     2   1    1728  0    4/4/6
+
+# Decide on using brightness balancing on a dataset-by-dataset basis. For some datasets where they
+#   are not well matched, it can help.
+# Current workflow is that if it is applied at all, it's done before creating the masks and
+#   using all pairwise comparisons (without solved order).
+# 2D alignment iteration 1, if utilized calculate the section brightness adjusts
+#histos16    export    run_regions-histos-ds16                CPU/GPU/CPU-72c  8/16/12   0     2   0    1750  875
+#sbalance    histos16  run_regions-slice-balance              CPU/GPU/CPU-72c  1/1/1     0     4   0    0
+#ibright     sbalance  run_regions-brightness-init            CPU/GPU/CPU-72c  48/48/72  0     1   0    1750  875
+# 2D alignment iteration 2, do NOT recalculate.
+# Instead use the same brightness adjusts that were calculated and applied for the -i1 mask generation.
+#ibright     export    run_regions-brightness-init            CPU/GPU/CPU-72c  48/48/72  0     1   0    1750  875
+# For either workflow apply the brightness adjusts after the init
+#bright      ibright   run_regions-slice-brightness-adjust    CPU/GPU/CPU-72c  4/8/6     0     2   0    1750
+
+# xxx - currently no blocking support for conversion to tiff, so entire section has to load into memory
+# need this step for the tissue mask generation
+#exporttif   bright           run_regions-convert-h5-to-tiff       CPU/GPU/CPU-72c 6/12/8   0     1       0   1750  1225
+exporttif   export           run_regions-convert-h5-to-tiff       CPU/GPU/CPU-72c 6/12/8   0     1       0   1750  1225

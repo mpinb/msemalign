@@ -4,7 +4,7 @@
 Top level command-line interface for generating plots related to the
   aggregation, i.e., applying the LSS to rough / fine alignments.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -68,6 +68,8 @@ parser.add_argument('--run-type', nargs=1, type=str, default=['rough'],
                     choices=['deltas', 'rough', 'fine_outliers', 'fine_xcorrs'], help='the type of plots to generate')
 parser.add_argument('--run-str', nargs=1, type=str, default=['none'],
                     help='string to differentiate alignments with different parameters')
+parser.add_argument('--run-str-deltas', nargs=1, type=str, default=['none'],
+                    help='string to differentiate alignments with different parameters')
 parser.add_argument('--show-plots', dest='save_plots', action='store_false',
                     help='display plots instead of saving as png')
 parser.add_argument('--mean-wafer-id', nargs=1, type=int, default=[0],
@@ -118,6 +120,9 @@ fine_xcorrs_tsp = args['fine_xcorrs_tsp']
 
 # this is an identifier so that multiple rough/fine alignemnts can be exported / loaded easily.
 run_str = args['run_str'][0]
+
+# this is an identifier so that multiple rough/fine alignemnts can be exported / loaded easily (deltas).
+run_str_deltas = args['run_str_deltas'][0]
 
 # run type string is used for some filenames / paths
 run_type = args['run_type'][0]
@@ -345,6 +350,7 @@ if rough_plot:
     cum_translations = np.zeros((ntotal,2), dtype=np.double)
     cum_scales = np.ones((ntotal,2), dtype=np.double)
     cum_shears = np.zeros((ntotal,2), dtype=np.double)
+    rigid_affine = True
     for i in range(ntotal):
         aff = load_dict['cum_affines'][i]
         if aff is None: continue
@@ -352,7 +358,7 @@ if rough_plot:
         # decompose affine in the order of rotation, scale, shear
         u,p = lin.polar(aff[:2,:2])
         # check if affine is a rigid body affine (rot and trans only)
-        rigid_affine = np.allclose(p,np.eye(2))
+        rigid_affine = (rigid_affine and np.allclose(p,np.eye(2)))
         if rigid_affine:
             cum_angles[i] = np.arctan2(aff[1,0], aff[0,0])
         else:
@@ -405,7 +411,8 @@ if grid_plots:
 if not save_plots: plt.show()
 
 # xxx - move filenames to def_common_params?
-fine_reslice_fn = 'fine_reslice.h5'
+# fine_reslice_fn = 'fine_reslice.h5'
+fine_reslice_fn = 'fine_reslice.' + run_str_deltas + '.h5'
 fine_reslice_fn = os.path.join(meta_folder, fine_reslice_fn)
 
 if any_fine:
@@ -502,16 +509,22 @@ if deltas_plot:
     make_param_plot(load_dict, delta_stat_ctr, ylabel='deltas mean mag', dimstrs=['mag'], figno=8)
     if save_plots: plt.gcf().savefig(os.path.join(outdir,'deltas_ctr_ordered.png'))
 
+    #step = 1; bins = np.arange(0,10000,step); cbins = bins[:-1] + step/2
     step = 1/16; bins = np.arange(0,1000,step); cbins = bins[:-1] + step/2
-    hist,bins = np.histogram(np.sqrt((load_dict['cum_deltas']**2).sum(2)), bins)
+    cd = load_dict['cum_deltas']
+    sel = np.logical_not(np.isclose(cd.reshape((load_dict['cum_wafers_nimgs'][-1], -1)), 0)).any(1)
+    hist,bins = np.histogram(np.sqrt((cd[sel,:]**2).sum(2)), bins)
+    print('max delta mag in pixels {}'.format(np.sqrt((cd**2).sum(2).max())))
     plt.figure(9876)
     plt.plot(cbins/meta_dict['scale_um_to_pix'], hist/hist.sum())
+    plt.xlabel('delta magnitude (um)')
+    plt.ylabel('normalized count (pdf)')
     #plt.plot(cbins, np.log10(hist/hist.sum()))
     #plt.plot(cbins, np.log10(np.cumsum(hist)/hist.sum()))
     # for generating histogram of all deltas.
     # dump a dill file to be used to generate plots.
     dill_fn = 'cum_deltas_histos-ufine.dill'
-    d = {'hist':hist, 'cbins':cbins, 'deltas_shape':load_dict['cum_deltas'].shape}
+    d = {'hist':hist, 'cbins':cbins, 'deltas_shape':cd.shape}
     with open(dill_fn, 'wb') as f: dill.dump(d, f)
 
     if not save_plots: plt.show()
@@ -639,7 +652,7 @@ if fine_outliers_plot:
     if not save_plots: plt.show()
 
 if fine_xcorrs_plot:
-    print_excel = False
+    print_excel = True
 
     if use_reslice:
         print('WARNING: currently only a single process fine reslice supported')
@@ -793,13 +806,14 @@ if fine_xcorrs_plot:
             for x in global_tour[xcorr_tsp_positives]: print(x)
 
         cutoff = 5
-        print('Locations that agree within {} in z'.format(cutoff))
-        xcorr_nn = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(xcorr_nbr_positives.reshape(-1,1))
-        xcdist, xcinds = xcorr_nn.kneighbors(xcorr_tsp_positives.reshape(-1,1), return_distance=True)
-        xcinds = np.unique(xcinds[xcdist <= cutoff])
-        print(xcorr_nbr_positives[xcinds])
-        #print('Indices (for copying to excel):')
-        #for x in xcorr_nbr_positives[xcinds]: print(x)
+        if xcorr_tsp_positives.size > 0:
+            print('Locations that agree within {} in z'.format(cutoff))
+            xcorr_nn = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(xcorr_nbr_positives.reshape(-1,1))
+            xcdist, xcinds = xcorr_nn.kneighbors(xcorr_tsp_positives.reshape(-1,1), return_distance=True)
+            xcinds = np.unique(xcinds[xcdist <= cutoff])
+            print(xcorr_nbr_positives[xcinds])
+            #print('Indices (for copying to excel):')
+            #for x in xcorr_nbr_positives[xcinds]: print(x)
 
         plt.figure(13)
         plt.plot(global_tour)

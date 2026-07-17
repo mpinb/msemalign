@@ -2,14 +2,25 @@
 import os
 os.system('date')
 
-# script to convert a downloaded webknossos tear annotation file into stored dills
-#   that are easily loadable in the msem package without the pain of dealing with
-#   the webknossos dependency conflicts.
+"""run_tear_convert.py
 
-# script additionally does all the preprocessing required for the tear fixing,
-#   up to the point of the actual image manipulation (done by run_regions).
-# added option to do the actual image manipulation on downsampled images, i.e.,
-#   image at the same resolution that the tear was annotated in (usually 256 nm).
+Convert a downloaded webknossos tear annotation file into stored dills.
+  and preprocess tear annotations into format required for the tear fixing.
+
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see <http://www.gnu.org/licenses/>.
+"""
 
 import numpy as np
 
@@ -22,6 +33,7 @@ from sklearn.neighbors import NearestNeighbors
 # did not install sklearnex in wkw setup
 #from sklearnex.neighbors import NearestNeighbors
 import skfmm
+from skimage.morphology import skeletonize #, medial_axis
 
 import hdf5plugin
 hdf5plugin.FILTERS # avoid linter warning
@@ -36,10 +48,13 @@ import argparse
 import os
 import time
 import shutil
+import traceback
 
 import tifffile
 from matplotlib import pyplot as plt
 os.system('date')
+
+from sslock import report_job_completed
 
 # all parameters loaded from an experiment-specific import.
 # NOTE: def_common_params should load without any other msem dependencies, so only need it in the PYTHONPATH,
@@ -64,8 +79,8 @@ parser.add_argument('--run-type', nargs=1, type=str, default=['process'],
     help='the type of run to choose')
 parser.add_argument('--fit-ends-dist-um', nargs=1, type=float, default=[64.],
     help='Distance to fit at end of skeletons to project to edge of image')
-parser.add_argument('--interpolation-sampling-um', nargs=1, type=float, default=[10.24],
-    help='Distance to fit at end of skeletons to project to edge of image')
+parser.add_argument('--interpolation-sampling-um', nargs=1, type=float, default=[5.12],
+    help='How densely to add control points along fitted tear')
 parser.add_argument('--nml-file', nargs=1, type=str, default=[''],
     help='specify the nml file containing the control points')
 parser.add_argument('--nml-file-out', nargs=1, type=str, default=[''],
@@ -78,6 +93,8 @@ parser.add_argument('--print-only', dest='print_only', action='store_true',
     help='just show the list of torn slices and unordered / ordered zinds')
 parser.add_argument('--doplots', dest='doplots', action='store_true',
     help='show (debug) plots')
+parser.add_argument('--no-hard-fail', dest='hard_fail', action='store_false',
+    help='gracefully continue if an error occurs with one section')
 args = parser.parse_args()
 args = vars(args)
 
@@ -117,6 +134,9 @@ print_only = args['print_only']
 
 # option to override tear_annotation_ds
 use_ds = args['tear_annotation_ds'][0] if args['tear_annotation_ds'][0] > 0 else tear_annotation_ds
+
+# whether to stop or not if an error is encountered
+hard_fail = args['hard_fail']
 
 # these specify what type of run this is (one of these must be set True)
 run_type = args['run_type'][0]
@@ -307,7 +327,7 @@ def interpolate_path(points, sampling=0.5):
     if distance.ndim > 1:
         distance = distance.reshape(points.shape[0], -1).max(1)
 
-    alpha = np.linspace(0, 1, np.ceil(max_distance.max() / sampling).astype(np.int64))
+    alpha = np.linspace(0, 1, np.ceil(np.ceil(max_distance.max()) / sampling).astype(np.int64))
     #interpolations_methods = ['slinear', 'quadratic', 'cubic']
     interpolator =  interp.interp1d(distance, points, kind='cubic', axis=0)
     return interpolator(alpha)
@@ -368,6 +388,9 @@ def path_to_skel(path_points):
     tmp = np.round(path_points).astype(np.int64)
     bwskel = np.zeros(img_shape_ds, dtype=bool)
     bwskel[tmp[:,1], tmp[:,0]] = 1
+    # annoyingly this is necessary to ensure full FG connectivity of skeleton,
+    #   which is assumed by lineEnds method for getting the endpoints.
+    bwskel = skeletonize(bwskel)
     # SO - 56131466/detecting-start-and-end-point-of-line-in-image-numpy-array
     endpts_bw = nd.generic_filter(bwskel, lineEnds, (3,3))
     endpts_lbls, nendpts, endpts = get_pts_labels(endpts_bw)
@@ -478,6 +501,16 @@ def tear_skeleton_to_segments(bwskel, endpts, endpts_lbls, figbase=0):
                 print(np.transpose(np.nonzero(tear_segments==i+1))[0,:])
             plt.show() # for debug
     assert( ntear_segments==2 ) # boundary is messed up, common error, keep this after plot for debug
+
+    # xxx - useful debug in case either of the below asserts fail,
+    #   i.e., if nodes are on boundary or both on same side of tear boundary.
+    #tmp = tear_segments.copy(); tmp[boundary.astype(bool)] = 0 #; tmp[bw] = 3
+    #plt.figure(1240); plt.gcf().clf(); plt.title('tear segments points'); plt.imshow(tmp)
+    #for i in range(nskels):
+    #    inode = np.round(cnodes[i,:,:]).astype(np.int64)
+    #    plt.scatter(inode[:,0], inode[:,1], c='r', s=36, marker='x')
+    #    plt.plot(inode[:,0], inode[:,1], c='g', linewidth=2)
+    #plt.show()
 
     print('Get intersection between control point segments and boundary'); t = time.time()
     boundary_pts = np.transpose(np.nonzero(boundary))[:,::-1]
@@ -666,8 +699,12 @@ for wafer_id, wafer_ind in zip(all_wafer_ids, range(total_nwafers)):
 
             clf = [linear_model.LinearRegression(fit_intercept=True) for x in range(nendpts)]
             iclf = linear_model.LinearRegression(fit_intercept=True)
-            boundary, tear_segments, nodes_middles, intersect, fit_x = \
-                tear_skeleton_to_segments(bwskel, endpts, endpts_lbls)
+            try:
+                boundary, tear_segments, nodes_middles, intersect, fit_x = \
+                    tear_skeleton_to_segments(bwskel, endpts, endpts_lbls)
+            except:
+                traceback.print_exc()
+                assert( not hard_fail )
             onodes = nodes_middles[:,:2,:]
 
             # now that the control points are ordered by which side of the tear they are on,
@@ -760,7 +797,7 @@ for wafer_id, wafer_ind in zip(all_wafer_ids, range(total_nwafers)):
                 with open(annotation_out_fn, 'rb') as f: cdict = dill.load(f)
             except FileNotFoundError:
                 print('No annotation info for ' + prefix)
-                continue
+                assert( not hard_fail )
             #d = {'correspondence':nodes_middles, 'tear_segments_labels':tear_segments}
             warp_image_in_fn = os.path.join(warp_image_in_dn, image_fn)
             print(warp_image_in_fn)
@@ -814,4 +851,4 @@ for wafer_id, wafer_ind in zip(all_wafer_ids, range(total_nwafers)):
 
 if nml_fn_out: annotation.save(nml_fn_out)
 
-print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+report_job_completed()

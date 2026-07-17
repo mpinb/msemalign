@@ -7,7 +7,7 @@ os.system('date')
 Top level command-line interface for the wafer ordering solving and for
   computing the affine transformations of the rough alignment.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -37,7 +37,9 @@ import time
 os.system('date')
 
 from msem import wafer, wafer_solver
-from msem.utils import make_hex_points, dill_lock_and_load, dill_lock_and_dump
+from msem.utils import make_hex_points
+
+from sslock import dill_lock_and_load, dill_lock_and_dump, report_job_completed
 
 # all parameters loaded from an experiment-specific import
 from def_common_params import get_paths, dsstep, use_thumbnails_ds, dsthumbnail, exclude_regions, region_manifest_cnts
@@ -46,7 +48,7 @@ from def_common_params import keypoints_dill_fn_str, matches_dill_fn_str, rough_
 from def_common_params import order_txt_fn_str, exclude_txt_fn_str, limi_dill_fn_str
 from def_common_params import thumbnail_subfolders, thumbnail_subfolders_order, debug_plots_subfolder
 from def_common_params import region_suffix, thumbnail_suffix
-from def_common_params import lowe_ratio, nfeatures, max_npts_feature_correspondence
+from def_common_params import lowe_ratio, sift_args, max_npts_feature_correspondence
 from def_common_params import affine_rigid_type, min_feature_matches, roi_polygon_scales, matches_iroi_polygon_scales
 from def_common_params import rough_residual_threshold_um, min_fit_pts_radial_std_um, max_fit_translation_um
 from def_common_params import rough_bounding_box_xy_spc, rough_grid_xy_spc, custom_roi
@@ -55,6 +57,7 @@ from def_common_params import keypoints_nworkers_per_process, keypoints_nprocess
 from def_common_params import keypoints_filter_size, keypoints_rescale
 from def_common_params import tissue_mask_path, tissue_mask_fn_str, tissue_mask_ds
 from def_common_params import tissue_mask_min_edge_um, tissue_mask_min_hole_edge_um, tissue_mask_bwdist_um
+from def_common_params import allow_empty_mfovs
 os.system('date')
 
 
@@ -376,7 +379,7 @@ for skip_slices_cross_wafer_ind in skip_slices_cross_wafer_inds:
             use_tissue_masks=tissue_masks, tissue_mask_path=tissue_mask_path, tissue_mask_ds=tissue_mask_ds,
             tissue_mask_fn_str=tissue_mask_fn_str, tissue_mask_min_edge_um=tissue_mask_min_edge_um,
             tissue_mask_min_hole_edge_um=tissue_mask_min_hole_edge_um, tissue_mask_bwdist_um=tissue_mask_bwdist_um,
-            region_manifest_cnts=region_manifest_cnts, verbose=True)
+            region_manifest_cnts=region_manifest_cnts, allow_empty_mfovs=allow_empty_mfovs, verbose=True)
 
     solver = wafer_solver(cwafer, lowe_ratio=lowe_ratio, min_feature_matches=min_feature_matches,
             min_fit_pts_radial_std_um=min_fit_pts_radial_std_um, thumbnail_subfolders=use_thumbnail_subfolders,
@@ -400,7 +403,7 @@ for skip_slices_cross_wafer_ind in skip_slices_cross_wafer_inds:
         #   the entire workflow is no longer runable at once on machine with 64G memory.
         custom_polygon = custom_roi[wafer_ids[0]]
         custom_polygon = np.array(custom_polygon) if custom_polygon is not None else None
-        solver.compute_wafer_keypoints(nfeatures, custom_polygon=custom_polygon,
+        solver.compute_wafer_keypoints(sift_args, custom_polygon=custom_polygon,
             nthreads_per_job=arg_nworkers, iprocess=iprocess, filter_size=keypoints_filter_size,
             rescale=keypoints_rescale, sample_p=sample_p)
         solver.wafer_images = [None]*solver.wafer_nimages
@@ -412,14 +415,15 @@ for skip_slices_cross_wafer_ind in skip_slices_cross_wafer_inds:
         with open(keypoints_dill_fns[0][iprocess], 'wb') as f: dill.dump(d, f)
         print('\tdone in %.4f s' % (time.time() - t, ))
         print('JOB FINISHED: computed / saved keypoints only')
-        print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+        report_job_completed()
         sys.exit()
 
     if compute_matches:
         if run_merge:
             print('Merging matches dills'); t = time.time()
             for i in range(nprocesses):
-                with open(matches_dill_fns[0] + '.' + str(i), 'rb') as f: d = dill.load(f)
+                fn = matches_dill_fns[0] + '.' + str(i)
+                with open(fn, 'rb') as f: d = dill.load(f)
                 if i==0:
                     solver.percent_matches = d['percent_matches']
                 else:
@@ -429,6 +433,12 @@ for skip_slices_cross_wafer_ind in skip_slices_cross_wafer_inds:
             d = {'percent_matches':solver.percent_matches,
                  }
             with open(matches_dill_fns[0], 'wb') as f: dill.dump(d, f)
+
+            # delete the process dills after the merge is complete
+            print('Merge complete, deleting process dills')
+            for i in range(nprocesses):
+                fn = matches_dill_fns[0] + '.' + str(i)
+                os.remove(fn)
         else:
             # changed this code path so that all that happens is calculating percent matches.
             solver.compute_wafer_matches(iroi_polygon_scale=use_matches_iroi_polygon_scale, full=matches_full,
@@ -439,7 +449,7 @@ for skip_slices_cross_wafer_ind in skip_slices_cross_wafer_inds:
             with open(matches_dill_fns[0] + '.' + str(iprocess), 'wb') as f: dill.dump(d, f)
 
         print('JOB FINISHED: computed / saved or merged matches only')
-        print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+        report_job_completed()
         sys.exit()
 
     if load_matches_dill and nwafer_ids == 1:
@@ -519,9 +529,14 @@ for skip_slices_cross_wafer_ind in skip_slices_cross_wafer_inds:
                 dmrg['affine_percent_matches'][rngs[i][0]:rngs[i][1],:] = \
                     d['affine_percent_matches'][rngs[i][0]:rngs[i][1],:]
         with open(rough_affine_dill_fn, 'wb') as f: dill.dump(dmrg, f)
+        # delete the process dills after the merge is complete
+        print('Merge complete, deleting process dills')
+        for i in range(nprocesses):
+            fn = rough_affine_dill_fn + '.' + str(i)
+            os.remove(fn)
         print('\tdone in %.4f s' % (time.time() - t, ))
         print('JOB FINISHED: merged affine dills only')
-        print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+        report_job_completed()
         sys.exit()
 
     random_excludes = solver.compute_wafer_alignments(solved_order=solved_order, solved_order_mask=solved_order_mask,
@@ -550,7 +565,7 @@ for skip_slices_cross_wafer_ind in skip_slices_cross_wafer_inds:
             #solver.solved_order.tofile(order_txt_fns[0], sep=' ')
 
         print('JOB FINISHED: order solver only')
-        print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+        report_job_completed()
         sys.exit()
 
     if nwafer_ids == 1:
@@ -591,4 +606,4 @@ for skip_slices_cross_wafer_ind in skip_slices_cross_wafer_inds:
         dill_lock_and_dump(rough_affine_dill_fn, d, f1, f2)
 
 print('JOB FINISHED: run_wafer_solver.py end of line')
-print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+report_job_completed()

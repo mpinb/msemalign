@@ -6,7 +6,7 @@ Class representation for Zeiss multi-SEM "wafers" which is a collection of
 Wafers contain multiple sections, each of which is a single z-slice out of
   the original tissue block.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -80,7 +80,9 @@ from .utils import constrainAngle, PolyCentroid, tile_nblks_to_ranges, block_con
 from .utils import label_fill_image_background, fill_outside_polygon, cached_image_load
 #from .utils import mls_rigid_transform, delta_interp_methods
 #from .utils import make_delta_plot #, make_grid_plot
-from .utils import big_img_load, big_img_save, big_img_info, big_img_init, gpfs_file_unlock
+from .utils import big_img_load, big_img_save, big_img_info, big_img_init
+
+from sslock import gpfs_file_unlock
 
 class wafer(region):
     """Zeiss mSEM region object.
@@ -127,7 +129,6 @@ class wafer(region):
     #   that important. float16 however, would not allow the range required for large slices.
     coordindate_transformations_dtype = np.float32
 
-
     def __init__(self, experiment_folders, protocol_folders, alignment_folders, region_strs, wafer_ids=[0],
                  region_inds=None, dsstep=1, crop_um=[50,50], delta_rotation_range=[0.,0.], delta_rotation_step=1.,
                  template_crop_um=[10,10], grid_locations=[0,0], rough_bounding_box=None, region_suffix='.tiff',
@@ -139,7 +140,8 @@ class wafer(region):
                  legacy_zen_format=False, nimages_per_mfov=None, init_region_coords=True, region_manifest_cnts=None,
                  use_tissue_masks=False, tissue_mask_path=None, tissue_mask_ds=1, tissue_mask_fn_str=None,
                  tissue_mask_min_edge_um=0., tissue_mask_min_hole_edge_um=0., tissue_mask_bwdist_um=0., zorder=None,
-                 block_overlap_grid_um=[0,0], region_include_cnts=None, custom_roi=[None, None], verbose=False):
+                 block_overlap_grid_um=[0,0], region_include_cnts=None, custom_roi=[None, None],
+                 allow_empty_mfovs=False, verbose=False):
         self.wafer_verbose = verbose
         self.experiment_folders = experiment_folders
 
@@ -246,7 +248,8 @@ class wafer(region):
                     nimages_per_mfov=nimages_per_mfov, scale_nm=scale_nm, tissue_mask_ds=tissue_mask_ds,
                     tissue_mask_min_edge_um=tissue_mask_min_edge_um,
                     tissue_mask_min_hole_edge_um=tissue_mask_min_hole_edge_um,
-                    tissue_mask_bwdist_um=tissue_mask_bwdist_um, verbose=False)
+                    tissue_mask_bwdist_um=tissue_mask_bwdist_um,
+                    allow_empty_mfovs=allow_empty_mfovs, verbose=False)
 
             self.use_tissue_masks = use_tissue_masks
             # xxx - OLDtissue - remove when fully moved to saving the masks
@@ -266,6 +269,7 @@ class wafer(region):
             self.set_xcorr_preproc_params()
             self.use_tissue_masks = False
             self.export_xcorr_comps_path = None
+            self.allow_empty_mfovs = allow_empty_mfovs
             # xxx - OLDtissue - remove when fully moved to saving the masks
             self.tissue_mask_path = None
             self.tissue_mask_ds = tissue_mask_ds # xxx - this stays even if we remove OLDtissue???
@@ -448,7 +452,8 @@ class wafer(region):
                         region_ind, dsstep=dsstep, mfov_align_init=False, use_thumbnails_ds=use_thumbnails_ds,
                         thumbnail_folders=thumbnail_folders[wafer_ind], backload_roi_poly_raw=backload_roi_polys[i],
                         legacy_zen_format=self.legacy_zen_format, scale_nm=self.native_scale_nm,
-                        nimages_per_mfov=self.nimages_per_mfov, init_region_coords=init_region_coords, verbose=False)
+                        nimages_per_mfov=self.nimages_per_mfov, init_region_coords=init_region_coords,
+                        allow_empty_mfovs=self.allow_empty_mfovs, verbose=False)
             except:
                 print('WARNING: error add region %d to missing_regions, might be bad, might be Zeiss $%%#&' % \
                       (region_ind,))
@@ -739,7 +744,7 @@ class wafer(region):
         return igrid_min, igrid_max, ibox_size
 
     def _region_load_xforms(self, ind, slice_image_fn, bg_fill_type, do_bg_fill, region_size, img, bgsel, tm_bw,
-            load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, verbose, doplots):
+            load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, return_coords, verbose, doplots):
         xdtype = self.coordindate_transformations_dtype
 
         if not self.load_rough_xformed_img:
@@ -773,15 +778,15 @@ class wafer(region):
             else:
                 control_points, _, _ = self._xform_points(ind, control_points, region_size, target_ctr=target_ctr)
 
+        if verbose: print('Crop to rough bounding box'); t = time.time()
+        igrid_min, igrid_max, _ = self._center_box_pixels(target_ctr, 1)
+        if not all([x==y for x,y in zip(img.size,igrid_max-igrid_min)]):
+            # the rough grid crop can also expand the image size, so the size
+            #   does not have to match the size of the input image.
+            #assert(self.input_data_type == msem_input_data_types.zen_msem_data or \
+            #    self.input_data_type == msem_input_data_types.new_msem_data)
+            img = img.crop((igrid_min[0], igrid_min[1], igrid_max[0], igrid_max[1]))
         if not self.load_rough_xformed_img:
-            if verbose: print('Crop to rough bounding box'); t = time.time()
-            igrid_min, igrid_max, _ = self._center_box_pixels(target_ctr, 1)
-            if not all([x==y for x,y in zip(img.size,igrid_max-igrid_min)]):
-                # xxx - is it always true for stack inputs that
-                #   the image sizes should always match the rough bounding box size?
-                assert(self.input_data_type == msem_input_data_types.zen_msem_data or \
-                    self.input_data_type == msem_input_data_types.new_msem_data)
-                img = img.crop((igrid_min[0], igrid_min[1], igrid_max[0], igrid_max[1]))
             if load_xform_bg and bgsel is not None and \
                     (not all([x==y for x,y in zip(bgsel.size,igrid_max-igrid_min)])):
                 # https://stackoverflow.com/questions/50527851/background-color-when-cropping-image-with-pil/50725455
@@ -798,7 +803,7 @@ class wafer(region):
             if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
 
             # apply the rough-alignment affine transformation
-            if self.regions_affines[0] is not None and self.regions_affines[0][ind] is not None:
+            if self.regions_affines is not None and self.regions_affines[0][ind] is not None:
                 if verbose: print('Apply rough affine xform'); t = time.time()
                 #print('applying affine'); print(self.regions_affines[0][ind][:2,:])
                 a,b,c,d,e,f = self.regions_affines[0][ind][:2,:].flat[:]
@@ -818,15 +823,9 @@ class wafer(region):
                 if bgsel: bgsel = np.asarray(bgsel)
                 label_fill_image_background(aimg, bg_fill_type=bg_fill_type, bgsel=bgsel)
                 img = Image.fromarray(aimg); del aimg
-
-            # currently this is single block anyways, so update shape after the xforms
-            img_shape = img.size[:2][::-1]
-        else: #if not self.load_rough_xformed_img:
-            img_shape = region_size[:2][::-1]
-            # for this pathway, verify that the total image shape matches that of the rough bounding box
-            box = [x - self.rough_bounding_box_pixels[0] for x in self.rough_bounding_box_pixels]
-            ibox_size = np.round(box[1]-box[0]).astype(np.int64)
-            assert(all([x==y for x,y in zip(img_shape[::-1],ibox_size)]))
+        # if not self.load_rough_xformed_img:
+        # currently this is single block anyways, so update shape after the xforms
+        img_shape = img.size[:2][::-1]
 
         # region_load using image transforms only supports block processing for the fine transformation.
         # save min value for the block, used later in many places as a "crop" for the block.
@@ -927,7 +926,12 @@ class wafer(region):
             if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
         #if self.deformations_points is not None:
 
-        return img, roi_points, control_points, img_shape, icrop_min, bgsel, tm_bw
+        if load_xform_tm and tm_bw is not None:
+            # keep the downsampled, xformed tissue mask and its relative downsampling
+            self.tissue_mask_bw[ind] = tm_bw
+            self.tissue_mask_bw_rel_ds = rel_ds
+
+        return img, roi_points, control_points, img_shape, icrop_min, bgsel, tm_bw, None
     #def _region_load_xforms(self
 
     # for transforming points based on the alignments being applied.
@@ -996,8 +1000,8 @@ class wafer(region):
                         else:
                             assert(nrough == 1) # why would you do this?
         else: # if not self.load_rough_xformed_img:
-            target_ctr = None
             rot_region_size = region_size
+            target_ctr = rot_region_size/2
 
         if self.deformations_points is not None:
             nfine = len(self.deformations_points)
@@ -1102,6 +1106,14 @@ class wafer(region):
             sel = np.logical_and(p >= 0, p < icoords_size_grid[None,:] - 1).all(1)
             p = p[sel,:]; v = v[sel,:]
 
+        gpmin = np.zeros(2, dtype=np.int64); gpmax = icoords_size.copy()
+        if p.size == 0:
+            if verbose: print('Block completely outside grid points, set interp deltas to 0')
+            # the block is completely outside of the grid points
+            vx = vy = np.zeros(icoords_size[::-1], dtype=xdtype)
+            cmin = gpmin; cmax = gpmax
+            return gpmin, gpmax, cmin, cmax, vx, vy
+
         # keep points to interpolate based on specified range for the grid.
         # only interpolate within the bounds of the selected points.
         # xxx - theoretically griddata can handle filling extrapolated points with default value,
@@ -1118,11 +1130,19 @@ class wafer(region):
         # set pmin/pmax for the dense crop (gpmin/gpmax). in the legacy case where the overlap is equal
         #   for the grid crop and the dense crop, gpmin/gpmax (should) default to pmin/pmax.
         # default to the entire dense grid (with overlap)
-        gpmin = np.zeros(2, dtype=np.int64); gpmax = icoords_size.copy()
         delta_min = icrop_min - icrop_min_grid
         delta_max = delta_min + icoords_size
-        sel = (delta_min <= pmin)
-        outside_grid = (sel.any() and (delta_max < pmin).any())
+        # BUG: found 20250708, Not totally clear the effect, possibly not warping some areas correctly
+        #   near to the edges of the grid, but could be that the problems are cropped out anyways.
+        #   The default if the warps are not computed here is to not warp those locations. This was not
+        #   found / triggered until the block size being smaller than overlap and/or crop was allowed
+        #   which happened during creating very small block sizes for native fine alignment export.
+        #sel = (delta_min <= pmin) # BUG20250708
+        #outside_grid = (sel.any() and (delta_max < pmin).any()) # BUG20250708
+        sel_min = (delta_min < pmin)
+        outside_grid = (sel_min.any() and (delta_max < pmin).any())
+        sel_max = (delta_max > pmax)
+        outside_grid = outside_grid or (sel_max.any() and (delta_min > pmax).any())
         if outside_grid:
             if verbose: print('Block completely outside grid, set interp deltas to 0')
             # the block is completely outside of the grid points
@@ -1130,9 +1150,11 @@ class wafer(region):
             cmin = gpmin; cmax = gpmax
         else:
             # gpmin/gpmax are assigned relative to dense grid overlap.
-            gpmin[sel] = pmin[sel] - delta_min[sel]
-            sel = (delta_max >= pmax)
-            gpmax[sel] = pmax[sel] - delta_min[sel]
+            #gpmin[sel] = pmin[sel] - delta_min[sel] # BUG20250708
+            #sel = (delta_max >= pmax) # BUG20250708
+            #gpmax[sel] = pmax[sel] - delta_min[sel] # BUG20250708
+            gpmin[sel_min] += (pmin[sel_min] - delta_min[sel_min])
+            gpmax[sel_max] += (pmax[sel_max] - delta_max[sel_max])
             gprng = gpmax - gpmin
             # goffset is assigned relative to grid points overlap.
             # different overlaps allows for larger grid context without dense interpolating the whole overlap area.
@@ -1167,7 +1189,7 @@ class wafer(region):
     #def _region_load_setup_deformations(self,
 
     def _region_load_coords(self, ind, slice_image_fn, bg_fill_type, do_bg_fill, region_size, img, bgsel, tm_bw,
-            load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, verbose, doplots):
+            load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, return_coords, verbose, doplots):
         # get the size of the output image based on the rough bounding box
         _, _, ibox_size = self._center_box_pixels(np.zeros(2), 1)
         ibox_shape = ibox_size[::-1]
@@ -1239,7 +1261,10 @@ class wafer(region):
                 if self.regions_affines[i][ind] is not None:
                     if verbose: print('Apply coords rough affine xform number {}'.format(i)); t = time.time()
                     tmp = self.regions_affines[i][ind].astype(xdtype)
-                    coords = np.dot(tmp[:2,:2], coords)
+                    # documentation says matmul is preferred, but it's more than that,
+                    #   dot uses much much more memory for large matrices (for example, coords).
+                    #coords = np.dot(tmp[:2,:2], coords)
+                    coords = np.matmul(tmp[:2,:2], coords)
                     coords += tmp[:2,2][:,None]
                     if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
                 else:
@@ -1271,7 +1296,8 @@ class wafer(region):
             c, s = np.cos(ang_rad), np.sin(ang_rad)
             R_forwards = np.array([[c, -s], [s, c]], dtype=xdtype)
             coords -= (rot_region_size/2)[:,None]
-            coords = np.dot(R_forwards, coords)
+            #coords = np.dot(R_forwards, coords)
+            coords = np.matmul(R_forwards, coords)
             coords += (region_size/2)[:,None]
         if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
 
@@ -1305,29 +1331,43 @@ class wafer(region):
         # apply the transforms to the images
         # xxx - could load images one at a time, but this did not seem worth the hassle
         #   of pulling apart the image(s) loading logic.
-        img, bgsel, tm_bw, _, _, _, _, _, _ = \
-            self._region_load_load_imgs(ind, slice_image_fn, do_bg_fill, True, False, custom_rng, verbose)
-
-        # xxx - gah, punted on the tissue mask, one option could be to just keep it stored upsampled,
-        #   seems overly wasteful. can not think of a better solution at the moment.
-        tm_bw = None
+        img, bgsel, tm_bw, load_xform_tm, _, _, rel_ds, _, img_dtype = self._region_load_load_imgs(ind,
+                slice_image_fn, load_xform_bg, True, False, custom_rng, verbose)
+        # only support the tissue mask if it has been upsampled ('upsample-masks' mode in run_regions.py)
+        if rel_ds is None or rel_ds > 1: tm_bw = None
 
         if not out_of_bounds:
-            img = nd.map_coordinates(img, coords, order=self.warping_spline_order_nd, mode='constant', prefilter=False)
+            img = nd.map_coordinates(img, coords, order=self.warping_spline_order_nd, mode='constant',
+                    prefilter=False, cval=0.)
             if load_xform_bg and bgsel is not None:
                 bgsel = nd.map_coordinates(bgsel, coords, order=0, mode='constant', prefilter=False)
-            # if load_xform_tm and tm_bw is not None:
-            #     tm_bw = nd.map_coordinates(tm_bw, coords, order=0, mode='constant', prefilter=False)
+            if load_xform_tm and tm_bw is not None:
+                tm_bw = nd.map_coordinates(tm_bw, coords, order=0, mode='constant', prefilter=False)
         else:
             if verbose: print('All coords out of bounds')
             img = np.zeros(icoords_shape, dtype=img.dtype)
             if load_xform_bg and bgsel is not None:
                 bgsel = np.zeros(icoords_shape, dtype=bgsel.dtype)
-            # if load_xform_tm and tm_bw is not None:
-            #     tm_bw = np.zeros(icoords_shape, dtype=tm_bw.dtype)
+            if load_xform_tm and tm_bw is not None:
+                tm_bw = np.zeros(icoords_shape, dtype=tm_bw.dtype)
         if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
 
-        return img, roi_points, control_points, ibox_shape, icrop_min, bgsel, tm_bw
+        if return_coords:
+            coords = coords.reshape(2,-1)
+            coords += coords_imin[:,None]
+            coords = coords.reshape((2, icoords_shape[0], icoords_shape[1]))
+        else:
+            coords = None
+
+        if load_xform_bg and bgsel is not None and do_bg_fill:
+            label_fill_image_background(img, bg_fill_type=bg_fill_type, bgsel=bgsel)
+
+        if load_xform_tm and tm_bw is not None:
+            # keep the downsampled, xformed tissue mask and its relative downsampling
+            self.tissue_mask_bw[ind] = tm_bw
+            self.tissue_mask_bw_rel_ds = rel_ds
+
+        return img, roi_points, control_points, ibox_shape, icrop_min, bgsel, tm_bw, coords
     #def _region_load_coords(self
 
     # this is mostly meant for "back-transforming" masks that were created from "microscope aligned" images.
@@ -1381,7 +1421,8 @@ class wafer(region):
             c, s = np.cos(ang_rad), np.sin(ang_rad)
             R_backwards = np.array([[c, s], [-s, c]], dtype=xdtype)
             coords -= (region_size/2)[:,None]
-            coords = np.dot(R_backwards, coords)
+            #coords = np.dot(R_backwards, coords)
+            coords = np.matmul(R_backwards, coords)
             coords += (rot_region_size/2)[:,None]
         if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
 
@@ -1433,11 +1474,11 @@ class wafer(region):
         return img, roi_points, ibox_shape, icrop_min
     #def _region_load_coords_inv(self
 
-    def _region_load_load_imgs(self, ind, slice_image_fn, do_bg_fill, load_img, return_pil, custom_rng, verbose):
+    def _region_load_load_imgs(self, ind, slice_image_fn, load_xform_bg, load_img, return_pil, custom_rng, verbose):
         if verbose: print('Loading image and/or roi/bg/mask'); t = time.time()
-        load_xform_bg = do_bg_fill and load_img
-        load_xform_tm = False
-        roi_points = tm_bw = bgsel = img = img_shape = rel_ds = control_points = None
+        load_xform_tm = load_img
+        load_xform_bg = (load_xform_bg and load_img)
+        roi_points = tm_bw = bgsel = img = img_shape = img_dtype = rel_ds = control_points = None
         if self.input_data_type == msem_input_data_types.zen_msem_data or \
                 self.input_data_type == msem_input_data_types.new_msem_data:
             # in the normal workflow the region outputs are always hdf5 files.
@@ -1465,39 +1506,40 @@ class wafer(region):
             if load_img:
                 # load the pre-montaged region (slice) image.
                 img, img_shape = big_img_load(slice_image_fn, _nblks, _iblk, _novlp, custom_rng=custom_rng)
+                img_dtype = img.dtype
                 if return_pil: img = Image.fromarray(img)
             else:
-                img_shape, _ = big_img_info(slice_image_fn)
+                img_shape, img_dtype = big_img_info(slice_image_fn)
 
             if load_xform_bg:
-                # another method to avoid spurious correlations, fill any zero-padded areas with noise
-                # this has to be done after the image rotation, cropping and affine transformations,
-                #   because the transformations also create background.
                 bgsel, _ = big_img_load(slice_image_fn, _nblks, _iblk, _novlp, dataset='background',
                         custom_rng=custom_rng)
                 if return_pil: bgsel = Image.fromarray(bgsel)
 
             # xxx - because it is relatively low overhead, decided to just always xform the tissue masks
             #   if they are present in the region file, even if they are not going to be used.
-            try:
-                attrs = {'ds':0}
-                tm_bw, _ = big_img_load(slice_image_fn, dataset='tissue_mask', attrs=attrs)
-                load_xform_tm = True
-            except:
-                load_xform_tm = False
+            if load_xform_tm:
+                try:
+                    attrs = {'ds':0}
+                    if self.use_coordinate_based_xforms:
+                        # for this code path the tissue masks should have been upsampled in run_regions
+                        tm_bw, _ = big_img_load(slice_image_fn, _nblks, _iblk, _novlp, dataset='tissue_mask',
+                                custom_rng=custom_rng, attrs=attrs)
+                    else:
+                        tm_bw, _ = big_img_load(slice_image_fn, dataset='tissue_mask', attrs=attrs)
+                    load_xform_tm = True
+                except:
+                    load_xform_tm = False
             if load_xform_tm:
                 rel_ds = attrs['ds'] // self.dsstep
                 if return_pil: tm_bw = Image.fromarray(tm_bw)
         elif self.input_data_type == msem_input_data_types.image_stack:
             slice_image_fn = slice_image_fn + self.region_ext
-            img = cached_image_load(slice_image_fn, cache_dir=self.cache_dir, return_pil=True)
-            img_shape = img.size[:2][::-1]
-            if load_img:
-                if not return_pil: img = np.asarray(img) #.copy()
-            else:
-                # xxx - could query size here instead of loading image.
-                #   decided it was not worth the effort since this pathway is typically for smallerish images.
-                img = None
+            img, img_shape, img_dtype = cached_image_load(slice_image_fn, cache_dir=self.cache_dir,
+                    return_pil=return_pil)
+            # xxx - if load_img==False we could query size here instead of loading image.
+            #   decided it was not worth the effort since this pathway is typically for smallerish images.
+            if not load_img: img = None
         elif self.input_data_type == msem_input_data_types.hdf5_stack:
             slice_image_fn = slice_image_fn + self.region_ext
             try:
@@ -1510,13 +1552,18 @@ class wafer(region):
                 else:
                     _nblks = [1,1]; _iblk = [0,0]; _novlp = [0,0]
                 img, img_shape = big_img_load(slice_image_fn, _nblks, _iblk, _novlp, custom_rng=custom_rng)
+                img_dtype = img.dtype
                 if return_pil: img = Image.fromarray(img)
+                if load_xform_bg:
+                    bgsel, _ = big_img_load(slice_image_fn, _nblks, _iblk, _novlp, dataset='background',
+                            custom_rng=custom_rng)
+                    if return_pil: bgsel = Image.fromarray(bgsel)
             else:
-                img_shape, _ = big_img_info(slice_image_fn)
+                img_shape, img_dtype = big_img_info(slice_image_fn)
         if verbose: print('\tdone in %.4f s' % (time.time() - t, ))
 
         img_size = np.array(img_shape[::-1])
-        return img, bgsel, tm_bw, load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, img_size
+        return img, bgsel, tm_bw, load_xform_tm, roi_points, control_points, rel_ds, img_size, img_dtype
     #def _region_load_load_imgs(self
 
     def _get_region_filename(self, ind):
@@ -1541,7 +1588,8 @@ class wafer(region):
     #   (1) microscope alignment, rotation and region roi center (from czi/cz file)
     #   (2) rough alignment, affine transformation calculated by wafer_solver
     #   (3) fine alignment, from deltas calculated in align_regions method below
-    def _region_load(self, ind, bg_fill_type='noise', return_pil=True, verbose=False, doplots=False):
+    def _region_load(self, ind, bg_fill_type='noise', bg_grid_sel=False, return_pil=True, return_img_coords=False,
+            verbose=False, doplots=False):
         slice_image_fn = self._get_region_filename(ind)
         print(slice_image_fn)
 
@@ -1549,8 +1597,9 @@ class wafer(region):
         if verbose: print('do background fill {}'.format(do_bg_fill))
 
         load_img = not self.use_coordinate_based_xforms
-        img, bgsel, tm_bw, load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, region_size = \
-            self._region_load_load_imgs(ind, slice_image_fn, do_bg_fill, load_img, True, None, verbose)
+        load_xform_bg = (do_bg_fill or bg_grid_sel)
+        img, bgsel, tm_bw, load_xform_tm, roi_points, control_points, rel_ds, region_size, _ = \
+            self._region_load_load_imgs(ind, slice_image_fn, load_xform_bg, load_img, True, None, verbose)
 
         # the original load method applied transformations directly to the images in the forward direction.
         # this is left in as _region_load_xforms. this method only supports block processing for the fine alignemnt.
@@ -1562,28 +1611,23 @@ class wafer(region):
             f_region_load = self._region_load_xforms
             assert(self.regions_affines is None or len(self.regions_affines) == 1) # use coord xforms
             assert(self.deformations_points is None or len(self.deformations_points) == 1) # use coord xforms
-        img, roi_points, control_points, img_shape, icrop_min, bgsel, tm_bw = \
+        img, roi_points, control_points, img_shape, icrop_min, bgsel, tm_bw, img_coords = \
             f_region_load(ind, slice_image_fn, bg_fill_type, do_bg_fill, region_size, img, bgsel, tm_bw,
-                load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, verbose, doplots)
+                load_xform_bg, load_xform_tm, roi_points, control_points, rel_ds, return_img_coords, verbose, doplots)
 
         if type(img) is Image.Image:
             if not return_pil: img = np.asarray(img) #.copy()
         else:
             if return_pil: img = Image.fromarray(img)
 
-        if load_xform_tm and tm_bw is not None:
-            # keep the downsampled, xformed tissue mask and its relative downsampling
-            self.tissue_mask_bw[ind] = tm_bw
-            self.tissue_mask_bw_rel_ds = rel_ds
-
-        return img, roi_points, control_points, img_shape, icrop_min, bgsel
+        return img, roi_points, control_points, img_shape, icrop_min, bgsel, img_coords
     # def _region_load(self, ind
 
     # get selects of which grid points are within the roi polygon (if loaded / specified).
-    def _get_grid_selects(self, i, grid_points=None, roi_points=None):
+    def _get_grid_selects(self, i, grid_points=None, roi_points=None, bgsel=None, icrop_min=None):
         if grid_points is None: grid_points = self.grid_locations_pixels
 
-        grid_selects = None
+        grid_selects = roi_points_scl = None
         if roi_points is not None and self.roi_polygon_scale > 0:
             ctr = PolyCentroid(roi_points[:,0], roi_points[:,1])
             roi_points_scl = (roi_points - ctr)*self.roi_polygon_scale + ctr
@@ -1591,6 +1635,17 @@ class wafer(region):
 
         if self.custom_roi[i] is not None:
             mask = Path(self.custom_roi[i]).contains_points(grid_points)
+            grid_selects = mask if grid_selects is None else np.logical_and(grid_selects, mask)
+
+        if bgsel is not None:
+            bw = bgsel
+            # for the background select, only the current block is loaded, so need icrop_min.
+            ipts = np.round(grid_points - icrop_min).astype(np.int64)
+            mask_sel = np.logical_and((ipts >= 0).all(1), (ipts < np.array(bw.shape)[None,::-1]).all(1))
+            mask2 = np.array([not bw[x[1],x[0]] for x in ipts[mask_sel,:]])
+            # only set the grid selects to false if in the background area for points that are inside
+            #   the current block. other mechanisms check for grid points outside of the block.
+            mask = np.ones(mask_sel.shape, dtype=bool); mask[mask_sel] = mask2
             grid_selects = mask if grid_selects is None else np.logical_and(grid_selects, mask)
 
         bw = None
@@ -1603,6 +1658,7 @@ class wafer(region):
             else:
                 bw = self.tissue_mask_bw[i]
                 rel_ds = self.tissue_mask_bw_rel_ds
+            assert(not self.use_coordinate_based_xforms or rel_ds == 1) # tissue masks need to be upsampled
 
             if self.tissue_mask_min_size > 0:
                 # remove small components
@@ -1636,15 +1692,25 @@ class wafer(region):
             if self.tissue_mask_bwdist > 0:
                 bw = (nd.distance_transform_edt(np.logical_not(bw)) < self.tissue_mask_bwdist)
 
-            ipts = np.round(grid_points / rel_ds).astype(np.int64)
-            mask = np.logical_and((ipts >= 0).all(1), (ipts < np.array(bw.shape)[None,::-1]).all(1))
-            mask2 = np.array([bw[x[1],x[0]] for x in ipts[mask,:]]); mask[mask] = mask2
-            grid_selects = mask if grid_selects is None else np.logical_and(grid_selects, mask)
+            if self.use_coordinate_based_xforms:
+                # xxx - almost copy/paste of background select select code, but mask meaning is inverted.
+                ipts = np.round(grid_points - icrop_min).astype(np.int64)
+                mask_sel = np.logical_and((ipts >= 0).all(1), (ipts < np.array(bw.shape)[None,::-1]).all(1))
+                mask2 = np.array([bw[x[1],x[0]] for x in ipts[mask_sel,:]])
+                # only set the grid selects to false if not in the tissue area for points that are inside
+                #   the current block. other mechanisms check for grid points outside of the block.
+                mask = np.ones(mask_sel.shape, dtype=bool); mask[mask_sel] = mask2
+                grid_selects = mask if grid_selects is None else np.logical_and(grid_selects, mask)
+            else:
+                # tissue masks are downsampled in this case
+                ipts = np.round(grid_points / rel_ds).astype(np.int64)
+                mask = np.logical_and((ipts >= 0).all(1), (ipts < np.array(bw.shape)[None,::-1]).all(1))
+                mask2 = np.array([bw[x[1],x[0]] for x in ipts[mask,:]]); mask[mask] = mask2
+                grid_selects = mask if grid_selects is None else np.logical_and(grid_selects, mask)
         #if self.use_tissue_masks:
 
         if grid_selects is None:
             grid_selects = np.ones((self.ngrid,), bool)
-            roi_points_scl = roi_points
 
         return grid_selects, roi_points_scl, bw
 
@@ -1679,8 +1745,8 @@ class wafer(region):
 
         for i in regions:
             if doload:
-                imgs[i], rois_points[i], _, img_shape, icrop_min, _ = \
-                    self._region_load(i, bg_fill_type=bg_fill_type, return_pil=False)
+                imgs[i], rois_points[i], _, img_shape, icrop_min, bgsel, _ = self._region_load(i,
+                        bg_fill_type=bg_fill_type, bg_grid_sel=self.allow_empty_mfovs, return_pil=False)
 
                 # this is an optimization for speed, with high image coverage it's better to preproc all at once.
                 if ngrid > self.ngrid_cutoff and doproc:
@@ -1691,7 +1757,8 @@ class wafer(region):
             img = imgs[i]; img_proc = imgs_proc[i]
             #shape = img.shape if img is not None else img_proc.shape
             # since the addition of the rough bounding box, ctrs are the same for all images
-            grid_selects[:,i], _, _ = self._get_grid_selects(i, roi_points=rois_points[i])
+            grid_selects[:,i], _, _ = self._get_grid_selects(i, roi_points=rois_points[i], bgsel=bgsel,
+                    icrop_min=icrop_min)
             grid_centers[:,i,:] = self.grid_locations_pixels[gridnums[:ngrid],:] - icrop_min
             if rois_points[i] is not None:
                 rois_points[i] = rois_points[i] - icrop_min # must be after _get_grid_selects
@@ -1835,6 +1902,9 @@ class wafer(region):
         # NOTE: can not do query cuda devices in a global init because cuda can not be forked,
         #   meaning any processes that try to use cuda will fail. another option is 'spawn'
         #   but all the conditional code required for this is a nightmare.
+        #   `spawn` does also not support the very useful and convenient feature of fork which is
+        #     copy-on-write, preventing having to copy read-only parameters to shared memory
+        #     for all the worker processes.
         self.query_cuda_devices()
         # nworkers is only used by the rcc-xcorr gpu version, does not matter for other methods.
         # xxx - nworkers is actually now just a hook because more than one worker did not help for small batches.
@@ -1852,6 +1922,10 @@ class wafer(region):
         imgs_shape = tpls_shape = None # to make sure they are all the same size
 
         # use the cross-correlation method to calculate local deltas at grid locations.
+        C = np.empty((self.ngrid,), dtype=np.double)
+        A = np.empty((self.ngrid,), dtype=np.double)
+        # template_match_rotate_images already returns deltas as double (between image centers)
+        D = np.empty((self.ngrid,2), dtype=np.double)
         for i in range(self.nregions-1):
             icur = self.solved_order[i]; inxt = self.solved_order[i+1]
 
@@ -1861,7 +1935,8 @@ class wafer(region):
                 self._load_grid_region_crops(range(self.ngrid), [icur,inxt])
 
             if self.wafer_verbose:
-                sel = np.logical_and(grid_selects, grid_selects_poly[:,[icur,inxt]].all(1))
+                #sel = np.logical_and(grid_selects, grid_selects_poly[:,[icur,inxt]].all(1))
+                sel = np.logical_and(grid_selects, grid_selects_poly[:,[icur,inxt]].any(1))
                 print('\tAligning region %d to %d, %d of %d, at %d / %d locations (block count %d)' % \
                       (inxt,icur,i,self.nregions,sel.sum(),self.ngrid,full_cnt))
                 print('\tCrop size {} x {}'.format(self.crop_um[0], self.crop_um[1]))
@@ -1869,17 +1944,20 @@ class wafer(region):
                 t = time.time()
 
             # iterate defined grid locations
-            C = np.empty((self.ngrid,), dtype=np.double); C.fill(-np.inf)
-            A = np.zeros((self.ngrid,), dtype=np.double)
-            # template_match_rotate_images already returns deltas as double (between image centers)
-            D = np.zeros((self.ngrid,2), dtype=np.double)
+            #C = np.empty((self.ngrid,), dtype=np.double); C.fill(-np.inf)
+            #A = np.zeros((self.ngrid,), dtype=np.double)
+            ## template_match_rotate_images already returns deltas as double (between image centers)
+            #D = np.zeros((self.ngrid,2), dtype=np.double)
+            C.fill(-np.inf); A.fill(0); D.fill(0)
             ctemplate0s = [None]*self.ngrid
             nprint = 0
             valid_cnt = 0
             tin = time.time()
             for x in range(self.ngrid):
                 # the template matching is done with the next image as the image and the current as the template.
-                if grid_selects[x] and grid_selects_poly[x,[icur,inxt]].all() and all([(x < y and x > 0 and y > 0) \
+                #sel_poly = grid_selects_poly[x,[icur,inxt]].all()
+                sel_poly = grid_selects_poly[x,[icur,inxt]].any()
+                if grid_selects[x] and sel_poly and all([(x < y and x > 0 and y > 0) \
                         for x,y in zip(timages_proc[x][icur].shape, images_proc[x][inxt].shape)]):
                     if imgs_shape is None:
                         imgs_shape = np.array(images_proc[x][inxt].shape)
@@ -1901,6 +1979,7 @@ class wafer(region):
                     valid_cnt += 1
                     if nprint > 0 and valid_cnt % nprint == 0:
                         print('\t\t{} / {} in {:.4f}'.format(valid_cnt,full_cnt,time.time() - tin,)); tin = time.time()
+            print('\tAligned at {} grid locations'.format(valid_cnt))
 
             if self.export_xcorr_comps_path is not None:
                 # xxx - hacky way to export xcorr comparisons / results for validating other methods
@@ -1998,7 +2077,7 @@ class wafer(region):
             start=0, stop=-1, bg_fill_type='none', do_overlays=False, export_solved_order=None, save_h5=False,
             zero_outside_grid=False, save_roi_points=False, convert_hdf5s=False, order_name_str='order',
             tissue_masks=False, init_locks=False, is_excluded=False, save_masks_in='', xform_control_points=False,
-            inv_xform_control_points=False, verbose_load=False):
+            inv_xform_control_points=False, save_img_coords=False, verbose_load=False):
         stop = (self.solved_order.size if use_solved_order else self.nregions) if stop < 0 else stop
 
         # optionally output at multiple downsamplings, saves time so that image is only loaded once
@@ -2008,6 +2087,7 @@ class wafer(region):
         assert( not (use_solved_order and export_solved_order is not None) ) # do not use both
         assert( self.single_block or not do_overlays ) # no overlays for hdf5 outputs
         assert( not convert_hdf5s or not save_roi_points ) # no saving roi points during hdf5 conversion
+        #assert( not save_img_coords or (ndssteps == 1 and dssteps[0] == 1) ) # no downsampling coords mapping
 
         # xxx - currently still allowing both modes, tissue mask saved with regions (new), or as tiffs (old)
         rel_ds = self.tissue_mask_bw_rel_ds if self.tissue_mask_bw_rel_ds > 0 else self.tissue_mask_ds // self.dsstep
@@ -2016,13 +2096,14 @@ class wafer(region):
 
         if self.wafer_verbose:
             print('Writing output tiffs for %d regions' % (stop-start, ))
-            print('\tCrop to grid {}, solved order {}, overlays {}, zero outside grid {}, convert hdf5s {}, init {}'.\
-                format(
+            print(('\tCrop to grid {}, solved order {}, overlays {}, zero outside grid {}, ' + \
+                'convert hdf5s {}, init {}, save_img_coords {}').format(
                     ('yes' if crop_to_grid else 'no'),
                     ('yes' if (use_solved_order or export_solved_order is not None) else 'no'),
                     ('yes' if do_overlays else 'no'), ('yes' if zero_outside_grid else 'no'),
                     ('yes' if convert_hdf5s else 'no'),
-                    ('yes' if init_locks else 'no'), ))
+                    ('yes' if init_locks else 'no'),
+                    ('yes' if save_img_coords else 'no'), ))
             if save_masks_in:
                 print('Saving transformed tissue masks back into regions')
             elif tissue_masks:
@@ -2041,6 +2122,13 @@ class wafer(region):
         grid_min = self.grid_locations_pixels.min(0)
         grid_max = self.grid_locations_pixels.max(0)
         grid_center = (grid_min + grid_max)/2
+
+        # this is for downsampling image coordinates (save_img_coords == True)
+        if save_img_coords:
+            dsreps = 2
+            dsstrs = ['x','y']
+        else:
+            dsreps = 1
 
         for i,cnt in zip(range(start,stop), range(stop-start)):
             x = ((self.solved_order[i] if export_solved_order is None else export_solved_order[i]) \
@@ -2073,7 +2161,7 @@ class wafer(region):
 
                 # invert the alignments in which the mask was generated
                 #   in order for it to align with the slice region image.
-                _, _, _, _, _, roi_points, _, _, region_size = self._region_load_load_imgs(x,
+                _, _, _, _, roi_points, _, _, region_size, _ = self._region_load_load_imgs(x,
                         slice_image_fn, False, False, False, None, verbose_load)
                 bw, roi_points, ibox_shape, icrop_min = self._region_load_coords_inv(x,
                         region_size, bw, roi_points, rel_ds, verbose_load, False)
@@ -2087,8 +2175,9 @@ class wafer(region):
                 # this is a special code path, so do not do anything else within the loop.
                 continue
             elif not convert_hdf5s and not init_locks:
-                img, roi_points, control_points, img_shape, icrop_min, bgsel = \
-                    self._region_load(x, bg_fill_type=bg_fill_type, verbose=verbose_load)
+                img, roi_points, control_points, img_shape, icrop_min, bgsel, img_coords = \
+                    self._region_load(x, bg_fill_type=bg_fill_type, return_img_coords=save_img_coords,
+                        verbose=verbose_load)
                 # get the image, rough bounding box and grid centers.
                 img_sz = np.array(img.size, dtype=np.int64); img_ctr = img_sz/2
                 img_shape_blk = img_shape
@@ -2116,8 +2205,8 @@ class wafer(region):
                 if not convert_hdf5s:
                     # this is used to calculate the ranges in big_img_save.
                     # big_img_save is based on image shape not size, so need to swap x/y
-                    bcrop = [[igrid_min[1], img_shape_blk[0]-igrid_max[1]],
-                             [igrid_min[0], img_shape_blk[1]-igrid_max[0]]]
+                    bcrop = [[igrid_min[1], igrid_max[1]],
+                             [igrid_min[0], igrid_max[0]]]
 
                 if self.single_block or convert_hdf5s:
                     bcrop_min = igrid_min; bcrop_max = igrid_max; icrop_min = igrid_min
@@ -2129,6 +2218,12 @@ class wafer(region):
                     icrop_max = icrop_min + img_sz
                     bcrop_max = img_sz.copy(); sel = (icrop_max > igrid_max)
                     bcrop_max[sel] = bcrop_max[sel] - (icrop_max[sel] - igrid_max[sel])
+                    # if (bcrop_max < bcrop_min).any():
+                    #     print(f'{bcrop_min=} {bcrop_max=}')
+                    #     assert(False) # crop is too big relative to the block size
+                    # this should crop to a zero size image if bcrop is bigger than the block size
+                    sel = (bcrop_max < bcrop_min)
+                    bcrop_min[sel] = bcrop_max[sel]
 
                     # update the cropping locations out of the entire image
                     icrop_min = np.maximum(igrid_min, icrop_min)
@@ -2138,6 +2233,9 @@ class wafer(region):
                     # crop the image based on the bounding box of the grid
                     img = img.crop((bcrop_min[0], bcrop_min[1], bcrop_max[0], bcrop_max[1]))
                     if roi_points is not None: roi_points = roi_points - icrop_min
+                    # NO: do not crop the coordinate transforms, always keep full rough bounding box
+                    #if img_coords is not None:
+                    #   img_coords = img_coords[:,bcrop_min[1]:bcrop_max[1],bcrop_min[0]:bcrop_max[0]]
             else: #if crop_to_grid and not init_locks
                 bcrop = None
 
@@ -2174,7 +2272,7 @@ class wafer(region):
                 fn = self.wafer_strs[wafer_ind] + order_str + self.wafer_region_strs[x] + suffix
                 if is_excluded: fn = 'x' + fn
                 fn = os.path.join(outpath, fn)
-                h5fn = fn + '.h5'
+                h5fn = fn + '.h5' if fn[-3:] != '.h5' else fn
 
                 if init_locks:
                     assert( not (not save_h5 and (self.single_block or convert_hdf5s)) ) # not saving h5
@@ -2189,27 +2287,41 @@ class wafer(region):
                 if convert_hdf5s and j==0:
                     if self.wafer_verbose:
                         print('\tLoading hdf5 "' + h5fn + '"'); lt = time.time()
-                    if crop_to_grid:
-                        # hdf5s are stored in images space, flip xy
-                        rng = [[bcrop_min[1], bcrop_max[1]], [bcrop_min[0], bcrop_max[0]]]
-                        print('\t\tCrop to grid slice (y/x) range {}-{}, {}-{}'.format(rng[0][0],rng[0][1],
-                            rng[1][0], rng[1][1]))
+                    if save_img_coords:
+                        # never crop to grid when saving coords
+                        reg_shape, coords_dtype = big_img_info(h5fn, 'coords_x')
+                        img_coords = np.empty((2,) + reg_shape, dtype=coords_dtype)
+                        # x/y swap for coordinates already done when saving coords to the hdf5 file
+                        img_coords[0,:,:] = big_img_load(h5fn, dataset='coords_x')[0]
+                        img_coords[1,:,:] = big_img_load(h5fn, dataset='coords_y')[0]
                     else:
-                        rng = None
-                    img, _ = big_img_load(h5fn, custom_rng=rng)
+                        if crop_to_grid:
+                            # hdf5s are stored in images space, flip xy
+                            rng = [[bcrop_min[1], bcrop_max[1]], [bcrop_min[0], bcrop_max[0]]]
+                            print('\t\tCrop to grid slice (y/x) range {}-{}, {}-{}'.format(rng[0][0],rng[0][1],
+                                rng[1][0], rng[1][1]))
+                        else:
+                            rng = None
+                        img, _ = big_img_load(h5fn, custom_rng=rng)
                     if self.wafer_verbose:
                         print('\t\tdone in %.4f s' % (time.time() - lt, ))
                     continue # the first index is just for loading the hdf5
 
                 if dsstep > 1:
-                    pad = (dsstep - np.array(img.shape) % dsstep) % dsstep
-                    oimg = measure.block_reduce(np.pad(img, ((0,pad[0]), (0,pad[1])), mode='reflect'),
-                            block_size=(dsstep, dsstep), func=self.blkrdc_func).astype(img.dtype)
+                    if save_img_coords:
+                        ds_shape = tuple(np.ceil(np.array(reg_shape)/dsstep).astype(np.int64).tolist())
+                        ds_img_coords = np.empty((2,) + ds_shape, dtype=coords_dtype)
+                    for k in range(dsreps):
+                        if save_img_coords: img = img_coords[k,:,:]
+                        pad = (dsstep - np.array(img.shape) % dsstep) % dsstep
+                        oimg = measure.block_reduce(np.pad(img, ((0,pad[0]), (0,pad[1])), mode='reflect'),
+                                block_size=(dsstep, dsstep), func=self.blkrdc_func).astype(img.dtype)
+                        if save_img_coords: ds_img_coords[k,:,:] = oimg
                 else:
                     oimg = img
 
                 if tissue_masks:
-                    bw = self.tissue_mask_bw[x]
+                    bw = self.tissue_mask_bw[x] if not convert_hdf5s else img
                     if dsstep > rel_ds:
                         assert(dsstep % rel_ds == 0)
                         ds = dsstep // rel_ds
@@ -2220,9 +2332,13 @@ class wafer(region):
                         assert(rel_ds % dsstep == 0)
                         ds = rel_ds // dsstep
                         bw = block_construct(bw, ds)
-                    # paddings at different downsamplings can results in different sizes.
-                    # so, crop to the downsampled output image size.
-                    bw = bw[:oimg.shape[0], :oimg.shape[1]]
+                    if rel_ds != 1:
+                        assert(not crop_to_grid)
+                        # paddings at different downsamplings can results in different sizes.
+                        # so, crop to the downsampled output image size.
+                        bw = bw[:oimg.shape[0], :oimg.shape[1]]
+                    elif crop_to_grid:
+                        bw = bw[bcrop_min[1]:bcrop_max[1], bcrop_min[0]:bcrop_max[0]]
                     oimg = bw.astype(np.uint8) # convert to uint8 so that webknossos can cube it
 
                 if do_overlays:
@@ -2259,10 +2375,18 @@ class wafer(region):
                     cv2.circle(oimg, tuple(igrid_center.tolist()), 11, (0,255,0), -1)
 
                 if not save_h5 and (self.single_block or convert_hdf5s):
-                    _, ext = os.path.splitext(fn)
-                    ext = '' if ext == '.tiff' else '.tiff'
-                    tifffile.imwrite(fn + ext, oimg)
+                    bn, ext = os.path.splitext(fn)
+                    obn, ext = bn, '.tiff'
+                    for k in range(dsreps):
+                        if save_img_coords:
+                            oimg = ds_img_coords[k,:,:]
+                            obn = bn + '_' + dsstrs[k]
+                        tifffile.imwrite(obn + ext, oimg)
                 else:
+                    # if this block was cropped down to zero size, do not store image
+                    if oimg.size < 1: oimg = None
+                    # to save space, do not write image data along with coordinates along with xforms.
+                    if img_coords is not None: oimg = None
                     lock = not self.single_block
                     _, f1, f2 = big_img_save(h5fn, oimg, img_shape=img_shape, nblks=self.nblocks,
                             iblk=self.iblock, novlp_pix=self.block_overlap_pix, recreate=True, compression=True,
@@ -2271,11 +2395,21 @@ class wafer(region):
                         big_img_save(h5fn, bgsel, img_shape=img_shape, nblks=self.nblocks, iblk=self.iblock,
                             novlp_pix=self.block_overlap_pix, dataset='background', recreate=True, compression=True,
                             img_shape_blk=img_shape_blk, bcrop=bcrop, f1=f1, f2=f2)
+                    if img_coords is not None:
+                        # NOTE: do not crop the coordinate transforms, always keep full rough bounding box
+                        big_img_save(h5fn, img_coords[1,:], img_shape=img_shape_blk, nblks=self.nblocks,
+                            iblk=self.iblock, novlp_pix=self.block_overlap_pix, dataset='coords_x', recreate=True,
+                            compression=True, f1=f1, f2=f2)
+                        big_img_save(h5fn, img_coords[0,:], img_shape=img_shape_blk, nblks=self.nblocks,
+                            iblk=self.iblock, novlp_pix=self.block_overlap_pix, dataset='coords_y', recreate=True,
+                            compression=True, f1=f1, f2=f2)
+                        img_coords = None
                     if self.first_block and roi_points is not None:
-                        big_img_save(h5fn, roi_points, roi_points.shape, dataset='roi_points', recreate=True)
+                        big_img_save(h5fn, roi_points, roi_points.shape, dataset='roi_points', recreate=True,
+                            overwrite_dataset=True)
                     if lock: gpfs_file_unlock(f1,f2)
 
-                if save_roi_points:
+                if save_roi_points and roi_points is not None:
                     sfx, _ = os.path.splitext(suffix); sfx += '_region_coords.csv'
                     fn = os.path.join(outpath, self.wafer_strs[wafer_ind] + order_str + self.wafer_region_strs[x]+sfx)
                     np.savetxt(fn, roi_points/dsstep, delimiter=';')

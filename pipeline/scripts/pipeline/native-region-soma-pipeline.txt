@@ -1,0 +1,51 @@
+#name       deps       swarm                                part            nproc    ngpu  time pack   mroll maxr   s
+# xxx - possible bottleneck for full PB-scale datasets, might need to further memory optimize the balancing
+bal-mfov1   ,          run_regions-balance-mean-mfov        CPU/GPU/CPU-72c 3/7/5    0     4       0   1750
+# def_brightness_use_mode_ratio==False
+bal-mfov2   bal-mfov1  run_regions-balance-mean-mfov-pass2  CPU/GPU/CPU-72c 3/7/5    0     4       0   1750
+# def_brightness_use_mode_ratio==True
+#bal-mfov2   bal-mfov1  run_regions-balance-mean-mfov-pass2  CPU/GPU/CPU-72c 2/5/3    0     4       0   1750
+# xxx - tempting to further optimize the packing here, but you will encounter OOM for some datasets / sections
+#   likely culprit is the linear systems solver for the balancing, another possible bottleneck with 4nm?
+balance     bal-mfov2  run_regions-balance                  CPU/GPU/CPU-72c 4/8/6    0     4       0   1750
+iexport     balance    run_regions-export-init              CPU/GPU/CPU-72c 48/48/72 0     1       0   1750  875
+export      iexport    run_regions-export                   CPU/GPU/CPU-72c 48/48/72 0     2       1   1728  0    4/4/6
+# def_brightness_use_mode_ratio==True
+#export      iexport    run_regions-export                   CPU/GPU/CPU-72c 12/24/16 0     2       1   1728  1296 3/6/4
+
+# IMPORTANT: if there are torn slices, then you need to run tear correction export here
+#   these are copied from tear pipeline file, see comments there for additional information.
+#istitch     export           run_regions-stitch-tears-init   CPU/GPU/CPU-72c 48/48/72  0     1   0    0
+#stitch      istitch          run_regions-stitch-tears        CPU/GPU/CPU-72c 6/12/8    0     2   0    0
+## for large sections approaching 1 mm2
+##stitch      istitch          run_regions-stitch-tears        CPU/GPU/CPU-72c 1/2/1     0     2   0    0
+
+# for normal masks generated for the regions, workflow uses --iterate-ranges-split 128 128 ...
+# IMPORTANT: for native need to change tissue_mask_ds back to downsampled amount.
+#   the masks do not typically need to be reupsampled for the native fine export.
+masks       export     run_regions-save_masks               CPU/GPU/CPU-72c 48/48/72 0      1      0   0
+
+# For some workflows, do the brightness matching after the masks have been generated, but before contrast matching.
+# NOTE: if brightness matching was used before histo templates were generated, then for the native export it's
+#   far more efficient to only run the template sections. Create a backup of them first, then save the templates,
+#   then restore the backups for the template sections and run contrast matching on the whole dataset.
+#histos16    masks     run_regions-histos-ds16               CPU/GPU/CPU-72c 12/24/18 0      4      1   1728  1620 2/4/3
+#sbalance    histos16  run_regions-slice-balance             CPU/GPU/CPU-72c 1/1/1    0      4      0   0
+#ibright     sbalance  run_regions-brightness-init           CPU/GPU/CPU-72c 48/48/72 0      1      0   1750  875
+#bright      ibright   run_regions-slice-brightness-adjust   CPU/GPU/CPU-72c 4/8/6    0      2      0   1750
+
+# need to adjust either blocking or packing for different section sizes.
+# recommend not defining histos_ranges (so that each job is a single section).
+# without tissue masks
+#histos      masks      run_regions-histos                   CPU/GPU/CPU-72c 16/32/24 0      4      1   1728  1620 2/4/3
+# with tissue masks
+#histos      bright     run_regions-histos                   CPU/GPU/CPU-72c 12/24/18 0      4      1   1728  1620 2/4/3
+histos      masks      run_regions-histos                   CPU/GPU/CPU-72c 12/24/18 0      4      1   1728  1620 2/4/3
+# NOTE: this step needs to be run with logs enabled
+# This step is not needed unless a different template slice will be used for 4nm, typically not.
+#widths      histos     plot_regions-histo-width             CPU/GPU/CPU-72c 10/10/10 0      2      0   0
+# need to choose template(s) at this point (before running contrast step).
+# Typically just use the same template slice as was used for 16nm
+# look in workflow command file for "save the target histogram" to find the command.
+icontrast   histos     run_regions-contrast-init            CPU/GPU/CPU-72c 48/48/72 0      1      0   1750  875
+contrast    icontrast  run_regions-slice-contrast-match     CPU/GPU/CPU-72c 16/32/24 0      2      1   1728  0    2/4/3

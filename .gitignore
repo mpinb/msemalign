@@ -230,3 +230,6 @@ bin/
 
 # core dumps
 core
+
+# vscode
+.vscode/

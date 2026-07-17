@@ -26,7 +26,7 @@
 #   ValueError: threads > 1 requested, but pyFFTW was not built with multithreaded FFTW.
 # pyfftw is only used as one option for normxcorrs in _template_match, that in all recent tests is slower
 #   than the mkl-enabled ffts anyways.
-#use_python_311=1 # comment to install the previous working env using python 3.9
+use_python_311=1 # comment to install the previous working env using python 3.9
 if [[ -n "$use_python_311" ]]; then
 pyver=3.11
 use_pyfftw=pyfftw
@@ -51,26 +51,34 @@ fi
 # name of the environment to use.
 # WARNING: existing environment with this name is automatically deleted below.
 env_name=msem
-#env_name=msem-311
 
 # allow this script to use either conda or mamba
-conda=conda
-#conda=mamba
+#conda=conda
+conda=mamba
 
 # location of the root dir for the conda/mamba install.
-conda_dir=${HOME}/miniconda3
+#conda_dir=${HOME}/miniconda3
 #conda_dir=${HOME}/mambaforge
-#conda_dir=${HOME}/miniforge3
+conda_dir=${HOME}/miniforge3
 
 # CAUTION: automatically deletes existing env with same name
-${conda} env remove --name ${env_name}
+${conda} env remove -y --name ${env_name}
 
 # make an env specifically for the msem package.
 # NOTE: suggest not mixing conda base channel with condaforge,
 #   likely to experience dependency problems.
 # NOTE: needed to add intel channel for base install so that mkl
 #   and blas using mkl installs correctly and with more recent versions.
-${conda} create -y --name ${env_name} -c intel -c conda-forge python=${pyver} matplotlib scikit-learn scikit-learn-intelex imageio scikit-image sympy hdf5plugin mkl blas mkl-service mkl_fft mkl_random
+# NOTE: intel channel is foobar as of mid summer 2024:
+#   https://community.intel.com/t5/oneAPI-Registration-Download/Disappearance-of-intel-conda-chann
+#   Seems likely related to the anaconda license squeeze that started in 2024:
+#     https://www.theregister.com/2024/08/08/anaconda_puts_the_squeeze_on
+#${conda} create -y --name ${env_name} -c intel -c conda-forge python=${pyver} matplotlib scikit-learn scikit-learn-intelex imageio scikit-image sympy hdf5plugin mkl blas mkl-service mkl_fft mkl_random
+#${conda} create -y --name ${env_name} -c conda-forge python=${pyver} matplotlib scikit-learn scikit-learn-intelex imageio scikit-image sympy hdf5plugin mkl blas=*=*mkl* mkl-service mkl_fft mkl_random
+# https://github.com/scipy/scipy/issues/20357
+#${conda} create -y --name ${env_name} -c conda-forge python=${pyver} matplotlib scikit-learn scikit-learn-intelex imageio scikit-image sympy hdf5plugin mkl blas=*=*mkl* mkl-service mkl_fft mkl_random scipy=1.11.4
+# faiss 1.7.4 requires numpy < 2.0, mkl_fft interface changes after 1.3.11, sklearn broken with sklearnex after 1.6.1
+${conda} create -y --name ${env_name} -c conda-forge python=${pyver} matplotlib scikit-learn=1.6.1 scikit-learn-intelex imageio scikit-image sympy hdf5plugin mkl blas=*=*mkl* mkl-service mkl_fft=1.3.11 mkl_random numpy=1.26.4
 
 # activate the new env, conda activate does not work within bash scripts:
 #https://stackoverflow.com/questions/34534513/calling-conda-source-activate-from-bash-script
@@ -81,10 +89,18 @@ python --version
 # these are separated out of the initial conda create because
 #   they frequently have dependency compatibility issues.
 # ongoing MP issue with pyfftw: https://github.com/conda-forge/pyfftw-feedstock/issues/51
-${conda} install -y -c conda-forge ${use_pyfftw} cudatoolkit=11.8 faiss-gpu cupy ${rcc_conda}
+# faiss-gpu > 1.7.4 does not install properly from conda-forge,
+#   AttributeError: module 'faiss' has no attribute 'StandardGpuResources'
+#${conda} install -y -c conda-forge ${use_pyfftw} cudatoolkit=11.8 faiss-gpu cupy ${rcc_conda}
+${conda} install -y -c conda-forge ${use_pyfftw} cudatoolkit=11.8 faiss-gpu=1.7.4 cupy ${rcc_conda}
 
 # will get Qt errors without using opencv headless
-pip install opencv-contrib-python-headless tifffile dill ${use_aicspylibczi} scikit-fmm ${rcc_pip}
+#pip install opencv-contrib-python-headless tifffile dill ${use_aicspylibczi} scikit-fmm ${rcc_pip}
+# opencv version for numpy < 2
+pip install "opencv-contrib-python-headless==4.11.0.86" tifffile dill ${use_aicspylibczi} scikit-fmm ${rcc_pip}
+
+# install sslock for gpfs file locking and job completion reporting
+pip install git+ssh://git@github.com/mpinb/sslock.git
 
 if [[ -n "$install_rcc_xcorr" ]]; then
 # clone and install using local pip install with requirements commented out.

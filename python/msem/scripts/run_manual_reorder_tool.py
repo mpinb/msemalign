@@ -4,7 +4,7 @@
 Utility that assists in converting wafer orderings and excludes to / from
   a format that is easier to manually edit.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -26,6 +26,8 @@ import argparse
 import os
 import sys
 # import time
+
+from sslock import report_job_completed
 
 try:
     from def_common_params import get_paths, order_txt_fn_str, exclude_txt_fn_str, wafer_region_prefix_str
@@ -235,6 +237,7 @@ if len(wafer_region_ids_lookup) > 0 or len(region_zinds_lookup) > 0 or len(solve
     #for wafer_id, wafer_ind in zip(all_wafer_ids, range(nwafers)):
 
     if solved_zinds_nml[0]: annotation.save(solved_zinds_nml[0])
+    report_job_completed()
     sys.exit(0)
 # if len(wafer_region_ids_lookup) > 0 or len(region_zinds_lookup) > 0 or len(solved_zinds_lookup) > 0:
 
@@ -350,4 +353,4 @@ else: # if not write_order:
         prev_delim = delims[2*w+1] + 1
     #for wafer_id, w in zip(all_wafer_ids, range(nwafers)):
 
-print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+report_job_completed()

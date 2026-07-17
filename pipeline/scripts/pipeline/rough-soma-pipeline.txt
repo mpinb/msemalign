@@ -1,0 +1,30 @@
+#name       deps        swarm                                part             nproc     ngpu time pack mroll maxrun  s
+thumbs      ,           run_wafer-rough_export_thumbnails    CPU/GPU/CPU-72c  12/24/18  0     1   0    1750  1225
+# without masks
+keypoints   thumbs      run_wafer_solver-keypoints           CPU/GPU/CPU-72c  1/1/1     0     2   0    0
+# with masks
+#mthumbs     thumbs      run_wafer-rough_export_thumb_masks   CPU/GPU/CPU-72c  12/24/18  0     1   0    1750  1225
+#keypoints   mthumbs     run_wafer_solver-keypoints           CPU/GPU/CPU-72c  1/1/1     0     2   0    0
+
+affines0    keypoints   run_wafer_solver-affines_skip0       GPU              16        4     4    1   0
+maffines0   affines0    run_wafer_solver-merge_affines_skip0 CPU/GPU/CPU-72c  8/8/8     0     2    0   0
+writeseq0   maffines0   run_wafer_aggregator-status_skip0    CPU/GPU/CPU-72c  8/8/8     0     1    0   0
+
+# solved order, no rough alignment
+oexport     ,           run_wafer-rough_export_order         CPU/GPU/CPU-72c  12/24/18  0     1   0    1750  875
+moexport    oexport     run_wafer-rough_export_order_masks   CPU/GPU/CPU-72c  12/24/18  0     1   0    1750  875
+# no solved order, no rough alignment
+aexport     ,           run_wafer-acquisition_export         CPU/GPU/CPU-72c  12/24/18  0     1   0    1750  875
+maexport    aexport     run_wafer-acquisition_export_masks   CPU/GPU/CPU-72c  12/24/18  0     1   0    1750  875
+
+affines     keypoints   run_wafer_solver-affines_all_skips   GPU              16        4     4    1   0
+maffines    affines     run_wafer_solver-merge_affines_skips CPU/GPU/CPU-72c  6/12/8    0     2    0   0
+writeseq    maffines    run_wafer_aggregator-status          CPU/GPU/CPU-72c  6/12/8    0     1    0   0
+xaffines    maffines    run_wafer_solver-affines_xwafer      GPU              4         1     4    1   0
+recon       xaffines    run_wafer_aggregator-rough           CPU/GPU/CPU-72c  1/1/1     0     4    0   0
+mrecon      recon       run_wafer_aggregator-rough-merge     CPU/GPU/CPU-72c  1/1/1     0     4    0   0
+iexport     mrecon      run_wafer-rough_export_init          CPU/GPU/CPU-72c  48/48/72  0     1   0    1750  875
+export      iexport     run_wafer-rough_export               CPU/GPU/CPU-72c  48/48/72  0     2   1    1728  0    4/4/6
+
+# xxx - typically just cubing 16nm exports now then deleting the dataset after it's no longer necessary
+#dstiffs     export      run_wafer-rough_export_tiffs         CPU/GPU/CPU-72c  48/48/72  0     1   0    1750  875

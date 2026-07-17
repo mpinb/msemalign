@@ -4,7 +4,7 @@ Helper class for wafer class that aggregates solved rough and fine alignments.
 Alignments are computed between neighboring slices, so they need to be
   aggregated to create single "global" transforms for each slice.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -37,6 +37,7 @@ import scipy.sparse as sp
 import scipy.spatial as spatial
 #import scipy.interpolate as interp
 import scipy.ndimage as nd
+import scipy.linalg as lin
 
 # from sklearnex import patch_sklearn
 # patch_sklearn()
@@ -54,11 +55,11 @@ from .utils import get_num_threads, tile_nblks_to_ranges
 from .utils import mad_zscore, mad_angle_zscore
 from .utils import get_voronoi_circumcenters_from_delaunay_tri, get_voronoi_to_simplex_mapping
 from .utils import voronoi_vectors_to_point_vectors, mls_rigid_transform
-from .utils import dill_lock_and_load, dill_lock_and_dump, get_process_uuid
-from .utils import delta_interp_methods
+from .utils import get_process_uuid, delta_interp_methods
 from .utils import make_delta_plot #, make_grid_plot
 from .utils import big_img_load, big_img_save, big_img_info
 
+from sslock import dill_lock_and_load, dill_lock_and_dump, dill_init
 
 import multiprocessing as mp
 import queue
@@ -70,7 +71,8 @@ import queue
 # this is the main function for a single worker thread, so each voronoi vertex can be parallized independetly.
 def reconcile_deltas_job(n, ind, inds, simplices, neighbor_rng, nneighbors, pts_to_grid_pts, deltas, weights,
         valid_comparison, L1_norm, L2_norm, min_adj, regr_bias, voronoi_to_simplex, scale, voronoi_neighbors,
-        neighbors_std_pixels, neighbors_W, neighbors_expected, vertices, z_nnbrs_rad, result_queue, verbose):
+        neighbors_std_pixels, neighbors_W, neighbors_expected, vertices, z_nnbrs_rad, run_registration,
+        result_queue, verbose):
     if verbose: print('\tworker%d started' % (ind,))
     neighbors_var_pixels = neighbors_std_pixels*neighbors_std_pixels
 
@@ -103,8 +105,13 @@ def reconcile_deltas_job(n, ind, inds, simplices, neighbor_rng, nneighbors, pts_
         # originally just set these as zeros and let it broadcast.
         # with the option for a z neighborhood range (z_nnbrs > 0), this was no longer possible.
         vrdelta_default = np.zeros((nlocal_nbrs,2), dtype=np.double)
-        vcomps_sel_default = np.zeros((nlocal_nbrs,), dtype=bool)
-        vrdelta = vrdelta_default; vcomps_sel = vcomps_sel_default
+        if run_registration:
+            vcomps_sel_default = np.ones((nlocal_nbrs,), dtype=bool)
+            vrdelta = vrdelta_default.copy()
+        else:
+            vcomps_sel_default = np.zeros((nlocal_nbrs,), dtype=bool)
+            vrdelta = vrdelta_default
+        vcomps_sel = vcomps_sel_default
 
         # see http://qhull.org/html/qvoronoi.htm option Qz, point "at infinity"
         # ignore voronoi vertices with no simplex mapping. they do not define any voronoi regions.
@@ -186,6 +193,15 @@ def reconcile_deltas_job(n, ind, inds, simplices, neighbor_rng, nneighbors, pts_
                             # update the matrices that are sent to the solver.
                             ii = inbr*nlocal_nbrs+ilo; jj = inbr*nlocal_nbrs+jlo
                             W[jj,ii] = curW; adj[jj,ii] = 1; dx[jj,ii] = cdelta[0]; dy[jj,ii] = cdelta[1]
+
+                            if run_registration:
+                                # intent of this mode is to register the even images to the odd images
+                                if (i % 2 == 0) and (ik == 1):
+                                    vrdelta[i,:] -= cdelta/2
+                                    #vrdelta[i+1,:] += cdelta/2 # to align odd to even
+                                elif (i % 2 == 1) and (ik == 0):
+                                    vrdelta[i-1,:] += cdelta/2
+                                    #vrdelta[i,:] -= cdelta/2 # to align odd to even
                         #for inbr in range(nnbrs):
                     #for k,ik in zip(neighbor_rng, range(nneighbors)):
                 #for i,il in zip(range(zrng[0],zrng[1]), range(nlocal)):
@@ -242,7 +258,7 @@ def reconcile_deltas_job(n, ind, inds, simplices, neighbor_rng, nneighbors, pts_
                 #if nnbrs > 1:
 
                 #print(adj.shape, adj.nnz, nnbrs)
-                if adj.nnz >= min_adj:
+                if not run_registration and adj.nnz >= min_adj:
                     try:
                         vrdelta, _, vcomps_sel = mfov.solve_stitching(adj, dx, Dy=dy, W=W, label_adj_min=min_adj,
                                 return_comps_sel=True, l1_alpha=L1_norm, l2_alpha=L2_norm, regr_bias=regr_bias)
@@ -546,6 +562,10 @@ class wafer_aggregator(zimages):
         #assert( (grid_points.min(0) > [0,0]).all() ) # bad grid points
         #assert( (grid_points.max(0) < self.rough_bounding_box_size).all() ) # bad grid points
 
+        # kludgy mode to hijack the alignment to register two different alignments with each other
+        assert( not self.run_registration or all([x == 0 for x in z_nnbrs_rad]) ) # no z-nbhd with registration mode
+        assert( not self.run_registration or neighbors_radius_pixels == 0 ) # no grid-nbhd with registration mode
+
         # inits
         dln, vor, voronoi_to_simplex, voronoi_neighbors = self._triangulate_grid(neighbors_radius_pixels)
         n = self.total_nimgs
@@ -617,7 +637,8 @@ class wafer_aggregator(zimages):
                     args=(n, i, inds[i], dln.simplices, self.neighbor_rng, self.nneighbors,
                         pts_to_grid_pts, deltas, weights, valid_comparison, L1_norm, L2_norm, min_adj, regr_bias,
                         voronoi_to_simplex, scale, voronoi_neighbors, neighbors_std_pixels, neighbors_W,
-                        neighbors_expected, vor.vertices, z_nnbrs_rad, result_queue, self.wafer_aggregator_verbose))
+                        neighbors_expected, vor.vertices, z_nnbrs_rad, self.run_registration,
+                        result_queue, self.wafer_aggregator_verbose))
             workers[i].start()
         # NOTE: only call join after queue is emptied
         # https://stackoverflow.com/questions/45948463/python-multiprocessing-join-deadlock-depends-on-worker-function
@@ -697,6 +718,8 @@ class wafer_aggregator(zimages):
         self.neighbor_rng = [x for x in range(-self.neighbor_range,self.neighbor_range+1) if x != 0]
         self.nneighbors = len(self.neighbor_rng)
         self.single_block = True # xxx - do we need block processing for rough alignment?
+
+        assert( not self.run_registration or self.neighbor_range == 1 ) # no multiple neighbors for registration
 
         # rough alignment grid locations.
         # need some minimum number of points on a grid that covers the rough_bounding_box.
@@ -866,23 +889,27 @@ class wafer_aggregator(zimages):
             i_slice = self.solved_orders[i_wafer_ind][i_ind]
             #i_wafer_id = self.wafer_ids[i_wafer_ind]
 
-            # remove any grid points that were not nearby any original sift points before fitting affine.
-            pts_sel = np.zeros((self.ngrid,), dtype=bool)
-            for k,ik in zip(self.neighbor_rng, range(self.nneighbors)):
-                if self.all_pts_src[i][ik] is None: continue
-                knbrs = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(self.all_pts_src[i][ik])
-                kdist, _ = knbrs.kneighbors(self.grid_locations_pixels, return_distance=True)
-                pts_sel = np.logical_or(pts_sel, kdist.reshape(-1) < rough_distance_cutoff_pixels)
+            if rough_distance_cutoff_pixels > 0:
+                # remove any grid points that were not nearby any original sift points before fitting affine.
+                pts_sel = np.zeros((self.ngrid,), dtype=bool)
+                for k,ik in zip(self.neighbor_rng, range(self.nneighbors)):
+                    if self.all_pts_src[i][ik] is None: continue
+                    knbrs = NearestNeighbors(n_neighbors=1, algorithm='kd_tree').fit(self.all_pts_src[i][ik])
+                    kdist, _ = knbrs.kneighbors(self.grid_locations_pixels, return_distance=True)
+                    pts_sel = np.logical_or(pts_sel, kdist.reshape(-1) < rough_distance_cutoff_pixels)
+            else:
+                pts_sel = np.ones((self.ngrid,), dtype=bool)
 
-            #if pts_sel.sum() <= 12:
-            #    i_wafer_id = self.wafer_ids[i_wafer_ind]
-            #    i_slice_str = self.region_strs[i_wafer_ind][self.solved_orders[i_wafer_ind][i_ind]]
-            #    print('\nProcessing total order ind %d' % (i,))
-            #    print('\tind %d slice %s wafer %d, sel pts %d' % (i_ind, i_slice_str, i_wafer_id, pts_sel.sum()))
-            #    make_delta_plot(self.grid_locations_pixels, deltas=self.cum_deltas[i,:,:], grid_sel_r=pts_sel)
-            #    plt.show()
-            #    continue
             assert(pts_sel.sum() > 12) # not enough grid points nearby
+            if pts_sel.sum() <= 12:
+                i_wafer_id = self.wafer_ids[i_wafer_ind]
+                i_slice_str = self.region_strs[i_wafer_ind][self.solved_orders[i_wafer_ind][i_ind]]
+                print('\nProcessing total order ind %d' % (i,))
+                print('\tind %d slice %s wafer %d, sel pts %d' % (i_ind, i_slice_str, i_wafer_id, pts_sel.sum()))
+                #make_delta_plot(self.grid_locations_pixels, deltas=self.cum_deltas[i,:,:], grid_sel_r=pts_sel)
+                #plt.show()
+                #continue
+                assert(False) # not enough grid points nearby
 
             grid_pts_dst = self.grid_locations_pixels[pts_sel,:] + self.cum_deltas[i,pts_sel,:]
             clf.fit(grid_pts_src[pts_sel,:], grid_pts_dst)
@@ -895,19 +922,26 @@ class wafer_aggregator(zimages):
             # also fit rigid affines, translation and rotation only
             clf_rigid.fit(self.grid_locations_pixels[pts_sel,:], grid_pts_dst)
 
+            if (self.cum_deltas[i,pts_sel,:] == 0).all():
+                # xxx - all zero deltas realisitically only happens during registration mode.
+                #   better way to deal with it?
+                caffine = caffine_rigid = np.identity(3, dtype=caffine.dtype)
+            else:
+                caffine_rigid = clf_rigid.coef_
+
             # save current affine for the wafer and over all wafers.
             A = self.wafers_imaged_order_rough_affines[i_wafer_ind][i_slice]
             if A is None:
                 self.wafers_imaged_order_rough_affines[i_wafer_ind][i_slice] = caffine
                 self.cum_affines[i] = caffine
-                self.wafers_imaged_order_rough_rigid_affines[i_wafer_ind][i_slice] = clf_rigid.coef_.copy()
-                self.cum_rigid_affines[i] = clf_rigid.coef_.copy()
+                self.wafers_imaged_order_rough_rigid_affines[i_wafer_ind][i_slice] = caffine_rigid.copy()
+                self.cum_rigid_affines[i] = caffine_rigid.copy()
             else:
                 # apply the affine on top of an existing affine
                 B = np.dot(caffine, A)
                 self.wafers_imaged_order_rough_affines[i_wafer_ind][i_slice] = B
                 self.cum_affines[i] = B
-                B = np.dot(clf_rigid.coef_, A)
+                B = np.dot(caffine_rigid, A)
                 self.wafers_imaged_order_rough_rigid_affines[i_wafer_ind][i_slice] = B
                 self.cum_rigid_affines[i] = B
 
@@ -1375,12 +1409,10 @@ class wafer_aggregator(zimages):
                         #pfn += '.{}'.format(self.iblock[0]) # store in separate dirs instead
                         fn = os.path.join(dfn, pfn)
                     if update_type == 'block-init' and not os.path.isfile(fn):
-                        # block-init should not be process parallelized, so only one process per dill file
-                        os.makedirs(dfn, exist_ok=True)
-                        with open(fn, 'wb') as f: dill.dump({}, f)
+                        dill_init(fn)
 
                 # dills can be updated by multiple processes
-                d, f1, f2 = dill_lock_and_load(fn, keep_locks=True)
+                d, f1, f2 = dill_lock_and_load(fn, keep_locks=True, lock_same_file=False)
 
                 # save the current outlier/processed deltas in the last crop index specified.
                 key_str = 'crop{}-skip{}-{}'.format(self.range_crops-1, ak-1, direction_str)
@@ -1424,7 +1456,7 @@ class wafer_aggregator(zimages):
                     subd['weights'] = all_weights
                     subd['valid_comparison'] = valid_comparison
                 elif update_type=='filtered_deltas':
-                    d[key_str]['wafer_grid_filtered_deltas'] = self.filtered_deltas[i,ik,:,:]
+                    d[key_str]['wafer_grid_filtered_deltas'] = self.filtered_deltas[i][ik,:,:]
                 elif update_type=='interpolated_deltas':
                     if self.single_block:
                         d[key_str]['wafer_grid_interp_deltas'] = self.fine_interp_deltas[i][ik,:,:]
@@ -1450,7 +1482,7 @@ class wafer_aggregator(zimages):
                 #update_type select
 
                 # dills can be updated by multiple processes
-                dill_lock_and_dump(fn, d, f1, f2)
+                dill_lock_and_dump(fn, d, f1, f2, lock_same_file=False)
             #for k,ik in zip(self.neighbor_rng, range(self.nneighbors)):
         #for i in range(self.img_range[0],self.img_range[1]):
     #def update_fine(self,
@@ -2277,13 +2309,7 @@ class wafer_aggregator(zimages):
             print('\tdone in %.4f s' % (time.time() - t, ))
     #def interpolate_fine_outliers(self):
 
-    def fine_deltas_to_rough_affines(self, use_interp_points=False, cutoff_to_fit=0.):
-        if self.wafer_aggregator_verbose:
-            print('Fine inlier affine fits, ngrid points {}, img range {}-{}'.format(self.ngrid,
-                self.img_range[0],self.img_range[1]))
-            t = time.time()
-
-        # inits affines and points
+    def init_rough_affines(self):
         self.forward_affines = [None]*self.nwafer_ids; self.reverse_affines = [None]*self.nwafer_ids
         self.forward_pts_src = [None]*self.nwafer_ids; self.reverse_pts_src = [None]*self.nwafer_ids
         self.forward_pts_dst = [None]*self.nwafer_ids; self.reverse_pts_dst = [None]*self.nwafer_ids
@@ -2294,6 +2320,14 @@ class wafer_aggregator(zimages):
             self.reverse_pts_src[i] = [[None]*self.wafers_nimgs[i] for x in range(self.max_neighbor_range)]
             self.forward_pts_dst[i] = [[None]*self.wafers_nimgs[i] for x in range(self.max_neighbor_range)]
             self.reverse_pts_dst[i] = [[None]*self.wafers_nimgs[i] for x in range(self.max_neighbor_range)]
+
+    def fine_deltas_to_rough_affines(self, use_interp_points=False, cutoff_to_fit=0.):
+        if self.wafer_aggregator_verbose:
+            print('Fine inlier affine fits, ngrid points {}, img range {}-{}'.format(self.ngrid,
+                self.img_range[0],self.img_range[1]))
+            t = time.time()
+
+        self.init_rough_affines()
 
         # turn the fine delta inliers into affine transformations to be applied to each slice.
         # these can be exported in the same format as rough deltas
@@ -2451,13 +2485,16 @@ class wafer_aggregator(zimages):
         #
         #     self.imaged_order_deltas[i_wafer_ind][i_slice] = self.cum_deltas[i,:,:]
 
-    def fine_deltas_affine_filter(self, shape_pixels, affine_degree=1, use_interp_points=False,
-            affine_interpolation=False, output_features_scale=None, doplots=False, dosave_path=''):
+    def fine_deltas_affine_filter(self, shape_pixels, affine_degree=1, use_interp_points=False, affine_adjust=False,
+            affine_interpolation=False, output_features_scale=None, doplots=False, dosave_path='',
+            use_affine_adjusted=False, verbose_iterations=None):
         assert( not use_interp_points or not affine_interpolation ) # do not use these features together
+        assert( not (affine_adjust and use_affine_adjusted) ) # affine adjust can not use affined adjusted
+        if verbose_iterations is None: verbose_iterations = self.verbose_iterations
         if self.wafer_aggregator_verbose:
-            print('{} fine deltas with affine filter, ngrid points {}, img range {}-{}'.format(\
-                'Interpolating' if affine_interpolation else 'Filtering', self.ngrid,
-                self.img_range[0],self.img_range[1]))
+            print('{} fine deltas with affine filter, ngrid points {}, img range {}-{}'.format(
+                'Interpolating' if affine_interpolation else ('Adjust' if affine_adjust else 'Filtering'),
+                self.ngrid, self.img_range[0],self.img_range[1]))
             print('Filter pixel shape {} x {}'.format(shape_pixels[0], shape_pixels[1]))
             t = time.time()
 
@@ -2486,15 +2523,20 @@ class wafer_aggregator(zimages):
         if affine_interpolation:
             self.fine_interp_deltas = [None]*self.total_nimgs
             self.fine_interp_weights = [None]*self.total_nimgs
-        else:
-            # output of this function, the "affine-filtered" deltas
-            self.filtered_deltas = np.zeros((self.total_nimgs,self.nneighbors,ngrid,2), dtype=np.double)
+        elif affine_adjust or not use_affine_adjusted:
+            # output of this function, the "affine-filtered" deltas.
+            # do not re-init when using affine adjusted deltas because
+            #   the adjusted deltas are stored in self.filtered_deltas (!)
+            self.filtered_deltas = [None]*self.total_nimgs
 
         # iterate the fine deltas and fit local regions with affines.
         # use the local affine fitted deltas as the new delta at each point, an "affine filter"
         poly = preprocessing.PolynomialFeatures(degree=affine_degree)
         poly.fit_transform(np.random.rand(3,2)) # just so features are populated for 2D
         clf = linear_model.LinearRegression(fit_intercept=False, copy_X=False, n_jobs=self.nthreads)
+
+        if affine_adjust:
+            grid_pts_src = preprocessing.PolynomialFeatures(degree=1).fit_transform(self.grid_locations_pixels)
 
         # outer loop over slices, fits are done independently over slices and skips
         #for i in range(self.total_nimgs):
@@ -2503,6 +2545,8 @@ class wafer_aggregator(zimages):
                 self.fine_interp_deltas[i] = np.empty((self.nneighbors,ngrid,2), dtype=np.double)
                 self.fine_interp_deltas[i].fill(np.nan)
                 self.fine_interp_weights[i] = np.zeros((self.nneighbors,ngrid), dtype=np.double)
+            elif affine_adjust or not use_affine_adjusted:
+                self.filtered_deltas[i] = np.zeros((self.nneighbors,ngrid,2), dtype=np.double)
 
             i_wafer_ind = np.nonzero(i / self.cum_wafers_nimgs[1:] < 1.)[0][0]
             i_ind = (i - self.cum_wafers_nimgs[i_wafer_ind]) % self.wafers_nimgs[i_wafer_ind]
@@ -2519,7 +2563,7 @@ class wafer_aggregator(zimages):
 
                 if not self.fine_valid_comparison[i,ik]: continue
 
-                if self.verbose_iterations:
+                if verbose_iterations:
                     print('\nProcessing total order ind %d' % (i,))
                     print('\tind %d slice %s wafer %d, compare to offset %d, ind %d slice %s wafer %d' % \
                           (i_ind, i_slice_str, i_wafer_id, k, j_ind, j_slice_str, j_wafer_id))
@@ -2534,52 +2578,78 @@ class wafer_aggregator(zimages):
                     cexcluded = np.logical_not(self.xcorrs[i][ik,:])
                     cinliers[cexcluded] = 0
 
-                for g in range(ngrid):
-                    if affine_interpolation:
-                        # for interpolation mode, skip points outside polygon.
-                        # "partially process" inliers, but only to remove inliers with very few inlier
-                        #   deltas within the affine filter shape (shape_pixels).
-                        if cexcluded[g]: continue
-                    else:
-                        # do not filter outlier points in normal mode, but fill in in interpolation mode
-                        if not cinliers[g]: continue
-                    sel_pts = np.logical_and(\
-                            grid_pts >= grid_pts[g,:]-shape_pixels/2,
-                            grid_pts <= grid_pts[g,:]+shape_pixels/2).all(1)
-                    sel_pts = np.logical_and(sel_pts, cinliers)
-
-                    # if there are not enough points to fit the affine
-                    if sel_pts.sum() < int(poly.n_output_features_*output_features_scale):
+                if affine_adjust:
+                    # this is a mode for running a fine alignment on top of the same cross correlations that
+                    #   were computed and used for a fine-to-rough alignment. because the affines are rigid,
+                    #   it prevents an expensive recomputation of all the cross correlations.
+                    # affines computed for images, use inverse affine for the points
+                    aff_i, aff_j = lin.inv(self.cum_affines[i]), lin.inv(self.cum_affines[j])
+                    # scikit learn puts constant terms on the left, remove augment and flip
+                    aff_i = np.concatenate( (aff_i[:2,2][:,None], aff_i[:2,:2], ), axis=1 )
+                    aff_j = np.concatenate( (aff_j[:2,2][:,None], aff_j[:2,:2], ), axis=1 )
+                    xpts_i = np.dot(grid_pts_src[cinliers,:], aff_i.T)
+                    xpts_j = np.dot(grid_pts_src[cinliers,:], aff_j.T)
+                    # xxx - the bane of the direction of the deltas
+                    # for future reference, the next time you invariably confuse this, the deltas are
+                    #   computed with the neighbor as the source and current index as the dest, i.e., the
+                    #   delta is that required so that the neighbor image mathes the current index image.
+                    #xpts_src, xpts_dst = xpts_i, xpts_j # WRONG!
+                    xpts_src, xpts_dst = xpts_j, xpts_i
+                    xdeltas = self.deltas[i][ik,cinliers,:] + (xpts_dst - xpts_src)
+                    # interpolate the deltas at the original grid positions, based on transformed grid positions
+                    p = xpts_src; v = xdeltas; ip = grid_pts[cinliers,:]
+                    f_v = mls_rigid_transform(ip, p, p+v)
+                    self.filtered_deltas[i][ik,cinliers,:] = f_v - ip
+                else: # if affine_adjust:
+                    for g in range(ngrid):
                         if affine_interpolation:
-                            if cinliers[g]:
-                                # xxx - hacky, when loaded for aggregation, allows for a "second-round"
-                                #   of outlier removal. mostly added this here to avoid having to rerun
-                                #   a long outlier detection step for the ultrafine alignment.
-                                self.fine_interp_weights[i][ik,g] = -1.
-                                #print('WARNING: at grid point {}, only {} inliers'.format(g,sel_pts.sum()))
+                            # for interpolation mode, skip points outside polygon.
+                            # "partially process" inliers, but only to remove inliers with very few inlier
+                            #   deltas within the affine filter shape (shape_pixels).
+                            if cexcluded[g]: continue
                         else:
-                            print('WARNING: at grid point {}, only {} inliers'.format(g,sel_pts.sum()))
-                            print('Your filter size might be too small relative to the point spacing')
-                            # better to leave the delta at zero, or to copy the original?
-                            #self.filtered_deltas[i,ik,g,:] = self.deltas[i,ik,g,:]
-                            assert(False) # with MLS interp should not happen
-                        continue
-                    # no further processing in interpolation mode for inlier points
-                    if affine_interpolation and cinliers[g]: continue
+                            # do not filter outlier points in normal mode, but fill in in interpolation mode
+                            if not cinliers[g]: continue
+                        sel_pts = np.logical_and(\
+                                grid_pts >= grid_pts[g,:]-shape_pixels/2,
+                                grid_pts <= grid_pts[g,:]+shape_pixels/2).all(1)
+                        sel_pts = np.logical_and(sel_pts, cinliers)
 
-                    # fit the affine and use it to estimate the current point ("affine-filter")
-                    cgrid_pts = grid_pts[sel_pts,:]
-                    cgrid_pts_dst = cgrid_pts + self.deltas[i][ik,sel_pts,:]
-                    cgrid_pts_src = poly.fit_transform(cgrid_pts)
+                        # if there are not enough points to fit the affine
+                        if sel_pts.sum() < int(poly.n_output_features_*output_features_scale):
+                            if affine_interpolation:
+                                if cinliers[g]:
+                                    # xxx - hacky, when loaded for aggregation, allows for a "second-round"
+                                    #   of outlier removal. mostly added this here to avoid having to rerun
+                                    #   a long outlier detection step for the ultrafine alignment.
+                                    self.fine_interp_weights[i][ik,g] = -1.
+                                    #print('WARNING: at grid point {}, only {} inliers'.format(g,sel_pts.sum()))
+                            else:
+                                print('WARNING: at grid point {}, only {} inliers'.format(g,sel_pts.sum()))
+                                print('Your filter size might be too small relative to the point spacing')
+                                assert(False) # with MLS interp should not happen
+                            continue
+                        # no further processing in interpolation mode for inlier points
+                        if affine_interpolation and cinliers[g]: continue
 
-                    clf.fit(cgrid_pts_src, cgrid_pts_dst)
-                    fit_pt = clf.predict(poly.fit_transform(grid_pts[g,:][None,:]))
-                    if affine_interpolation:
-                        # replace with the interpolated points
-                        self.fine_interp_deltas[i][ik,g,:] = fit_pt - grid_pts[g,:]
-                    else:
-                        self.filtered_deltas[i,ik,g,:] = fit_pt - grid_pts[g,:]
-                #for g in range(ngrid):
+                        # fit the affine and use it to estimate the current point ("affine-filter")
+                        cgrid_pts = grid_pts[sel_pts,:]
+                        if use_affine_adjusted:
+                            # the affine adjust deltas are saved into self.filtered_deltas
+                            cgrid_pts_dst = cgrid_pts + self.filtered_deltas[i][ik,sel_pts,:]
+                        else:
+                            cgrid_pts_dst = cgrid_pts + self.deltas[i][ik,sel_pts,:]
+                        cgrid_pts_src = poly.fit_transform(cgrid_pts)
+
+                        clf.fit(cgrid_pts_src, cgrid_pts_dst)
+                        fit_pt = clf.predict(poly.fit_transform(grid_pts[g,:][None,:]))
+                        if affine_interpolation:
+                            # replace with the interpolated points
+                            self.fine_interp_deltas[i][ik,g,:] = fit_pt - grid_pts[g,:]
+                        else:
+                            self.filtered_deltas[i][ik,g,:] = fit_pt - grid_pts[g,:]
+                    #for g in range(ngrid):
+                #else: # if affine_adjust:
 
                 if doplots:
                     pn = os.path.join(dosave_path, 'outliers_interp-filter')
@@ -2593,7 +2663,7 @@ class wafer_aggregator(zimages):
                     sel_outliers = self.all_fine_outliers[i][-1][ik]
                     cexcluded = np.logical_not(self.xcorrs[i][ik,:])
                     make_delta_plot(grid_pts, deltas=d, figno=10, grid_sel_b=cexcluded, grid_sel_r=sel_outliers)
-                    d = self.filtered_deltas[i,ik,:,:].copy()
+                    d = self.filtered_deltas[i][ik,:,:].copy()
                     make_delta_plot(grid_pts, deltas=d, figno=10, overlay=True, quiver_color='g')
                     if dosave_path: plt.savefig(bfn + '_red-outliers_blue-excl_black-deltas_green-filtered' + ext)
 
@@ -2683,62 +2753,3 @@ class wafer_aggregator(zimages):
         if self.wafer_aggregator_verbose:
             print('\tdone in %.4f s' % (time.time() - t, ))
     #def solved_deltas_affine_filter(self):
-
-# xxx - maybe remove? decided it makes more sense to convert the actual deltas to affines in the same
-#   format as the rough affines (calculated on SIFT features) and then rerun the rough reconciler,
-#   instead of this, which is simply to fit the solved fine alignment with an affine transformation.
-#     def fine_solved_deltas_to_rough_affines(self, affine_degree=1):
-#         if self.wafer_aggregator_verbose:
-#             print('Affine fitting solved fine deltas, ngrid points {}, img range {}-{}'.format(self.ngrid,
-#                 self.img_range[0],self.img_range[1]))
-#             t = time.time()
-#
-#         # inits
-#         if self.wafers_imaged_order_rough_affines is None:
-#             self.wafers_imaged_order_rough_affines = [None]*self.nwafer_ids
-#             for i in range(self.nwafer_ids):
-#                 self.wafers_imaged_order_rough_affines[i] = [None]*self.wafers_nregions[i]
-#         self.cum_affines = [None]*self.total_nimgs
-#         poly = preprocessing.PolynomialFeatures(degree=affine_degree)
-#         poly.fit_transform(np.random.rand(3,2)) # just so features are populated for 2D
-#         clf = linear_model.LinearRegression(fit_intercept=False, copy_X=False, n_jobs=self.nthreads)
-#
-#         for i in range(self.img_range[0],self.img_range[1]):
-#             i_wafer_ind = np.nonzero(i / self.cum_wafers_nimgs[1:] < 1.)[0][0]
-#             i_ind = (i - self.cum_wafers_nimgs[i_wafer_ind]) % self.wafers_nimgs[i_wafer_ind]
-#             i_slice = self.solved_orders[i_wafer_ind][i_ind]
-#             #i_wafer_id = self.wafer_ids[i_wafer_ind]
-#
-#             cinliers = self.cum_comps_sel[i,:]
-#             #assert(cinliers.sum() > poly.n_output_features_+1) # not enough inlier grid points
-#             assert(cinliers.sum() > 2*poly.n_output_features_) # not enough inlier grid points
-#
-#             # affines calculated on the points are the inverse of those for the images.
-#             cgrid_pts_dst = self.grid_locations_pixels[cinliers,:]
-#             cgrid_pts = cgrid_pts_dst + self.cum_deltas[i,cinliers,:]
-#             cgrid_pts_src = poly.fit_transform(cgrid_pts)
-#
-#             # fit the affines
-#             clf.fit(cgrid_pts_src, cgrid_pts_dst)
-#             # scikit learn puts constant terms on the left, flip and augment
-#             caffine = clf.coef_
-#             caffine = np.concatenate( (np.concatenate( (caffine[:,1:], caffine[:,0][:,None]), axis=1 ),
-#                                        np.zeros((1,3), dtype=caffine.dtype)), axis=0 )
-#             caffine[2,2] = 1
-#
-#             # save current affine for the wafer and over all wafers.
-#             A = self.wafers_imaged_order_rough_affines[i_wafer_ind][i_slice]
-#             if A is None:
-#                 self.wafers_imaged_order_rough_affines[i_wafer_ind][i_slice] = caffine
-#                 self.cum_affines[i] = caffine
-#             else:
-#                 # apply the affine on top of an existing affine
-#                 B = np.dot(caffine, A)
-#                 self.wafers_imaged_order_rough_affines[i_wafer_ind][i_slice] = B
-#                 self.cum_affines[i] = B
-#
-#         #for i in range(self.img_range[0],self.img_range[1]):
-#
-#         if self.wafer_aggregator_verbose:
-#             print('\tdone in %.4f s' % (time.time() - t, ))
-#     #def fine_solved_deltas_to_rough_affines(self):

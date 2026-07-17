@@ -1,0 +1,18 @@
+#name       deps        swarm                                part             nproc     ngpu time pack mroll maxrun
+thumbs      ,           run_wafer-rough_export_thumbnails    CPU/GPU/CPU-72c  12/24/18  0    0    -1   1750  1225
+# without masks
+keypoints   thumbs      run_wafer_solver-keypoints           CPU/GPU/CPU-72c  1/1/1     0    0    -1   0
+# with masks
+#mthumbs     thumbs      run_wafer-rough_export_thumb_masks   CPU/GPU/CPU-72c  12/24/18  0     0   -1   1750  1225
+#keypoints   mthumbs     run_wafer_solver-keypoints           CPU/GPU/CPU-72c  1/1/1     0     0   -1   0
+
+# xxx - matches consistently throws 1 or 2 unexplainable failure jobs that just exit with no error message
+#   recommned not running through matches because very high chance it will need the error reruns
+#   was so far unable to debug what causes this, started sometime around adding ransac to the matches computation
+#   the reruns always run successfully, so it is an intermittent problem; the logs are useless
+matches     keypoints   run_wafer_solver-matches             GPU              1         4    0     1   0
+mmatches    matches     run_wafer_solver-matches-merge       CPU/GPU/CPU-72c  8/8/8     0    0     0   0
+solve       mmatches    run_wafer_solver-solve               CPU/GPU/CPU-72c  8/8/8     0    0     0   0
+affines0    solve       run_wafer_solver-affines_skip0       GPU              16        4    0     1   0
+maffines0   affines0    run_wafer_solver-merge_affines_skip0 CPU/GPU/CPU-72c  8/8/8     0    0     0   0
+writeseq0   maffines0   run_wafer_aggregator-status_skip0    CPU/GPU/CPU-72c  8/8/8     0    0     0   0

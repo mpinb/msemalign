@@ -1,0 +1,5 @@
+#name       deps             swarm                               part            nproc    ngpu  time pack    mroll maxr
+# this could theoretically be merged in with region0 pipeline file, but it also serves as an initial indication
+#   that none of the image data is corrupted, so decided to keep it as a completely separate pipeline file.
+# jobs are heavily IO limited, diminishing returns somewhere around 1500-2000 simultaneously running jobs
+down        ,                run_downsample_wafer-downsample     CPU/GPU/CPU-72c 12/12/18 0     0       0    1750  875

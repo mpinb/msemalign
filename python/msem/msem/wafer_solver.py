@@ -6,7 +6,7 @@ These are the components of the "rough alignment", order solving and computing
   rigid or affine transformations for each slice, imporoving dramatically
   on the "microscope" alignment, but without applying any elastic warping.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -66,7 +66,7 @@ import matplotlib.patches as patches
 import matplotlib.gridspec as gridspec
 from matplotlib.path import Path
 
-from .utils import get_num_threads, PolyCentroid, nsd
+from .utils import get_num_threads, PolyCentroid, nsd, block_construct, pad_to_match
 from .zimages import zimages
 from .AffineRANSACRegressor import AffineRANSACRegressor, _ransac_repeat
 from .procrustes import RigidRegression_types
@@ -79,15 +79,18 @@ import queue
 SIFT_descriptor_dtype = np.float32
 SIFT_descriptor_ndims = 256
 
-def compute_keypoints_job(nfeatures, nthreads_per_job, ind, inds, imgs, result_queue, polygons, custom_polygon,
+def compute_keypoints_job(sift_args, nthreads_per_job, ind, inds, imgs, result_queue, polygons, custom_polygon,
         masks, mask_ds, filter_size, rescale, min_features, sample_p, verbose):
     if verbose: print('\tworker%d started' % (ind, ))
     cv2.setNumThreads(nthreads_per_job)
-    # Initiate SIFT detector
-    if nfeatures is not None:
-        sift = cv2.SIFT_create(nfeatures=nfeatures)
+    if 'nfeatures' in sift_args:
+        # nfeatures as a sift argument does a lot more pruning than just capping the number of features.
+        # instead use it to just cap the number of features.
+        nfeatures = sift_args['nfeatures']
+        del sift_args['nfeatures']
     else:
-        sift = cv2.SIFT_create()
+        nfeatures = None
+    sift = cv2.SIFT_create(**sift_args)
 
     nimgs = len(imgs) #; dt = time.time()
     for i in range(nimgs):
@@ -105,16 +108,35 @@ def compute_keypoints_job(nfeatures, nthreads_per_job, ind, inds, imgs, result_q
             # non-optional preprocessing, SIFT only works on 8 bit grayscale images (at least in cv2).
             if pimg.dtype != np.uint8: pimg = img_as_ubyte(pimg)
 
+            umask = None
+            if masks[i] is not None:
+                if mask_ds > 1:
+                    #if verbose: print('Upsampling mask {}'.format(mask_ds)); t = time.time()
+                    #if verbose: print('bw tm is {}x{}'.format(masks[i].shape[1],masks[i].shape[0]))
+                    #if verbose: print('img is {}x{}'.format(pimg.shape[1],pimg.shape[0]))
+                    umask = pad_to_match(block_construct(masks[i], mask_ds).astype(np.uint8, copy=False), pimg)
+                    #if verbose: print('\tdone upsampling in %.4f s' % (time.time() - t, ))
+                    #if verbose: print('bw tm is {}x{}'.format(umask.shape[1],umask.shape[0]))
+                else:
+                    umask = masks[i].astype(np.uint8)
+                # need to crop after upsampling because of padding for downsampling
+                umask = umask[:pimg.shape[0], :pimg.shape[1]]
+                assert( umask.shape == pimg.shape )
+
             # find the keypoints and descriptors with SIFT
             # do not add a try here, whatever the issue is, it should be dealt with before moving on.
             #   for example a blank image, an out-of-memory error, etc.
-            keypoints, descriptors = sift.detectAndCompute(pimg,None)
+            keypoints, descriptors = sift.detectAndCompute(pimg, umask)
+            assert(len(keypoints) > 0) # something is wrong, maybe wrong mask ds set?
 
             # normalizing makes l2 distance the same as cosine distance, xxx - this seems to give worse result
             #d = self.wafer_descriptors[i]; self.wafer_descriptors[i] = d / np.linalg.norm(d, axis=1)[:,None]
 
             mask = pmask = None
             if masks[i] is not None:
+                # xxx - this is most likely redundant because detectAndCompute call was modified
+                #   to take the masks directly. decided it was not worth trying to remove it.
+                #   relatively fast and does not hurt anything.
                 ipts = np.round(np.array([x.pt for x in keypoints]) / mask_ds).astype(np.int64)
                 # round can put some points over the max
                 ipts[ipts[:,0] == masks[i].shape[1],0] = masks[i].shape[1]-1
@@ -150,6 +172,12 @@ def compute_keypoints_job(nfeatures, nthreads_per_job, ind, inds, imgs, result_q
                 #     descriptors = descriptors[mask,:]
                 keypoints = tmp
                 descriptors = descriptors[mask,:]
+
+            # use nfeatures to just cap the number of features after sorting by salience. claude generated
+            if nfeatures is not None and len(keypoints) > nfeatures:
+                order = sorted(range(len(keypoints)), key=lambda i: keypoints[i].response, reverse=True)[:nfeatures]
+                keypoints = [keypoints[i] for i in order]
+                descriptors = descriptors[order]
 
             # https://stackoverflow.com/questions/10045363/pickling-cv2-keypoint-causes-picklingerror
             # this is needed for saving to dill file, but also can not insert the keypoints into the
@@ -243,7 +271,6 @@ class wafer_solver(zimages):
 
     ### fixed parameters not exposed
 
-    #CONCORDE_EXE = os.path.expanduser('~/projects/concorde_tsp/concorde/build/TSP/concorde')
     CONCORDE_EXE = os.path.expanduser('~/gits/concorde_tsp/concorde/build/TSP/concorde')
 
     # so that this can be consistent across whole msem package using env variable.
@@ -571,6 +598,9 @@ class wafer_solver(zimages):
                             if add.size > 0:
                                 bw[np.isin(labels, add)] = 1
 
+                    if self.wafer.tissue_mask_bwdist > 0:
+                        bw = (nd.distance_transform_edt(np.logical_not(bw)) < self.wafer.tissue_mask_bwdist)
+
                     self.wafer_tissue_masks[i] = bw
 
                     doplots = False
@@ -603,8 +633,8 @@ class wafer_solver(zimages):
                         if self.roi_polygon_scales[j] > 0:
                             self.wafer_roi_points_scaled[j][i] = (pts - ctr)*self.roi_polygon_scales[j] + ctr
                 else:
-                    # must have roi points saved for this option
-                    assert( all([x==0 for x in self.roi_polygon_scales]) )
+                    # must have roi points saved for this option, allow if running registration
+                    assert( all([x==0 for x in self.roi_polygon_scales]) or self.run_registration )
             else: # if os.path.isfile(fn):
                 if not c.sel_missing_regions[i]:
                     print(fn)
@@ -710,7 +740,7 @@ class wafer_solver(zimages):
         return inds, inds_proc
 
 
-    def compute_wafer_keypoints(self, nfeatures, custom_polygon=None, filter_size=0, rescale=False,
+    def compute_wafer_keypoints(self, sift_args, custom_polygon=None, filter_size=0, rescale=False,
             nthreads_per_job=None, iprocess=0, sample_p=None):
         if self.wafer_solver_verbose:
             print('Computing keypoints / descriptors for {} images'.format(self.wafer.nregions,))
@@ -745,7 +775,7 @@ class wafer_solver(zimages):
             msks = self.wafer_tissue_masks[inds[i][0]:inds[i][-1]+1]
             rel_ds = self.wafer.tissue_mask_ds // self.dsthumbnail
             workers[i] = mp.Process(target=compute_keypoints_job, daemon=True,
-                    args=(nfeatures, nthreads_per_job, i, inds[i], self.wafer_images[inds[i][0]:inds[i][-1]+1],
+                    args=(sift_args, nthreads_per_job, i, inds[i], self.wafer_images[inds[i][0]:inds[i][-1]+1],
                         result_queue, pts, cpts, msks, rel_ds, filter_size, rescale, self.min_feature_matches,
                         sample_p, self.wafer_solver_verbose))
             workers[i].start()
@@ -1496,23 +1526,30 @@ class wafer_solver(zimages):
             if do_overlays:
                 continue # hijacked this function to optionally export images with sift features
             if bad_match:
-                print(f'bad match: {x=} {y=} {npts_forward=} {npts_fit_forward=} {npts_reverse=} {npts_fit_reverse=}')
+                if solved_order_mask[i]:
+                    print(f'bad match: {x=} {y=}')
+                    print(f'{npts_forward=} {npts_fit_forward=} {npts_reverse=} {npts_fit_reverse=}')
                 # save the "bad matches" edges that need to be fixed manually
                 self.solved_order_bad_matches[nbad_matches,:] = [x,y]
                 self.solved_order_bad_matches_inds[nbad_matches] = i+1
                 self.bad_matches_fail_types[nbad_matches,:] = [forward_fail_type, reverse_fail_type]
                 nbad_matches += 1
+                affine_forward = affine_reverse = None
+                forward_pts_src = forward_pts_dst = None
+                reverse_pts_src = reverse_pts_dst = None
             else:
                 # replace a match that is below threshold if the other is above.
                 # already detected above if both are below threshold (bad_match)
                 if npts_fit_forward < self.min_feature_matches:
                     affine_forward = lin.inv(affine_reverse)
-                    forward_pts_src = forward_pts_dst = None
+                    #forward_pts_src = forward_pts_dst = None
+                    forward_pts_src, forward_pts_dst = reverse_pts_dst, reverse_pts_src
                 else:
                     self.affine_percent_matches[i,0] = npts_fit_forward / len(self.wafer_keypoints[y])
                 if npts_fit_reverse < self.min_feature_matches:
                     affine_reverse = lin.inv(affine_forward)
-                    reverse_pts_src = reverse_pts_dst = None
+                    #reverse_pts_src = reverse_pts_dst = None
+                    reverse_pts_src, reverse_pts_dst = forward_pts_dst, forward_pts_src
                 else:
                     self.affine_percent_matches[i,1] = npts_fit_reverse / len(self.wafer_keypoints[x])
 

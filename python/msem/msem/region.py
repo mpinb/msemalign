@@ -4,7 +4,7 @@ Class representation and alignment / stitching procedure for Zeiss multi-SEM
   regions. Regions contain multiple contiguous mFOVs within a single section
   (i.e., from a single z-plane of the original tissue block).
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -143,7 +143,9 @@ class region(mfov):
                  D_cutoff=None, V_cutoff=None, W_default=[None]*3, overlap_radius=None, legacy_zen_format=False,
                  C_cutoff_soft_nGMM=0, nimages_per_mfov=None, scale_nm=None, init_region_coords=True, tissue_mask_ds=1,
                  #tissue_mask_path=None, tissue_mask_ds=1, tissue_mask_fn_str=None, tissue_mask_min_edge_um=0.,
-                 tissue_mask_min_edge_um=0., tissue_mask_min_hole_edge_um=0., tissue_mask_bwdist_um=0., verbose=False):
+                 tissue_mask_min_edge_um=0., tissue_mask_min_hole_edge_um=0., tissue_mask_bwdist_um=0.,
+                 allow_empty_mfovs=False, median_filter=None, use_tissue_coordinates=False,
+                 tissue_coordinates_centroid=None, verbose=False):
         self.region_verbose = verbose
 
         # new brightness balancing method between tiles in the entire region
@@ -152,15 +154,26 @@ class region(mfov):
         # allow the overlap radius (between mfovs) to be overriden, mostly intended for debug
         if overlap_radius is not None: self.overlap_radius = overlap_radius
 
+        # in order to allow for discontiguous tissue regions in sections, and also to make the emalign code even
+        #   prettier, the acquisition format was changed so that some mfovs may not contain any tiles.
+        # so that init can run easily, tried to make minimal change here that will find the first non-empty mfov,
+        #   and use this for init.
+        self.allow_empty_mfovs = allow_empty_mfovs
+        if mfov_ids is None:
+            # driving mfov_id as None into mfov forces it to search for a non-empty mfov directory.
+            use_mfov_id = None if allow_empty_mfovs else 1
+        else:
+            use_mfov_id = mfov_ids[0]
+
         # use the parent class to store mfov parameters and initialize coords, filenames, etc
         self.region_W_default = W_default
-        mfov.__init__(self, experiment_folders, region_strs, region_ind, 1 if mfov_ids is None else mfov_ids[0],
+        mfov.__init__(self, experiment_folders, region_strs, region_ind, use_mfov_id,
                       overlap_radius=self.overlap_radius, overlap_correction_borders=overlap_correction_borders,
                       dsstep=dsstep, use_thumbnails_ds=use_thumbnails_ds, false_color_montage=false_color_montage,
                       thumbnail_folders=thumbnail_folders, D_cutoff=D_cutoff, V_cutoff=V_cutoff,
                       W_default=W_default[0], legacy_zen_format=legacy_zen_format, scale_nm=scale_nm,
                       nimages_per_mfov=nimages_per_mfov, init_region_coords=init_region_coords,
-                      C_cutoff_soft_nGMM=C_cutoff_soft_nGMM, verbose=False)
+                      C_cutoff_soft_nGMM=C_cutoff_soft_nGMM, median_filter=median_filter, verbose=False)
         if self.imfov_diameter <= 1: return # make empty directory a graceful error
         # xxx - currently doing this to init member variables for this region:
         #   max_delta_zeiss, mfov_hex_coords
@@ -171,6 +184,7 @@ class region(mfov):
         if mfov_align_init: self.align_and_stitch(init_only=True, init_only_load_images=False)
 
         self.mfov_coords = None
+        self.coords_nd = 2
 
         # total unique tiles in entire region
         self.region_ntiles = self.nmfovs*self.niTiles
@@ -216,13 +230,27 @@ class region(mfov):
                 pts = -self.roi_poly_raw/self.scale_nm
                 pts = np.dot(self.s2ics, pts.T).T
             else:
-                # roi coordiantes are already in image pixel coordinates, so only adjust by the downsampling
+                # roi coordinates are already in image pixel coordinates, so only adjust by the downsampling
                 pts = self.roi_poly_raw/use_thumbnails_ds if use_thumbnails_ds > 0 else self.roi_poly_raw
             self.roi_poly = (pts - self.region_coords.reshape((-1,2)).min(0))/self.dsstep
             self.roi_poly_rect_ctr = (self.roi_poly.max(0) + self.roi_poly.min(0))/2
             self.roi_poly_ctr = PolyCentroid(self.roi_poly[:,0], self.roi_poly[:,1])
         else:
             self.roi_poly = self.roi_poly_rect_ctr = self.roi_poly_ctr = None
+
+        # try to load the polygon that defines the tissue as saved during acquisition.
+        # these are like the tissue masks except saved as a polygon using the limi overview images.
+        fn = os.path.join(self.region_folder, 'Tissue_coordinates.txt')
+        if not self.legacy_zen_format and use_tissue_coordinates and os.path.isfile(fn):
+            self.tissue_poly_raw = zimages.get_roi_coordinates(self.region_folder, coordinate_file=fn, scl=1,
+                    sep=None, cache_dn=self.cache_dir)
+            if tissue_coordinates_centroid is not None:
+                self.tissue_poly_raw += (self.roi_poly_raw.mean(0) - self.tissue_poly_raw.mean(0))
+                self.tissue_poly_raw += tissue_coordinates_centroid
+            pts = self.tissue_poly_raw/use_thumbnails_ds if use_thumbnails_ds > 0 else self.tissue_poly_raw
+            self.tissue_poly = (pts - self.region_coords.reshape((-1,2)).min(0))/self.dsstep
+        else:
+            self.tissue_poly_raw = self.tissue_poly = None
 
         # convert feathering distance to pixels for feathering blending in montage
         self.blending_mode_feathering_dist_pix = blending_mode_feathering_dist_um / self.scale_nm / self.dsstep * 1000
@@ -306,12 +334,14 @@ class region(mfov):
                     thumbnail_folders=self.thumbnail_folder, region_coords=self.region_coords,
                     region_filenames=self.region_filenames, D_cutoff=D_cutoff, W_default=self.region_W_default[0],
                     legacy_zen_format=self.legacy_zen_format, scale_nm=self.native_scale_nm,
-                    C_cutoff_soft_nGMM=self.C_cutoff_soft_nGMM, nimages_per_mfov=self.nimages_per_mfov, verbose=True)
+                    C_cutoff_soft_nGMM=self.C_cutoff_soft_nGMM, nimages_per_mfov=self.nimages_per_mfov,
+                    region_tile_masks=self.region_tile_masks, verbose=True)
                 # uncomment for hacky way to save xcorr inputs and outputs
                 #cmfov.export_xcorr_comps_path = # export path
                 # save the deltas without outliers removed for the second pass.
                 cdelta_coords = cmfov.align_and_stitch(doplots=doplots, dosave_path=dosave_path,
                         get_delta_coords=True, init_only=twopass_multiple_regions, nworkers=nworkers)
+                assert( self.allow_empty_mfovs or not cmfov.is_empty_mfov ) # empty mfov present but not allowed
                 # deltas coords depends on mfov neighbors (adjs for missing neighbors are removed)
                 mfov_subs[cnt] = np.transpose(cmfov.adj_matrix.nonzero())
                 # also return an adj matrix that only contains adjacencies for between mfovs
@@ -429,7 +459,8 @@ class region(mfov):
             mfov_weights[cmfov.mfov_weights==0] = 1.
             mfov_weights[cmfov.mfov_weights==1] = self.region_W_default[2][0]
             mfov_weights[cmfov.mfov_weights==2] = self.region_W_default[2][1]
-            mfov_weights[cmfov.mfov_weights==3] = self.region_W_default[2][0]
+            #mfov_weights[cmfov.mfov_weights==3] = self.region_W_default[2][0] # bug discovered 20250109
+            mfov_weights[cmfov.mfov_weights==3] = self.region_W_default[2][2]
 
             # cmp is the value the determines which delta is selected from the overlap areas,
             #   i.e. spots where the xcorrs were run twice (for each mfov with neighboring context).
@@ -1110,7 +1141,8 @@ class region(mfov):
                 self.mfov_graph_colors = [0]
 
     def _create_mfov_coords_from_inner_rect_coords(self, ihex_xy, load_neighbors=False):
-        assert( all([x == y for x,y in zip(ihex_xy.shape, (self.nmfovs, self.niTiles, 2))]) )
+        #assert( all([x == y for x,y in zip(ihex_xy.shape, (self.nmfovs, self.niTiles, 2))]) )
+        assert( all([x == y for x,y in zip(ihex_xy.shape, (self.nmfovs, self.niTiles))]) )
         self.mfov_coords_independent = self.mfov_coords
         self.mfov_coords, self.mfov_adjust_rect = [None]*self.nmfovs, [None]*self.nmfovs
 
@@ -1119,14 +1151,15 @@ class region(mfov):
         m = self.omfov_diameter; r = self.overlap_radius; n = self.imfov_diameter; er = m - r
         #for mfov_id in self.mfov_ids:
         for mfov_id in self.mfov_ids_with_neighbors:
+            nd = self.coords_nd = ihex_xy.shape[2]
             # select out the inner mfov coords only and re-order into "rect" order typically solved in mfov.
-            tmp = np.empty((self.niTilesRect,2), dtype=np.double); tmp.fill(np.nan)
+            tmp = np.empty((self.niTilesRect,nd), dtype=np.double); tmp.fill(np.nan)
             tmp[self.iring['hex_to_rect'],:] = ihex_xy[mfov_id, :, :]
 
             # assign back into mfov coords containing full mfov alignments (with overlapping tiles not assigned).
-            self.mfov_coords[mfov_id] = np.empty((m,m,2), dtype=np.double); self.mfov_coords[mfov_id].fill(np.nan)
-            self.mfov_coords[mfov_id][r:er,r:er,:] = tmp.reshape((n,n,2))
-            self.mfov_coords[mfov_id] = self.mfov_coords[mfov_id].reshape((self.nTilesRect,2))
+            self.mfov_coords[mfov_id] = np.empty((m,m,nd), dtype=np.double); self.mfov_coords[mfov_id].fill(np.nan)
+            self.mfov_coords[mfov_id][r:er,r:er,:] = tmp.reshape((n,n,nd))
+            self.mfov_coords[mfov_id] = self.mfov_coords[mfov_id].reshape((self.nTilesRect,nd))
 
             if load_neighbors:
                 # xxx - not sure if this will work with more than one mfov specified for the region
@@ -1183,9 +1216,10 @@ class region(mfov):
         nd = self.mfov_adjust.shape[2] if self.brightness_balancing and hasattr(self, 'mfov_adjust') else 1
         #n = self.niTilesRect; inds = np.arange(n) # keep current rectangular ordering
         #self.nTotalTiles = self.nmfov_ids*n
+        cnd = self.coords_nd
         self.nTotalTiles = len(self.mfov_ids_with_neighbors)*n
         self.stitched_region_fns = [None]*self.nTotalTiles
-        self.stitched_region_coords = np.zeros((self.nTotalTiles,2), dtype=np.double)
+        self.stitched_region_coords = np.zeros((self.nTotalTiles,cnd), dtype=np.double)
         self.flat_zeiss_region_coords = np.zeros((self.nTotalTiles,2), dtype=np.double)
         if self.false_color_montage:
             self.stitched_hex_coords = np.zeros((self.nTotalTiles,2), dtype=np.double)
@@ -1207,8 +1241,8 @@ class region(mfov):
             self.stitched_region_fns[slc] = fns_rect
 
             # select out the inner rectangular coords for this mfov and re-order for montage
-            self.stitched_region_coords[slc,:] = self.mfov_coords[i].copy().reshape((m,m,2))[r:er,r:er,:].\
-                    reshape((n,2))[inds,:] * self.dsstep
+            self.stitched_region_coords[slc,:] = self.mfov_coords[i].copy().reshape((m,m,cnd))[r:er,r:er,:].\
+                    reshape((n,cnd))[inds,:] * self.dsstep
             if self.false_color_montage:
                 self.stitched_hex_coords[slc,:] = self.mfov_hex_coords.reshape((m,m,2))[r:er,r:er,:].\
                         reshape((n,2))[inds,:] * self.dsstep
@@ -1650,19 +1684,24 @@ class region(mfov):
         coords = self.stitched_region_coords if not zeiss else self.flat_zeiss_region_coords
 
         overlap_sum=None
-        if blending_mode == "feathering" or get_overlap_sum:
+        # overlap_sum is needed even without feathering if empty mfovs are allowed,
+        #   so that the empty mfovs can be treated as background.
+        # xxx - in the normal workflow with run_regions this is moot because get_overlap_sum is always True
+        if blending_mode == "feathering" or get_overlap_sum or self.allow_empty_mfovs:
             LOGGER.info('Need to montage twice, first time just to get overlap counts')
             overlap_sum, corners, _ = zimages.montage(self.stitched_region_fns, coords / dsstep,
                 image_load={'folder':self.images_load_folder, 'ovlp_sel':None, 'crop':self.border_crop,
-                            'max_delta':self.stitched_region_max_delta_zeiss, 'invert':self.invert_images,
-                            'decay':None, 'scale_adjust':None, 'dsstep':dsstep, 'reduce':self.blkrdc_func, },
+                            'max_delta':self.stitched_region_max_delta_zeiss, 'invert':None,
+                            'decay':None, 'scale_adjust':None, 'dsstep':dsstep, 'reduce':self.blkrdc_func,
+                            'median_filter':None, },
                 verbose_mod=10000 if self.region_verbose else None, get_overlap_sum_only=True, crop_size=crop_size,
                 nblks=nblks, iblk=iblk, novlp_pix=novlp_pix, cache_dn=self.cache_dir)
 
         image, corners, crop_info = zimages.montage(self.stitched_region_fns, coords / dsstep,
                 image_load={'folder':self.images_load_folder, 'ovlp_sel':border_correct, 'crop':self.border_crop,
                         'max_delta':self.stitched_region_max_delta_zeiss, 'invert':self.invert_images,
-                        'dsstep':dsstep, 'decay':decay, 'scale_adjust':scale_adjust, 'reduce':self.blkrdc_func, },
+                        'dsstep':dsstep, 'decay':decay, 'scale_adjust':scale_adjust, 'reduce':self.blkrdc_func,
+                        'median_filter':self.median_filter, },
                 adjust=adjust, verbose_mod=500 if self.region_verbose else None, blending_mode=blending_mode,
                 blending_mode_feathering_dist=self.blending_mode_feathering_dist_pix, overlap_sum=overlap_sum,
                 blending_mode_feathering_min_overlap_dist=self.blending_mode_feathering_min_overlap_dist_pix,

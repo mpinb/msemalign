@@ -4,7 +4,7 @@
 Top level command-line interface for generating plots showing the ordering
   of the sections on top of their original locations on a wafer.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software

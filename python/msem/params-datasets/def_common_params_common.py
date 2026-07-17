@@ -59,6 +59,7 @@ def csave_region_strs_to_meta(wafer_id, lget_paths, raw_folders_all, alignment_f
         reimage_max = np.array(reimage_beg_inds[wafer_id])
 
     fn = os.path.join(alignment_folder, 'rough_alignment', region_str_meta_fn_str.format(wafer_id))
+    error = False
     with open(fn, 'w') as f:
         for experiment_folder, raw_folder, ind in \
                 zip(experiment_folders, raw_folders_all[wafer_id], range(len(experiment_folders))):
@@ -69,17 +70,34 @@ def csave_region_strs_to_meta(wafer_id, lget_paths, raw_folders_all, alignment_f
                 if len(tmp) != 1:
                     print(tmp)
                     print('found %d folders matching %s in folder %s' % (len(tmp), region_str, experiment_folder))
-                    assert(False)
+                    error = True; break # no ignoring this, must be fixed
                 bn = os.path.basename(tmp[0])
                 iord = int(bn.split('_')[0])
                 ireimage = np.nonzero(iord < reimage_max)[0]
                 if ireimage.size == 0: ireimage = [reimage_max.size]
+                if not legacy_zen_format:
+                    dfn = os.path.join(experiment_folder, bn, 'done_file.txt')
+                    if not os.path.isfile(dfn):
+                        print('Missing done file "{}"'.format(dfn))
+                        error = True; break # likely acquisition problem, but comment to continue anyways
+                        fns = glob.glob(os.path.join(experiment_folder, bn, '???'))
+                        if len(fns) < 1:
+                            print('Additionally section contains no mfovs!')
+                            error = True; break # must be fixed
+                        dfn = sorted(fns)[0]
+                    cother.append(str(int(os.path.getmtime(dfn))))
                 f.write(os.path.join(raw_folder, bn) + ' ' + ' '.join(cother) + ' ' + str(ireimage[-1]) + '\n')
                 #print(bn)
+            if error: break
+            #for region_str,cother in zip(region_strs[ind],other_fields[ind]):
+        #for experiment_folder, raw_folder, ind in \
+    if error:
+        if os.path.isfile(fn): os.remove(fn)
+        assert(False) # something went wrong during manifest export, check acquisition data
 
 def cload_region_strs_from_meta(wafer_id, fn, raw_folders_all, alignment_folders):
-    alignment_folder = alignment_folders[wafer_id]
     if fn is None:
+        alignment_folder = alignment_folders[wafer_id]
         fn = os.path.join(alignment_folder, 'rough_alignment', region_str_meta_fn_str.format(wafer_id))
     raw_folders = raw_folders_all[wafer_id]
 
@@ -146,7 +164,8 @@ def cglob_regions_exclude(wafer_id, inds, exclude_inds, root_raw, raw_folders_al
 
 def init_region_info(all_wafer_ids, root_raw, lget_paths, raw_folders_all, alignment_folders, legacy_zen_format,
         reimage_beg_inds, fullres_dir, manifest_suffixes, stack_ext, region_strs_all, region_rotations_all,
-        region_reimage_index, region_manifest_cnts, region_include_cnts, exclude_regions, generate_manifest=None):
+        region_reimage_index, region_timestamps_all, region_manifest_cnts, region_include_cnts, exclude_regions,
+        generate_manifest=None):
     _region_strs_all = None
     for x in all_wafer_ids:
         if not root_raw:
@@ -177,6 +196,7 @@ def init_region_info(all_wafer_ids, root_raw, lget_paths, raw_folders_all, align
             other_fields_flat = [item for sublist in other_fields for item in sublist]
             # for the new format, the "microscope alignment" slice angles are also stored in the manifest
             region_rotations_all[x] = [float(x[0]) for x in other_fields_flat]
+            region_timestamps_all[x] = [int(x[1]) for x in other_fields_flat]
             region_reimage_index[x] = np.array([float(x[-1]) for x in other_fields_flat])
 
 # utility functions needed for defining and processing region_strs_all >>>

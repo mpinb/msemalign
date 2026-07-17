@@ -1,0 +1,6 @@
+#name       deps       swarm                              part            nproc    ngpu time pack  mroll  maxr   s
+iexport     ,          run_wafer-fine_export_init         CPU/GPU/CPU-72c 48/48/72 0     1    0    1750   875
+# split is still worth it because there will be many blocks around the periphery that are empty (cropped out)
+# xxx - probably better to not even iterate the out of crop blocks, BUT there is some fair amount of code
+#   that is tied to only write on block [0,0], would need to weed this out first.
+export      iexport    run_wafer-fine_export              CPU/GPU/CPU-72c 48/48/72 0     2    1    1728   0     8/8/12

@@ -2,7 +2,7 @@
 
 Miscellaneous dumping ground. Buyer beware.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -19,13 +19,12 @@ this program. If not, see <http://www.gnu.org/licenses/>.
 
 
 import os
+#import sys
 from pathlib import Path
 import time
 import re
 from enum import IntEnum
 import warnings
-import dill
-import fcntl
 import shutil
 import uuid
 
@@ -63,6 +62,8 @@ import hdf5plugin
 import h5py
 
 from contextlib import nullcontext
+
+from sslock import gpfs_file_lock, gpfs_file_unlock
 
 from scipy import fft as scipy_fft
 try:
@@ -230,6 +231,15 @@ def get_process_uuid(default=str(uuid.uuid4())):
     uuid.UUID(process_uuid) # throws exception for invalid uuid
     return process_uuid
 
+def get_registration_mode(default=False):
+    """ read registration mode from environment variable MSEM_REGISTRATION
+        otherwise set false"""
+    try:
+        run_registration: bool = bool(os.environ['MSEM_REGISTRATION'])
+    except:
+        run_registration: bool = default
+    return run_registration
+
 # helper functions to retrieve environment variables to set some msem runtime parameters globally >>>
 
 # not clear if these are re-entrant or not, so recreate on each usage.
@@ -238,9 +248,10 @@ def create_scipy_fft_context_manager(use_gpu, use_fft, use_fft_backend, nthreads
         ctx_managers = [scipy_fft.set_workers(nthreads)]
         # change fft backend for scipy, determines which library fftconvolve utilizes for ffts
         if use_fft_backend == FFT_backend_types.mkl:
-            ctx_managers += [scipy_fft.set_backend(mkl_fft)]
+            ctx_managers += [scipy_fft.set_backend(mkl_fft), mkl_fft.set_workers(nthreads)]
         elif use_fft_backend == FFT_backend_types.fftw:
-            ctx_managers += [scipy_fft.set_backend(pyfftw.interfaces.scipy_fft)]
+            ipyfftw = pyfftw.interfaces.scipy_fft
+            ctx_managers += [scipy_fft.set_backend(ipyfftw), ipyfftw.set_workers(nthreads)]
             pyfftw.interfaces.cache.enable() # Turn on the cache for optimum performance
             #pyfftw.config.NUM_THREADS = _template_match_nthreads # does not do anything
     else:
@@ -268,16 +279,19 @@ def cached_image_load(loadpath, loadfn=None, cache_dir='', return_pil=False):
     ext = os.path.splitext(loadfn)[1].lower()
     if ext == '.tiff' or ext == '.tif':
         img = tifffile.imread(cacheloadfn)
+        img_shape, img_dtype = img.shape, img.dtype
         if return_pil: img = Image.fromarray(img)
     else:
         img = Image.load(cacheloadfn); img.load(); img.close()
         # need copy to avoid ValueError: assignment destination is read-only
-        if not return_pil: img = np.asarray(img).copy()
+        _img = np.asarray(img)
+        img_shape, img_dtype = _img.shape, _img.dtype
+        if not return_pil: img = _img.copy()
 
     # immediately remove the temp file after it's loaded.
     if cache_dir: os.remove(cacheloadfn)
 
-    return img
+    return img, img_shape, img_dtype
 
 
 # <<< access and helper methods to support tiling (to allow for tile processing) of very large images
@@ -376,6 +390,10 @@ def big_img_save(fn, img_blk, img_shape=None, nblks=[1,1], iblk=[0,0], novlp_pix
     if lock:
         if not open_locks: f1, f2 = gpfs_file_lock(fn_lock_file, sleep=sleep)
 
+    if img_blk is None:
+        assert( lock and not open_locks and keep_locks ) # use case is just for the file locking
+        return 0, f1, f2
+
     lock_recreate_file_exists = lock_recreate and os.path.isfile(fn) and not truncate
     if (not recreate and not lock_recreate) or (lock_recreate and lock_recreate_file_exists):
         if sleep is None: csleep = [5,10]
@@ -438,6 +456,8 @@ def big_img_save(fn, img_blk, img_shape=None, nblks=[1,1], iblk=[0,0], novlp_pix
         image = fh.create_dataset(dataset, img_shape, dtype=img_blk.dtype, chunks=chunk_shape,
             **hdf5plugin.Blosc(cname='blosclz', clevel=5, shuffle=hdf5plugin.Blosc.SHUFFLE))
         write_mask = np.zeros(nblks, dtype=np.int64)
+    if not all([x == y for x,y in zip(write_mask.shape, nblks)]):
+        write_mask = np.zeros(nblks, dtype=np.int64)
     write_mask[iblk[0], iblk[1]] += 1; image.attrs['write_mask'] = write_mask
     write_count = (write_mask > 0).sum() # just return a count of the unique written blocks instead of mask
 
@@ -473,6 +493,7 @@ def big_img_save(fn, img_blk, img_shape=None, nblks=[1,1], iblk=[0,0], novlp_pix
 
 # creates the ranges for overlapping blocks.
 def tile_nblks_to_ranges(shape, nblks, novlp_pix, iblk, ignore_bounds=False, bcrop=None):
+    assert( bcrop is None or not ignore_bounds ) # xxx - no use case
     ndims = len(shape); rndims = range(len(shape))
     single_block = all([x==1 for x in nblks])
     if single_block:
@@ -480,95 +501,31 @@ def tile_nblks_to_ranges(shape, nblks, novlp_pix, iblk, ignore_bounds=False, bcr
     else:
         assert( len(nblks) == ndims and len(iblk) == ndims and len(novlp_pix) == ndims )
     rngs = [[[x[0],x[-1]+1] for x in np.array_split(np.arange(y), z)] for y,z in zip(shape, nblks)]
-    # add in overlap for blocks that are not along the edges
+    # add in overlap for blocks, rectify to shape unless ignore_bounds is specified.
+    # bcrop is a special code path for cropping fine alignment outputs.
     for x in rndims:
         for y in range(nblks[x]):
-            if ignore_bounds or y != 0:
-                rngs[x][y][0] -= novlp_pix[x]
-            if bcrop is not None and y != 0:
-                rngs[x][y][0] -= bcrop[x][0]
-            assert(ignore_bounds or rngs[x][y][0] >= 0) # overlap or crop bigger than chunk size
-            if ignore_bounds or y != nblks[x]-1:
-                rngs[x][y][1] += novlp_pix[x]
+            rngs[x][y][0] -= novlp_pix[x]
+            if not ignore_bounds and rngs[x][y][0] < 0:
+                rngs[x][y][0] = 0
             if bcrop is not None:
+                rngs[x][y][0] -= bcrop[x][0]
+                if rngs[x][y][0] < 0:
+                    rngs[x][y][0] = 0
+
+            rngs[x][y][1] += novlp_pix[x]
+            if not ignore_bounds and rngs[x][y][1] > shape[x]:
+                rngs[x][y][1] = shape[x]
+            if bcrop is not None:
+                if rngs[x][y][1] > bcrop[x][1]:
+                    rngs[x][y][1] = bcrop[x][1]
                 rngs[x][y][1] -= bcrop[x][0]
-                if y == nblks[x]-1:
-                    rngs[x][y][1] -= bcrop[x][1]
-            assert(ignore_bounds or rngs[x][y][1] <= shape[x]) # overlap or crop bigger than chunk size
     max_shape = [max([rngs[x][y][1] - rngs[x][y][0] for y in range(nblks[x])]) for x in rndims]
     min_shape = [min([rngs[x][y][1] - rngs[x][y][0] for y in range(nblks[x])]) for x in rndims]
     rng = [rngs[x][y] for x,y in zip(rndims,iblk)]
     return rngs, max_shape, min_shape, rng
 
 # access and helper methods to support tiling (to allow for tile processing) of very large images >>>
-
-
-# <<< generic locking functions on GPFS, works for thread safe and process safe, BUT not very efficient
-
-# NOTE: file locking is known to be problematic, this is very much os and file system
-#   dependent, but works on GPFS. also this was a much easier solution for now than
-#   switching to using a database or a server-based locking or mpi.
-# inspired from "Old post, but if anyone else finds it, I get this behaviour:" here:
-#   https://stackoverflow.com/questions/9907616/python-fcntl-does-not-lock-as-expected
-# lockf and flock behave differently on GPFS, see:
-#   https://www.ibm.com/mysupport/s/question/0D50z00006LKy2a/flock-on-gpfs?language=en_US
-#   flock works on GPFS for file descriptors within the same processes,
-#     but not for file descriptors in different processes.
-#   lockf works on GPFS for different processes (same or different nodes),
-#     but not for multilple file descriptors within the same process (i.e., threads)
-#   implementation here uses both locks so it is both thread and process safe.
-# mode 'r+' for lockf handle is because opening 'r' causes lockf to throw Bad File Descriptor (why?).
-
-def gpfs_file_lock(fn, allow_create=False, sleep=None):
-    if sleep is None: sleep = [5,10]
-    if allow_create and not os.path.isfile(fn): Path(fn).touch()
-    busy = True
-    while busy:
-        try:
-            fthread = open(fn, 'rb'); fproc = open(fn, 'rb+')
-            fcntl.flock(fthread, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.lockf(fproc, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            busy = False
-        except BlockingIOError:
-            gpfs_file_unlock(fthread, fproc)
-            # if many processes are trying to access the same set of files, polling a lot here
-            #   is a disaster. since usually swarms are setup to prevent too many processes from
-            #   concurrent file access, and this is an inefficient solution anyways, default
-            #   to a relatively long randomized sleep range before trying again.
-            time.sleep(sleep[0] if sleep[0] == sleep[1] else np.random.uniform(sleep[0], sleep[1]))
-    return fthread, fproc
-
-def gpfs_file_unlock(fthread, fproc):
-    # the order here is important (?), close in the opposite order they were locked.
-    fproc.close(); fthread.close()
-
-# generic locking functions on GPFS, works for thread safe and process safe, BUT not very efficient >>>
-
-
-# <<< access functions for reading and writing dills using file lock on GPFS
-
-def dill_lock_and_load(fn, keep_locks=False):
-    f1, f2 = gpfs_file_lock(fn)
-    d = dill.load(f1)
-    if keep_locks:
-        # NOTE: returning open file handles in this case; they need to be closed eventually.
-        #   This will block any other threads or processes from accessing this file
-        #     if they access the file via these locking functions.
-        return d, f1, f2
-    else:
-        gpfs_file_unlock(f1,f2)
-        return d
-
-def dill_lock_and_dump(fn, d, f1=None, f2=None):
-    assert( ((f1 is None) and (f2 is None)) or ((f1 is not None) and f2 is not None) )
-    open_locks = (f1 is not None)
-    if not open_locks:
-        f1, f2 = gpfs_file_lock(fn)
-    # use a separate file handle from the locks for writing.
-    f3 = open(fn, 'wb'); dill.dump(d, f3); f3.close()
-    gpfs_file_unlock(f1,f2)
-
-# access functions for reading and writing dills using file lock on GPFS >>>
 
 
 # better grid point interpolation (and extrapolation) method than using normal interpolation.
@@ -1238,6 +1195,21 @@ def block_construct(img, factor):
             oimg[i::factor,j::factor] = img
     return oimg
 
+# claude generated
+def pad_to_match(source, target):
+    """Pad source array with zeros to match target's shape."""
+    pad_height = target.shape[0] - source.shape[0]
+    pad_width = target.shape[1] - source.shape[1]
+    if pad_height < 0: pad_height = 0
+    if pad_width < 0: pad_width = 0
+    if pad_height == 0 and pad_width == 0:
+        return source
+
+    return np.pad(source, (
+        (0, pad_height),
+        (0, pad_width)
+    ), mode='constant', constant_values=0)
+
 # heuristical method of finding "tissue mode" in EM grayscale data.
 # attempts to essentially to deal with mutliple peaks based on slices with little tissue
 #   relative to other things in the slice (epon, wafer, iron, artifacts, etc).
@@ -1543,3 +1515,114 @@ def best_fit_piecewise_distribution(data_dtype, histo, rngs, nrepeats=1):
     return templ_pdf, cbins, dist_strs
 
 # histogram fitting code >>>
+
+
+# claude generated
+def remove_timeseries_spikes(
+    data,
+    window=7,
+    z_thresh=10.0,
+    max_run=5,
+):
+    """
+    Remove single or sequential outlier spikes from a generic time series
+    using robust statistics and vectorized replacement.
+
+    Parameters
+    ----------
+    data : array-like
+        1-D time series values.
+    window : int
+        Median-filter neighborhood size (must be odd). Should be
+        noticeably larger than max_run so outlier runs don't bias
+        the local background estimate.
+    z_thresh : float
+        Threshold in robust z-score (MAD-based) units. Samples whose
+        residual exceeds this are flagged as spikes.
+    max_run : int
+        Maximum number of consecutive flagged samples that will be
+        repaired. Runs longer than this are left untouched (they are
+        more likely to be genuine signal than artefacts).
+
+    Returns
+    -------
+    data_clean : ndarray
+        Time series with short spike runs replaced by interpolated values.
+    spike_mask : ndarray of bool
+        True at every position that was detected *and* repaired.
+
+    Notes
+    -----
+    Replacement strategy
+        For each repaired run the function uses linear interpolation
+        between the last clean sample before and the first clean sample
+        after the run.  This is more appropriate for a generic time series
+        than the neighbour-mean used for histograms, because it preserves
+        a smooth trend through the gap rather than introducing a flat
+        plateau.
+
+    Window sizing
+        Choose ``window`` so that it comfortably spans a spike run:
+        ``window >= 2 * max_run + 3`` is a safe rule of thumb.
+    """
+    data = np.asarray(data, dtype=float)
+    n = len(data)
+
+    if window % 2 == 0:
+        raise ValueError("window must be odd")
+    if window < 2 * max_run + 3:
+        import warnings
+        warnings.warn(
+            f"window={window} may be too small to reliably estimate the "
+            f"background around runs of length {max_run}. "
+            f"Consider window >= {2 * max_run + 3}.",
+            stacklevel=2,
+        )
+
+    # 1) Robust local background via median filter
+    background = nd.median_filter(data, size=window, mode="reflect")
+
+    # 2) MAD-based z-score
+    resid = data - background
+    mad = np.median(np.abs(resid)) + 1e-12
+    z = resid / mad
+
+    # 3) Flag spikes (both positive and negative)
+    raw_spike = np.abs(z) > z_thresh
+
+    # 4) Keep only runs whose length <= max_run
+    spike_mask = np.zeros(n, dtype=bool)
+    labeled, num_features = nd.label(raw_spike)
+    for run_id in range(1, num_features + 1):
+        run_idx = np.where(labeled == run_id)[0]
+        if len(run_idx) <= max_run:
+            spike_mask[run_idx] = True
+
+    # 5) Repair by linear interpolation across each accepted run
+    data_clean = data.copy()
+    labeled_clean, num_clean = nd.label(spike_mask)
+    for run_id in range(1, num_clean + 1):
+        run_idx = np.where(labeled_clean == run_id)[0]
+        i0, i1 = run_idx[0], run_idx[-1]
+
+        # Anchor points: last good sample before and first after the run
+        left_idx  = i0 - 1 if i0 > 0     else None
+        right_idx = i1 + 1 if i1 < n - 1 else None
+
+        if left_idx is None and right_idx is None:
+            # Entire series is a spike — nothing to anchor against
+            continue
+        elif left_idx is None:
+            # Run touches the left edge: fill with right anchor value
+            data_clean[run_idx] = data_clean[right_idx]
+        elif right_idx is None:
+            # Run touches the right edge: fill with left anchor value
+            data_clean[run_idx] = data_clean[left_idx]
+        else:
+            # General case: linearly interpolate across the gap
+            x_anchors = np.array([left_idx, right_idx], dtype=float)
+            y_anchors = np.array([data_clean[left_idx], data_clean[right_idx]])
+            data_clean[run_idx] = np.interp(run_idx.astype(float),
+                                             x_anchors, y_anchors)
+
+    return data_clean, spike_mask

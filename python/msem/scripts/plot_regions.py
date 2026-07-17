@@ -4,7 +4,7 @@
 Top level command-line interface for generating plots related to the
   2D alignment and montaging of sections.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -21,31 +21,31 @@ this program. If not, see <http://www.gnu.org/licenses/>.
 
 import os
 import time
-#import glob
 import dill
 import argparse
 
 import numpy as np
-#import scipy.linalg as lin
+from scipy import signal
 # from sklearnex import patch_sklearn
 # patch_sklearn()
 from sklearn import linear_model, preprocessing
-#import scipy.spatial.distance as scidist
-# import scipy.ndimage as nd
-# import tifffile
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 
+from sslock import report_job_completed
+
 from msem import region, zimages
 from msem.utils import big_img_load
-from def_common_params import get_paths, meta_folder, all_wafer_ids, total_nwafers, order_txt_fn_str
+from def_common_params import get_paths, meta_folder, meta_dill_fn_str, all_wafer_ids, total_nwafers, order_txt_fn_str
 from def_common_params import scale_nm, nimages_per_mfov, legacy_zen_format, native_subfolder
 from def_common_params import dsstep, use_thumbnails_ds, twopass_default_tol_nm
 from def_common_params import wafer_region_prefix_str, slice_balance_fn_str, align_subfolder
 from def_common_params import brightness_slice_histo_nsat, region_suffix
 
 from def_common_params import tissue_mask_ds, tissue_mask_min_edge_um, tissue_mask_min_hole_edge_um
+
+from msem.utils import remove_timeseries_spikes
 
 
 ## argparse
@@ -70,6 +70,10 @@ parser.add_argument('--mean-wafer-id', nargs=1, type=int, default=[0],
     help='for the mean wafer values, subtract the mean for this wafer, 0 for off')
 parser.add_argument('--no-solved-order', dest='solved_order', action='store_false',
     help='just use the indexed order instead of solved order')
+parser.add_argument('--solved-order-nbins', nargs=1, type=int, default=[1],
+    help='for histo-width mode, number of bins (in solved order)')
+parser.add_argument('--region-ind-template', nargs=1, type=int, default=[1],
+    help='for histo-width mode, which template to compare each hist against')
 parser.add_argument('--tissue-masks', dest='tissue_masks', action='store_true',
     help='use the tissue masks')
 parser.add_argument('--native', dest='native', action='store_true',
@@ -102,6 +106,12 @@ mean_wafer_id = args['mean_wafer_id'][0]
 
 # whether to use the solved order or not
 use_solved_order = args['solved_order']
+
+# how many bins to chunk the ordering into when displaying sorted histo widths / modes
+solved_order_nbins = args['solved_order_nbins'][0]
+
+# when computing histogram widths, check each histogram against this template for similarity
+region_ind_template = args['region_ind_template'][0]
 
 # whether to save or display plots
 save_plots = args['save_plots']
@@ -159,9 +169,7 @@ plot_xy_scatters = False
 if args['all_wafers']:
     wafer_ids = list(all_wafer_ids)
 
-outdir = os.path.join(meta_folder, 'brightness')
-os.makedirs(outdir, exist_ok=True)
-use_solved_order = use_solved_order and brightness_plot
+use_solved_order = use_solved_order and (brightness_plot or histo_width_plot)
 nmfov_ids = len(mfov_ids)
 
 # # for annoying parts of this script that have to be aware of wafers
@@ -173,6 +181,9 @@ nmfov_ids = len(mfov_ids)
 #     assert(tissue_mask_path is not None)
 # else:
 #     tissue_mask_path = None
+
+# stores some info used for entire dataset
+meta_dill_fn = os.path.join(meta_folder, meta_dill_fn_str)
 
 
 ## plot routines
@@ -249,6 +260,7 @@ else:
 
 adjusts = np.zeros((0,1), dtype=np.double)
 wafers_nimgs = np.zeros((use_nwafers,), dtype=np.int64)
+wafers_region_strs = [None]*use_nwafers
 for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
     experiment_folders, thumbnail_folders, protocol_folders, alignment_folder, _, region_strs = get_paths(wafer_id)
     nregions = sum([len(x) for x in region_strs])
@@ -262,7 +274,7 @@ for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
     else:
         slice_balance_fn = os.path.join(alignment_folder, slice_balance_fn_str.format(wafer_id))
 
-    if use_solved_order:
+    if use_solved_order and os.path.isfile(order_txt_fn):
         solved_order = np.fromfile(order_txt_fn, dtype=np.uint32, sep=' ')-1 # saved order is 1-based
     else:
         solved_order = np.arange(nregions)
@@ -270,7 +282,8 @@ for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
 
     if brightness_plot:
         assert( os.path.isfile(slice_balance_fn) )
-        cadjusts = zimages.load_slice_balance_file(slice_balance_fn)
+        cadjusts, region_strs = zimages.load_slice_balance_file(slice_balance_fn, return_region_strs=True)
+        wafers_region_strs[wafer_ind] = region_strs
         adjusts = np.concatenate((adjusts, cadjusts[solved_order][:,None]), axis=0)
 
     if deltas_plot or residuals_plot or (histo_width_plot and region_inds[0] > -1) or median_diff_plot:
@@ -797,24 +810,35 @@ for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
 
     # this is for trying to figure out a good tolerance vs the median deltas for twopass 2d alignment.
     if histo_width_plot:
-        ## just glob for all the available stitched regions instead of having to instantiate each region
-        #fns = glob.glob(os.path.join(alignment_folder, native_subfolder if native else '', '*_stitched.h5'))
-        ## sort newest to oldest makes looking at reimages easier
-        #fns.sort(key=os.path.getmtime); fns = fns[::-1]
-        #if region_inds[0] > -1:
-        #    fns = [x for x in fns if cregion.region_str in x]
-        #nfns = len(fns)
+        # local parameters
+        rng = [0.05, 0.98]
+        midpt = 128 # for 8bit grayscale images
+        maxlag = 5
+        maxD = 2. # maximum distance value
 
         nfns = nregions
         #nfns = 20 # to test or use with reimages
-        rng = [0.05, 0.98]
         width = np.empty((nfns,1), dtype=np.int64); width.fill(-1)
         mode = np.empty((nfns,1), dtype=np.int64); mode.fill(-1)
         area = np.zeros((nfns,1), dtype=np.int64)
+        Ctmpl = np.zeros((nfns,1), dtype=np.double); mode.fill(-1)
         fns = [None]*nfns
+        tdhisto = None
 
-        cregion_inds = region_inds if region_inds[0] > -1 else range(1,nregions+1)
+        if region_inds[0] > -1:
+            cregion_inds = region_inds
+        else:
+            if region_ind_template > 0:
+                cregion_inds = [region_ind_template] + list(range(1,nregions+1))
+            else:
+                with open(meta_dill_fn, 'rb') as f: d = dill.load(f)
+                target_histo_key = 'target_histogram' + ('_native' if native else '')
+                target_histo_slice_key = target_histo_key + '_slice'
+                print('Using saved histo template slice ' + d[target_histo_slice_key])
+                tdhisto = d[target_histo_key]
+
         for region_ind in cregion_inds:
+            # this avoids instantiating each region just for the path, which is slow.
             region_str = region_strs_flat[region_ind-1]
             prefix = wafer_region_prefix_str.format(wafer_id, region_str)
             fn = os.path.join(alignment_folder, prefix + region_suffix + '.h5')
@@ -839,44 +863,70 @@ for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
             histo[:histo_nsat[0]] = 0; histo[-histo_nsat[1]:] = 0
 
             mode[i] = np.argmax(histo)
-            dhisto = np.cumsum(histo)
-            hsum = histo.sum()
+            dhisto = histo.astype(np.double, copy=True)
+            cdhisto = np.cumsum(dhisto)
+            hsum = cdhisto[-1]
             if hsum > 0:
-                dhisto = dhisto / hsum
-                width[i] = np.nonzero(dhisto > rng[1])[0][0] - np.nonzero(dhisto > rng[0])[0][0]
+                cdhisto /= hsum
+                ndhisto = dhisto / hsum
+                width[i] = np.nonzero(cdhisto > rng[1])[0][0] - np.nonzero(cdhisto > rng[0])[0][0]
+            std = np.std(dhisto)
+            if std > 0:
+                # normalize the histos for xcorrs so we can compute a normalized cross-correlation at multiple lags
+                # SO - why-numpy-correlate-and-corrcoef-return-different-values-and-how-to-normalize
+                # histogram lengths are 256 for 8bit grayscale, sqrt(256) is 16
+                dhisto = (dhisto - np.mean(dhisto)) / (std * 16)
+
+            if tdhisto is None:
+                if region_ind == region_ind_template:
+                    tdhisto = dhisto
+            else:
+                X = signal.correlate(dhisto, tdhisto, mode='same')
+                Xmid = X[midpt-maxlag:midpt+maxlag+1]
+                Xmidmax = Xmid.max()
+                Ctmpl[i] = 0.5 + Xmidmax/2 # scale to [0,1] where 1 is most similar
+                #Dtmpl = maxlag - np.argmax(Xmid) # lag at Ctmpl (max xcorr)
 
             if region_inds[0] > -1:
                 print(cregion.region_str)
                 print(width[i])
                 print(mode[i])
-                plt.figure(1234); plt.gcf().clf(); plt.plot(histo)
-                plt.figure(1235); plt.gcf().clf(); plt.plot(dhisto)
+                plt.figure(1234); plt.gcf().clf(); plt.plot(ndhisto)
+                plt.figure(1235); plt.gcf().clf(); plt.plot(cdhisto)
                 plt.show()
         #for fn,i in zip(fns, range(nfns)):
 
         pfns = [os.path.basename(x) for x in fns]
         nprint = nfns
         #nprint = 20 # to test
+        invert = False
+
         print('wafer {}'.format(wafer_id))
-        pvals = [width,mode]
-        pvals_strs = ['histo width','histo_mode']
+        pvals = [width,mode,Ctmpl]
+        pvals_strs = ['histo width','histo_mode','C']
+        bins = np.array_split(solved_order, solved_order_nbins)
+        ibins = np.array_split(np.arange(solved_order.size), solved_order_nbins)
         for j in range(len(pvals)):
-            print('metric {}'.format(pvals_strs[j]))
-            if nprint < nfns:
-                print('smallest {}'.format(nprint))
-            pval = pvals[j].astype(np.double, copy=True)
-            pval[pval==-1] = np.inf
-            inds = np.argsort(pval, 0); vals = np.sort(pval, 0)
-            for i in range(nprint):
-                others = ' '.join([str(x[inds[i,0]]) for x in pvals])
-                print('{} {} {}'.format(pfns[inds[i,0]], vals[i,0], others))
-            if nprint < nfns:
-                print('biggest {}'.format(nprint))
-                pval = pvals[j].astype(np.double, copy=True)
-                pval[pval==-1] = 0
-                inds = np.argsort(pval, 0)[::-1,:]; vals = np.sort(pval, 0)[::-1,:]
-                for i in range(nprint):
-                    print('{} {}'.format(pfns[inds[i,0]], vals[i,0]))
+            cnt = 0
+            for k in range(solved_order_nbins):
+                print()
+                print('metric {} order {}-{}'.format(pvals_strs[j], bins[k][0], bins[k][-1]))
+                print('\tiorder {}-{}'.format(ibins[k][0], ibins[k][-1]))
+
+                pval = pvals[j][bins[k]].astype(np.double, copy=True)
+                pval[pval==-1] = np.inf
+                iinds = np.argsort(pval, 0)
+                inds = bins[k][iinds]; vals = np.sort(pval, 0)
+                iinds = ibins[k][iinds]
+                if invert:
+                    inds = inds[::-1,:]; vals = vals[::-1,:]
+                for i in range(inds.shape[0]):
+                    others = ' '.join([str(x[inds[i,0]]) for x in pvals])
+                    print('{} {} {} {}'.format(pfns[inds[i,0]], iinds[i,0], vals[i,0], others))
+                    cnt += 1
+                    if cnt >= nprint: break
+                if cnt >= nprint: break
+            # for k in range(solved_order_nbins):
         # for j in range(len(pvals)):
 
         # piggybacked this mode for exporting the areas
@@ -928,6 +978,12 @@ if brightness_plot:
         plt.savefig(os.path.join(meta_folder, 'region_plots',
             'brightness_slices_{}-order.png'.format('solved' if use_solved_order else 'manifest')), dpi=300)
 
+    # manual-intervention step to remove outliers, which frequently are half or bad sections
+    #adjusts = remove_timeseries_spikes(
+    #              adjusts.reshape(-1), window=11, max_run=4, z_thresh=5,
+    #              )[0].reshape(adjusts.shape)
+    #make_param_plot(adjusts, wafers_nimgs, figno=4)
+
     # also make histogram of the adjusts
     plt.figure(10)
     hist,bins = np.histogram(adjusts, 50)
@@ -940,5 +996,21 @@ if brightness_plot:
 
     if not save_plots: plt.show()
 
-print('JOB FINISHED: run_wafer.py')
-print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+    # for writing out modified section adjustments, this is a manual-intervention step.
+    # this will only work if NOT using the solved order.
+    # IMPORTANT: back up the origin adjustments files.
+    #cum_nregions = 0
+    #for wafer_id, wafer_ind in zip(use_wafer_ids, range(use_nwafers)):
+    #    experiment_folders, thumbnail_folders, protocol_folders, alignment_folder, _, region_strs = get_paths(wafer_id)
+    #    nregions = sum([len(x) for x in region_strs])
+    #    native_alignment_folder = os.path.join(alignment_folder, native_subfolder)
+    #    if native:
+    #        slice_balance_fn = os.path.join(native_alignment_folder, slice_balance_fn_str.format(wafer_id))
+    #    else:
+    #        slice_balance_fn = os.path.join(alignment_folder, slice_balance_fn_str.format(wafer_id))
+    #    zimages.write_image_coords(slice_balance_fn, wafers_region_strs[wafer_ind],
+    #        adjusts[cum_nregions:cum_nregions+nregions])
+    #    cum_nregions += nregions
+
+
+report_job_completed()

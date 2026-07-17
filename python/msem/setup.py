@@ -8,7 +8,7 @@ setup (name = 'msem',
        author_email = 'pwatkins@gmail.com',
        url = '',
        long_description = '''
-Image processing and alignment for mSEM inner and outer MFoV stitching, section alignment and export.
+Image processing for mSEM section stitching, section alignment and export.
 ''',
        packages = ['msem'],
        )

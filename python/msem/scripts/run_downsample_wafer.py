@@ -4,7 +4,7 @@
 Top level command-line interface for downsampling images from a wafer from
   native resolution (4nm) to the pipeline resolution (typically 16 nm).
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -36,6 +36,8 @@ import cv2
 import tifffile
 
 import skimage.measure as measure
+
+from sslock import report_job_completed
 
 # this script was originally developed as independent from the msem package.
 # decided to leave it as "half-in", meaning it still should be able to run in the old "dumb" mode.
@@ -465,4 +467,4 @@ if __name__ == "__main__":
     [x.close() for x in write_workers]
 
     logger.info('finished in %.3f', time.time()-t)
-    print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+    report_job_completed()

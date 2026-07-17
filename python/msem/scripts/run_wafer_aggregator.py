@@ -7,7 +7,7 @@ os.system('date')
 Top level command-line interface for aggregating the alignments computed
   for the rough and fine alignments by applying the LSS.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -24,15 +24,16 @@ this program. If not, see <http://www.gnu.org/licenses/>.
 
 import numpy as np
 import dill
-import os
+#import os
 import sys
 import argparse
 import time
 os.system('date')
 
 from msem import wafer_aggregator
-from msem.utils import make_hex_points, dill_lock_and_load, dill_lock_and_dump
-from msem.utils import l2_and_delaunay_distance_select, big_img_save
+from msem.utils import make_hex_points, l2_and_delaunay_distance_select, big_img_save
+
+from sslock import dill_lock_and_load, dill_lock_and_dump, report_job_completed
 
 # all parameters loaded from an experiment-specific import
 from def_common_params import get_paths, crops_um, all_wafer_ids, exclude_regions
@@ -84,7 +85,7 @@ parser.add_argument('--run-type', nargs=1, type=str, default=['rough'],
                     help='the type of run to choose')
 parser.add_argument('--run-str-in', nargs='+', type=str, default=['none'],
                     help='string to differentiate alignments with different parameters')
-parser.add_argument('--run-str-out-rough', nargs=1, type=str, default=['none'],
+parser.add_argument('--run-strs-out-rough', nargs='+', type=str, default=['none'],
                     help='string to differentiate alignments with different parameters')
 parser.add_argument('--run-str-out-fine', nargs=1, type=str, default=['none'],
                     help='string to differentiate alignments with different parameters')
@@ -173,8 +174,9 @@ save_plot_deltas = args['save_deltas_debug']
 # this is an identifier so that multiple rough/fine alignemnts can be exported / loaded easily.
 run_str_in = args['run_str_in'][0]
 run_strs_in = args['run_str_in'] # some modes can take multiple inputs
-run_str_out_rough = args['run_str_out_rough'][0]
+run_str_out_rough = args['run_strs_out_rough'][0]
 run_str_out_fine = args['run_str_out_fine'][0]
+run_str_rerough = args['run_strs_out_rough'][1] if len(args['run_strs_out_rough']) > 1 else None
 
 # specify subset of slices to accumulate by specifying range in slice order
 order_range = np.array(args['order_range'])-1
@@ -278,6 +280,8 @@ print(('run_wafer_aggregator run-type==%s run-str-in==%s run-str-out-rough==%s r
         run_str_out_fine, max_range_skips, reconcile_L1_norm, reconcile_L2_norm))
 if rerough:
     print('\trough on top of previous rough {}'.format(run_strs_in[1]))
+if run_str_rerough is not None:
+    print('\tfine on top of fine-to-rough {}'.format(run_str_rerough))
 
 # set wafer_ids to contain all wafers, if specified
 if args['all_wafers']:
@@ -297,11 +301,17 @@ print('Aggregating wafers:'); print(wafer_ids)
 agg_dill_fn_str = 'accum_meta_' + run_type.split('_')[0] + '.' + run_str_out + '.dill'
 agg_rigid_dill_fn_str = 'accum_meta_' + run_type.split('_')[0] + '.' + run_str_out + '_rigid.dill'
 
+# for aggregating a fine alignment using xcorrs already used for fine-to-rough
+#   but without rerunning the alignment (xcorrs).
+if run_str_rerough is not None:
+    rerough_agg_dill_fn_str = 'accum_meta_rough.' + run_str_rerough + '.dill'
+
 # option to use interpolated deltas during fine accumulation, probably leave this always true
 load_interpolated_deltas = True
 
 # name of the hdf5 file to save the "resliced" items necessary for the fine recon
-fine_reslice_fn = 'fine_reslice.h5'
+# fine_reslice_fn = 'fine_reslice.h5'
+fine_reslice_fn = 'fine_reslice.' + run_str_in + '.h5'
 
 
 ### INITS
@@ -371,6 +381,7 @@ for j,i in zip(wafer_ids, range(nwafer_ids)):
     fine_dill_fns[i] = os.path.join(alignment_folders[i], fine_dill_fn_str.format(j, run_str_out_fine))
     rough_dill_fns[i] = os.path.join(alignment_folders[i], rough_dill_fn_str.format(j, run_str_out_rough))
     rough_rigid_dill_fns[i] = os.path.join(alignment_folders[i], rough_rigid_dill_fn_str.format(j,run_str_out_rough))
+
     # if fine_affine:
     #     rough_dill_out_fns[i] = os.path.join(alignment_folders[i], rough_dill_fn_str.format(j, run_str_out_fine))
 
@@ -396,6 +407,10 @@ for j,i in zip(wafer_ids, range(nwafer_ids)):
 # meta dill stores aggregated alignments unrolled over wafers
 agg_dill_fn = os.path.join(meta_folder, agg_dill_fn_str)
 agg_rigid_dill_fn = os.path.join(meta_folder, agg_rigid_dill_fn_str)
+
+if run_str_rerough is not None:
+    rerough_agg_dill_fn = os.path.join(meta_folder, rerough_agg_dill_fn_str)
+    with open(rerough_agg_dill_fn, 'rb') as f: rerough_agg_dict = dill.load(f)
 
 # h5 files that temporarily stores the fine recone information, and is easily slice-able by blocks
 fine_reslice_fn = os.path.join(meta_folder, fine_reslice_fn)
@@ -491,6 +506,11 @@ if rough_reconcile:
                           forward_affines, forward_pts_src, forward_pts_dst,
                           reverse_affines, reverse_pts_src, reverse_pts_dst,
                           affine_percent_matches=affine_percent_matches)
+
+if run_str_rerough is not None:
+    rerough_agg_dill_fn = os.path.join(meta_folder, rerough_agg_dill_fn_str)
+    with open(rerough_agg_dill_fn, 'rb') as f: d = dill.load(f)
+    aggregator.cum_affines = d['cum_affines']; del d
 
 if print_rough_status:
     ind = irough_skip
@@ -602,9 +622,8 @@ elif rough_reconcile:
             print('Merging rough dills'); t = time.time()
             niter = nprocesses if single_block else aggregator.ntblocks
             for j in range(niter):
-                proc_str = '.' + str(j)
-                print(agg_dill_fn+proc_str)
-                with open(agg_dill_fn+proc_str, 'rb') as f: d = dill.load(f)
+                fn = agg_dill_fn + '.' + str(j)
+                with open(fn, 'rb') as f: d = dill.load(f)
                 if j==0:
                     cum_deltas = np.zeros((aggregator.total_nimgs,d['nvoronoi_vertices'],2), dtype=np.double)
                     #sanity_check = np.zeros((d['nvoronoi_vertices'],), dtype=np.int64)
@@ -690,6 +709,15 @@ elif rough_reconcile:
     # also save a version where the reconciled deltas were fit with a rigid transform.
     d['cum_affines'] = aggregator.cum_rigid_affines
     with open(agg_rigid_dill_fn+proc_str, 'wb') as f: dill.dump(d, f)
+
+    if run_merge:
+        print('Merge complete, deleting process dills')
+        niter = nprocesses if single_block else aggregator.ntblocks
+        for j in range(niter):
+            fn = agg_dill_fn + '.' + str(j)
+            os.remove(fn)
+            fn = agg_rigid_dill_fn + '.' + str(j)
+            os.remove(fn)
 
 elif fine_outliers:
     inds = np.array_split(np.arange(aggregator.order_rng[0],aggregator.order_rng[1]), nprocesses)
@@ -789,7 +817,7 @@ elif fine_accumulate:
 
         print('\tdone in %.4f s' % (time.time() - t, ))
         print('JOB FINISHED: run_wafer_aggregator.py')
-        print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+        report_job_completed()
         sys.exit(0)
 
     if run_merge:
@@ -797,8 +825,8 @@ elif fine_accumulate:
         niter = nprocesses if single_block else aggregator.ntblocks
         #dt = time.time()
         for j in range(niter):
-            proc_str = '.' + str(j)
-            with open(agg_dill_fn+proc_str, 'rb') as f: d = dill.load(f)
+            fn = agg_dill_fn + '.' + str(j)
+            with open(fn, 'rb') as f: d = dill.load(f)
             if j==0:
                 cum_deltas = np.zeros((aggregator.total_nimgs,d['nvoronoi_vertices'],2), dtype=np.double)
                 cum_comps_sel = np.zeros((aggregator.total_nimgs,d['nvoronoi_vertices']), dtype=bool)
@@ -876,6 +904,13 @@ elif fine_accumulate:
         np.save(agg_dill_fn+proc_str+'_cum_deltas', aggregator.cum_deltas)
     # xxx - omitted > 4 GB cum_comps_sel save as this case is not necessary for current workflow
 
+    if run_merge:
+        print('Merge complete, deleting process dills')
+        niter = nprocesses if single_block else aggregator.ntblocks
+        for j in range(niter):
+            fn = agg_dill_fn + '.' + str(j)
+            os.remove(fn)
+
 elif fine_interp:
     inds = np.array_split(np.arange(aggregator.order_rng[0],aggregator.order_rng[1]), nprocesses)
     rngs = [[x[0],x[-1]+1] for x in inds]
@@ -926,8 +961,14 @@ elif fine_filter:
         load_interpolated_deltas=use_interp_points)
     print('\tdone in %.4f s' % (time.time() - t, ))
 
+    if run_str_rerough is not None:
+        aggregator.fine_deltas_affine_filter(fine_filtering_shape_pixels, affine_degree=1, affine_adjust=True,
+            use_interp_points=use_interp_points, verbose_iterations=False)
+
     aggregator.fine_deltas_affine_filter(fine_filtering_shape_pixels, affine_degree=1,
-        use_interp_points=use_interp_points, doplots=plot_deltas, dosave_path=dosave_path)
+        use_interp_points=use_interp_points, use_affine_adjusted=(run_str_rerough is not None),
+        doplots=plot_deltas, dosave_path=dosave_path)
+
     print('Dumping fine filtered deltas back to delta dills'); t = time.time()
     aggregator.update_fine(update_type='filtered_deltas')
     print('\tdone in %.4f s' % (time.time() - t, ))
@@ -995,19 +1036,29 @@ elif fine_to_rough:
 
     if run_merge:
         print('Merging rough affine dills'); t = time.time()
-        for i in range(nprocesses):
-            proc_str = '.' + str(iprocess)
-            fn = rough_out_affine_skip_dill_fns[i][k]+proc_str
-            with open(fn, 'rb') as f: d = dill.load(f)
-            if i==0:
-                dmrg = d
-            else:
-                dmrg['forward_affines'][rngs[i][0]:rngs[i][1]] = d['forward_affines'][rngs[i][0]:rngs[i][1]]
-                dmrg['reverse_affines'][rngs[i][0]:rngs[i][1]] = d['reverse_affines'][rngs[i][0]:rngs[i][1]]
-                dmrg['forward_pts_src'][rngs[i][0]:rngs[i][1]] = d['forward_pts_src'][rngs[i][0]:rngs[i][1]]
-                dmrg['forward_pts_dst'][rngs[i][0]:rngs[i][1]] = d['forward_pts_dst'][rngs[i][0]:rngs[i][1]]
-                dmrg['reverse_pts_src'][rngs[i][0]:rngs[i][1]] = d['reverse_pts_src'][rngs[i][0]:rngs[i][1]]
-                dmrg['reverse_pts_dst'][rngs[i][0]:rngs[i][1]] = d['reverse_pts_dst'][rngs[i][0]:rngs[i][1]]
+        aggregator.init_rough_affines()
+        for i in range(nwafer_ids):
+            for k in range(max_range_skips):
+                for j in range(nprocesses):
+                    fn = rough_out_affine_skip_dill_fns[i][k] + '.' + str(j)
+                    with open(fn, 'rb') as f: d = dill.load(f)
+                    if j==0:
+                        dmrg = d
+                    else:
+                        dmrg['forward_affines'][rngs[j][0]:rngs[j][1]] = d['forward_affines'][rngs[j][0]:rngs[j][1]]
+                        dmrg['reverse_affines'][rngs[j][0]:rngs[j][1]] = d['reverse_affines'][rngs[j][0]:rngs[j][1]]
+                        dmrg['forward_pts_src'][rngs[j][0]:rngs[j][1]] = d['forward_pts_src'][rngs[j][0]:rngs[j][1]]
+                        dmrg['forward_pts_dst'][rngs[j][0]:rngs[j][1]] = d['forward_pts_dst'][rngs[j][0]:rngs[j][1]]
+                        dmrg['reverse_pts_src'][rngs[j][0]:rngs[j][1]] = d['reverse_pts_src'][rngs[j][0]:rngs[j][1]]
+                        dmrg['reverse_pts_dst'][rngs[j][0]:rngs[j][1]] = d['reverse_pts_dst'][rngs[j][0]:rngs[j][1]]
+                aggregator.forward_affines[i][k] = dmrg['forward_affines']
+                aggregator.reverse_affines[i][k] = dmrg['reverse_affines']
+                aggregator.forward_pts_src[i][k] = dmrg['forward_pts_src']
+                aggregator.forward_pts_dst[i][k] = dmrg['forward_pts_dst']
+                aggregator.reverse_pts_src[i][k] = dmrg['reverse_pts_src']
+                aggregator.reverse_pts_dst[i][k] = dmrg['reverse_pts_dst']
+            #for k in range(max_range_skips):
+        #for i in range(nwafer_ids):
     else:
         aggregator.fine_deltas_to_rough_affines(use_interp_points=use_interp_points, cutoff_to_fit=interp_inliers)
 
@@ -1024,10 +1075,16 @@ elif fine_to_rough:
             proc_str = ('.' + str(iprocess)) if nprocesses > 1 and not run_merge else ''
             fn = rough_out_affine_skip_dill_fns[i][k]+proc_str
             with open(fn, 'wb') as f: dill.dump(d, f)
+
+            if run_merge:
+                print('Merge wafer ind {} skip {} complete, deleting process dills'.format(i,k))
+                for j in range(nprocesses):
+                    fn = rough_out_affine_skip_dill_fns[i][k] + '.' + str(j)
+                    os.remove(fn)
         #for k in range(max_range_skips):
     #for i in range(nwafer_ids):
 
 # run_type switch
 
 print('JOB FINISHED: run_wafer_aggregator.py')
-print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+report_job_completed()

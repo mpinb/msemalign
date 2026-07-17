@@ -3,7 +3,7 @@
 Class representation and alignment / stitching procedure for single Zeiss
   multi-SEM fields of view (MFoVs).
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -154,7 +154,9 @@ class mfov(zimages):
     # whitening is essential for non-spurious xcorrs, clahe typically helps.
     def set_xcorr_preproc_params(self, off=False):
         pixel_scale_ds = self.scale_nm * self.dsstep
-        if off:
+        #if off:
+        # xxx - >512 is hack to turn off preproc for 2p data, really need another flag
+        if off or pixel_scale_ds > 512:
             self._proc_filter_size = 0
             self._proc_whiten_sigma = 0. # for off
             self._proc_clahe_clipLimit = 0. # for off
@@ -180,11 +182,11 @@ class mfov(zimages):
             self._proc_clahe_clipLimit = 20.
             self._proc_clahe_tileGridSize = (8,8)
 
-    def __init__(self, experiment_folders, region_strs, region_ind, mfov_id, dsstep=1, overlap_radius=2,
+    def __init__(self, experiment_folders, region_strs, region_ind, mfov_id=None, dsstep=1, overlap_radius=2,
                  overlap_correction_borders=None, init_region_coords=True, region_coords=None, region_filenames=None,
-                 mfov_tri=None, mfov_meta=None, false_color_montage=False, use_thumbnails_ds=8,
+                 mfov_tri=None, mfov_meta=None, false_color_montage=False, use_thumbnails_ds=8, region_tile_masks=None,
                  thumbnail_folders=[], D_cutoff=None, V_cutoff=None, W_default=None, legacy_zen_format=False,
-                 nimages_per_mfov=None, scale_nm=None, C_cutoff_soft_nGMM=0, verbose=False):
+                 nimages_per_mfov=None, scale_nm=None, C_cutoff_soft_nGMM=0, median_filter=None, verbose=False):
 
         zimages.__init__(self)
         # xxx - just completely disable the cache'ing for now, maybe not super useful?
@@ -232,11 +234,11 @@ class mfov(zimages):
             self.region_ind = region_ind
         assert(os.path.isdir(self.region_folder)) # causes even more confusing problems later, should exist
 
-        # convert mfov_id from zeiss numbering starting at 1 to numbering starting at 0
-        # mfovs (unlike regions) are always specified as integers which correspond to the imaging order.
-        self.mfov_id = mfov_id-1
-        self.mfov_str = ('{:06d}' if self.legacy_zen_format else '{:03d}').format(self.mfov_id+1)
-        self.mfov_folder = os.path.join(self.region_folder, self.mfov_str)
+        # in order to allow for discontiguous tissue regions in sections, and also to make the code even
+        #   prettier, the acquisition format was changed so that some mfovs may not contain any tiles.
+        # if mfov_id is None, then code below will set mfov_id to the first non-emtpy mfov.
+        if mfov_id is not None:
+            self.set_mfov_id(mfov_id)
 
         # get the Zeiss slice and region number part of the region_folder.
         # typically regions are named ???_S%dR%d where ? is integer imaging order (region_numstr)
@@ -247,8 +249,6 @@ class mfov(zimages):
             self.region_numstr = tmp[0]; self.region_slcstr =  tmp[1]
         else:
             self.region_numstr = self.region_slcstr = tmp[0]
-        logger.debug("mfov _ind %d, region _ind %d, _str '%s', _numstr '%s', _slcstr '%s'",
-            self.mfov_id, self.region_ind, self.region_str, self.region_numstr, self.region_slcstr)
 
         # parameter serves double duty, > 0 indicates on and if on it represents the ds amount
         self.use_thumbnails_ds = use_thumbnails_ds
@@ -279,6 +279,7 @@ class mfov(zimages):
             self.overlap_correction = self.overlap_correction_borders.any()
 
         if self.nimages_per_mfov is None:
+            assert(mfov_id is not None) # discontiguous mfovs not allowed if nimages_per_mfov is not specified
             # NOTE: just enumerating the images is dangerous... could be thumbnails or other images
             #   and we're not totally sure what the format is without the coords file.
             # set self.imfov_diameter based on how many image files are in the coords file
@@ -316,7 +317,6 @@ class mfov(zimages):
         # code does not work for overlap beyond hex-adjacent neighbors
         assert( self.omfov_diameter <= 2*self.imfov_diameter )
 
-
         # number of tiles (images) in the actual hexagonal MFoV layout, i.e., in a single mfov.
         # this is essentially fixed, but configurable in the case of number of beams in msem changes.
         self.niTiles = mfov.ntiles_from_mfov_diamter(self.imfov_diameter)
@@ -344,6 +344,8 @@ class mfov(zimages):
                 else:
                     # if no coords file is available in the region, then use the mfov coordinates file
                     assert(False) # do not use mfov image_coordinates... revalidate if we need it again
+                    # xxx - if this code path is needed again, remember it would not currently work if
+                    #   discontiguous mfovs are allowed (if mfov_id is None).
                     # fn = os.path.join(self.mfov_folder, "image_coordinates.txt")
                     # assert( os.path.isfile(fn) ) # can not find any image coordinates file
                     # n = self.mfov_id+1; ndims=2
@@ -366,6 +368,31 @@ class mfov(zimages):
                 # xxx - do not reload coordinates or recalculate triangulation if already done for another mfov
                 self.region_coords, self.region_filenames, self.mfov_tri = region_coords, region_filenames, mfov_tri
             self.nmfovs = len(self.region_filenames)
+
+        # in order to allow for discontiguous tissue regions in sections, and also to make the code even
+        #   prettier, the acquisition format was changed so that some mfovs may not contain any tiles.
+        # if mfov_id is None, then search for first mfov that contains images.
+        if mfov_id is None:
+            for i in range(self.nmfovs):
+                self.set_mfov_id(i+1)
+                if self.region_filenames is None:
+                    # xxx - this is painful, but did not see another option for wafer_solver
+                    #   running the coords init is extremely slow and unnecessary...
+                    #     it's possible the issue is addressed with an overhaul.
+                    #   obviously this method is breakable by having some other gibberish
+                    #     in the emtpy mfov folder that are not the image tiles.
+                    dn = self.images_load_folder
+                    if os.path.isdir(dn) and len(os.listdir(dn)) >= self.nimages_per_mfov:
+                        break
+                else:
+                    fn = os.path.join(self.images_load_folder, self.region_filenames[i][0])
+                    if os.path.isfile(fn):
+                        break
+        logger.debug("mfov _ind %d, region _ind %d, _str '%s', _numstr '%s', _slcstr '%s'",
+            self.mfov_id, self.region_ind, self.region_str, self.region_numstr, self.region_slcstr)
+
+        # this has to be done after mfov_id is set
+        if init_region_coords:
             self.get_mfov_neighbors()
 
         # load metadata text file for this mfov.
@@ -424,14 +451,27 @@ class mfov(zimages):
         # to enable the soft C cutoff method, specify > 0
         self.C_cutoff_soft_nGMM = C_cutoff_soft_nGMM
 
+        # this enables a median filter of specified size just after image tiles are loaded
+        self.median_filter = median_filter
+
         # try to set reasonable defaults for the xcorr preprocessing
         self.set_xcorr_preproc_params()
+
+        # for using tissues masks to discard xcorrs for 2D stitching
+        self.region_tile_masks = region_tile_masks
 
         # some member inits
         self.images = None
         self.image_adjust_rect = None
         self.mfov_filenames = None
         self.export_xcorr_comps_path = None
+
+    def set_mfov_id(self, mfov_id):
+        # convert mfov_id from zeiss numbering starting at 1 to numbering starting at 0
+        # mfovs (unlike regions) are always specified as integers which correspond to the imaging order.
+        self.mfov_id = mfov_id-1
+        self.mfov_str = ('{:06d}' if self.legacy_zen_format else '{:03d}').format(self.mfov_id+1)
+        self.mfov_folder = os.path.join(self.region_folder, self.mfov_str)
 
     # see documentation regarding how mfovs are laid out and the total number of tiles in each mfov.
     @staticmethod
@@ -1072,15 +1112,20 @@ class mfov(zimages):
     # reload image coords from stitched region coords (i.e. that were previously solved here and saved).
     # this function subtracts off the min of the loaded coordinates (make them relative to region).
     # then the coords are offset by the original zeiss global coordinates.
-    def load_stitched_region_image_coords(self, fn, scale=1, rmv_thb=False, add_thb=False):
+    def load_stitched_region_image_coords(self, fn, scale=1, rmv_thb=False, add_thb=False, load_tile_masks=False,
+            raw=False):
         if not hasattr(self,'zeiss_region_coords'):
             self.zeiss_region_coords = self.region_coords.copy()
-        zeiss_corners = self.zeiss_region_coords.reshape(-1,2).min(0)[None,None,:]
-        self.region_coords, self.region_filenames = zimages.read_all_image_coords(fn, self.niTiles,
+        ndims = 3 if load_tile_masks else 2
+        coords, self.region_filenames = zimages.read_all_image_coords(fn, self.niTiles, ndims=ndims,
                         cache_dn=self.cache_dir, nmfovs=self.nmfovs, expect_mfov_subdir=True)
-        self.region_coords = self.region_coords - np.nanmin(self.region_coords.reshape(-1,2), axis=0)[None,None,:]
-        self.region_coords = scale * self.region_coords + zeiss_corners
-        #self.get_mfov_neighbors() # xxx - why were we redoing this? Zeiss coords should suffice
+        self.region_coords = coords[:,:,:2]
+        if not raw:
+            loaded_corners = np.nanmin(self.region_coords.reshape(-1,2), axis=0)[None,None,:]
+            self.region_coords = self.region_coords - loaded_corners
+            zeiss_corners = self.zeiss_region_coords.reshape(-1,2).min(0)[None,None,:]
+            self.region_coords = scale * self.region_coords + zeiss_corners
+        self.region_tile_masks = coords[:,:,2].astype(bool) if load_tile_masks else None
 
         if rmv_thb:
             self.region_filenames = [[None if x is None else os.path.join(os.path.dirname(x),
@@ -1130,19 +1175,25 @@ class mfov(zimages):
 
         if len(self.ring['from_neighbor']) > 0:
             # load tiles within mfov and including overlapping tiles from neighboring mfovs
-            self.images, self.filenames_imgs, self.coords_imgs, self.mfov_ids, self.mfov_tile_ids = \
+            self.images, self.filenames_imgs, self.coords_imgs, self.mfov_ids, self.mfov_tile_ids, \
+                    self.is_empty_mfov, self.tile_masks_imgs = \
                 zimages.read_images_neighbors(self.images_load_folder,
                     self.region_filenames, self.region_coords, self.nTiles, self.niTiles, self.mfov_id,
                     self.mfov_neighbors, self.mfov_neighbors_edge, self.ring['to_neighbor'],
                     self.ring['from_neighbor'], crop=self.border_crop, dsstep=self.dsstep, invert=self.invert_images,
-                    reduce=self.blkrdc_func, init_only=init_only, cache_dn=self.cache_dir)
+                    blkrdc_func=self.blkrdc_func, init_only=init_only, cache_dn=self.cache_dir,
+                    median_filter=self.median_filter, all_tile_masks=self.region_tile_masks)
         else:
             # assembling fully tiled image with fixed indices (stitched image without any alignment)
             self.coords_imgs  = self.region_coords[self.mfov_id,:,:]
             self.filenames_imgs = self.region_filenames[self.mfov_id]
-            self.images = zimages.read_images(self.images_load_folder, self.filenames_imgs, crop=self.border_crop,
-                    dsstep=self.dsstep, invert=self.invert_images, reduce=self.blkrdc_func, init_only=init_only,
-                    cache_dn=self.cache_dir)
+            if self.region_tile_masks is not None:
+                self.tile_masks_imgs = self.region_tile_masks[self.mfov_id,:,:]
+            else:
+                self.tile_masks_imgs = None
+            self.images, self.is_empty_mfov = zimages.read_images(self.images_load_folder, self.filenames_imgs,
+                    crop=self.border_crop, dsstep=self.dsstep, invert=self.invert_images, blkrdc_func=self.blkrdc_func,
+                    init_only=init_only, cache_dn=self.cache_dir, median_filter=self.median_filter)
             self.mfov_ids = np.empty((self.nTiles,), dtype=np.int64); self.mfov_ids.fill(self.mfov_id)
             self.mfov_tile_ids = np.arange(self.nTiles, dtype=np.int64)
 
@@ -1243,6 +1294,9 @@ class mfov(zimages):
         coords_imgs_rect = np.zeros((self.nTilesRect,2), dtype=np.double)
         coords_imgs_rect[self.ring['hex_to_rect'],0] = self.coords_imgs[:,0]
         coords_imgs_rect[self.ring['hex_to_rect'],1] = self.coords_imgs[:,1]
+        if self.region_tile_masks is not None:
+            tiles_masks_imgs_rect = np.zeros((self.nTilesRect,), dtype=bool)
+            tiles_masks_imgs_rect[self.ring['hex_to_rect']] = self.tile_masks_imgs
         Dx_z = np.zeros((self.nTilesRect,self.nTilesRect), dtype=np.double)
         Dy_z = np.zeros((self.nTilesRect,self.nTilesRect), dtype=np.double)
         Dx_z[subs[:,0], subs[:,1]] = coords_imgs_rect[subs[:,0],0] - coords_imgs_rect[subs[:,1],0]
@@ -1286,6 +1340,8 @@ class mfov(zimages):
         #   the main issues are (1) the image size comes from the bottom of the call stack,
         #     after at least one image is loaded and (2) the coordinates are shuffled around depending
         #     on the mfov neighbors which is also done at the bottom of the call stack in zimages.
+        # xxx - the rabbit hole only got deeper when the spec changed for the acquisition and now
+        #   empty mfovs are allowed (placeholder mfovs that are not actually imaged).
         if init_only: return None
 
         if Dx_t is None:
@@ -1326,6 +1382,17 @@ class mfov(zimages):
                 if self.images_rect_var[i] < self.V_cutoff:
                     self.low_complexity_rect_inds[low_complexity_count] = i; low_complexity_count += 1
                     continue
+            # hijack this pathway to also ignore any image tiles that are not present (i.e., empty mfovs).
+            # xxx - decided not to make any distinction here between tiles that are not present and ones
+            #   that are imaged but somehow are all zeros... did not see the use case / purpose.
+            if images_rect[i].sum() == 0:
+                self.low_complexity_rect_inds[low_complexity_count] = i; low_complexity_count += 1
+                continue
+            # hijack this pathway again for the "two iteration" 2D alignment method using tile masks.
+            #   do not calculate or use any cross-correlations outside of the tissue area.
+            if self.region_tile_masks is not None and not tiles_masks_imgs_rect[i]:
+                self.low_complexity_rect_inds[low_complexity_count] = i; low_complexity_count += 1
+                continue
             if C is None:
                 images_rect_proc[i] = template_match_preproc(images_rect[i], whiten_sigma=self._proc_whiten_sigma,
                         clahe_clipLimit=self._proc_clahe_clipLimit, clahe_tileGridSize=self._proc_clahe_tileGridSize)

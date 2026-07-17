@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 import os
+import sys
+#import time
 os.system('date')
+#time.sleep(60)
+#sys.exit(0)
 
 """run_wafer.py
 
@@ -8,7 +12,7 @@ Top level command-line interface for the running the matching for the fine
   alignment and for exporting sections for a whole wafer at different
   stages of the alignment.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -33,16 +37,17 @@ import numpy as np
 
 import dill
 import argparse
-import os
-import sys
+#import os
+#import sys
 
 os.system('date')
 from msem import wafer
 
 from msem.utils import make_hex_points, PolyCentroid
-from msem.utils import dill_lock_and_load, dill_lock_and_dump
 from msem.utils import big_img_load, big_img_info
 from msem.zimages import msem_input_data_types
+
+from sslock import dill_lock_and_load, dill_lock_and_dump, dill_init, report_job_completed
 
 # all parameters loaded from an experiment-specific import
 from def_common_params import get_paths, native_subfolder, dsstep, use_thumbnails_ds, dsthumbnail, exclude_regions
@@ -62,7 +67,7 @@ from def_common_params import thumbnail_subfolders, thumbnail_subfolders_order, 
 from def_common_params import tissue_mask_path, tissue_mask_fn_str, tissue_mask_ds
 from def_common_params import tissue_mask_min_edge_um, tissue_mask_min_hole_edge_um, tissue_mask_bwdist_um
 from def_common_params import tears_subfolder, torn_regions, slice_blur_z_indices, slice_blur_factor
-from def_common_params import noblend_subfolder
+from def_common_params import noblend_subfolder, allow_empty_mfovs
 os.system('date')
 
 # <<< turn on stack trace for warnings
@@ -135,6 +140,8 @@ parser.add_argument('--crop-to-grid', dest='crop_to_grid', action='store_true',
                     help='option for exports that crops output to grid min/max')
 parser.add_argument('--zero-outside', dest='zero_outside', action='store_true',
                     help='option for exports that zeros outside of polygon (mask if --tissue-masks)')
+parser.add_argument('--save-image-coordinates', dest='save_img_coords', action='store_true',
+                    help='fine export option to save the coordinate transformation dst->src')
 parser.add_argument('--contrast-filter', dest='contrast_filter', action='store_true',
                     help='use the slices that were exported with the contrast filter')
 parser.add_argument('--rough-export-solve-order', dest='rough_export_solve_order', action='store_true',
@@ -255,6 +262,9 @@ crop_to_grid = args['crop_to_grid']
 
 # option to zero areas outside of the scaled polygon during rough or fine exports.
 zero_outside = args['zero_outside']
+
+# mostly intended for registration, return the fine coordinate transformations
+save_img_coords = args['save_img_coords']
 
 # set to non-empty to override the standard region image file suffix
 custom_suffix = args['custom_suffix'][0]
@@ -453,7 +463,8 @@ nrough = len(rough_run_strs)
 nfine = len(fine_run_strs)
 rough_run_id = '-'.join(rough_run_strs)
 rough_dills_fns = [[None for x in range(nwafer_ids)] for y in range(nrough)]
-fine_dills_fns = [[None for x in range(nwafer_ids)] for y in range(nfine)]
+# do the same thing as for roughs_dicts (below) and duplicate for the single-wafer case.
+fine_dills_fns = [[None for x in range(2)] for y in range(nfine)]
 limi_dill_fns = [None]*nwafer_ids; order_txt_fns = [None]*nwafer_ids
 for i in range(nwafer_ids):
     for j in range(nrough):
@@ -535,6 +546,8 @@ else:
     if nwafer_ids==1:
         for j in range(nrough):
             roughs_dicts[j][1] = roughs_dicts[j][0]
+        for j in range(nfine):
+            fine_dills_fns[j][1] = fine_dills_fns[j][0]
     elif invert_order:
         for j in range(nrough):
             roughs_dicts[j] = roughs_dicts[j][::-1]
@@ -546,6 +559,8 @@ else:
         region_strs_all = region_strs_all[::-1]
         roi_polygon_translations = roi_polygon_translations[::-1,:]
         wafer_ids = wafer_ids[::-1]
+        for j in range(nfine):
+            fine_dills_fns[j] = fine_dills_fns[j][::-1]
 
     do_export_solved_order = load_solved_order
     export_solved_order = None
@@ -702,7 +717,7 @@ cwafer = wafer(experiment_folders_all, protocol_folders_all, use_alignment_folde
         tissue_mask_min_hole_edge_um=tissue_mask_min_hole_edge_um, tissue_mask_bwdist_um=tissue_mask_bwdist_um,
         init_regions=init_regions, region_manifest_cnts=region_manifest_cnts, region_include_cnts=region_include_cnts,
         zorder=zorder, use_coordinate_based_xforms=use_coordinate_based_xforms, block_overlap_grid_um=blk_ovlp_grid_um,
-        custom_roi=use_custom_roi, verbose=True)
+        custom_roi=use_custom_roi, allow_empty_mfovs=allow_empty_mfovs, verbose=True)
 
 
 # deals with a legacy workflow (no region range specified), allow manifest index to still be added
@@ -732,7 +747,7 @@ if update_meta_dill:
     with open(meta_dill_fn, 'wb') as f: dill.dump(d, f)
     print('meta information saved to ' + meta_dill_fn)
     print('exiting')
-    print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+    report_job_completed()
     sys.exit(0)
 
 if write_order:
@@ -798,7 +813,7 @@ if rough_dills_run:
                 tissue_mask_bwdist_um=tissue_mask_bwdist_um, nimages_per_mfov=nimages_per_mfov,
                 region_manifest_cnts=region_manifest_cnts, region_include_cnts=region_include_cnts, zorder=zorder,
                 nblocks=nblks, iblock=iblk, block_overlap_um=blk_ovlp_um, block_overlap_grid_um=blk_ovlp_grid_um,
-                use_coordinate_based_xforms = use_coordinate_based_xforms)
+                use_coordinate_based_xforms=use_coordinate_based_xforms, allow_empty_mfovs=allow_empty_mfovs)
         cwafer.set_region_rotations_manual(d['imaged_order_limi_rotation'])
 
         # loading the whole slice just to get the roi points is way too heavy weight,
@@ -819,7 +834,7 @@ if rough_dills_run:
     # save region to limi roi (czifile) mapping, rotations and other limi-based info
     with open(limi_dill_fns[0], 'wb') as f: dill.dump(d, f)
     print('rough dills exported, exiting')
-    print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+    report_job_completed()
     sys.exit(0) # uncomment to only re-export the rough dills
 
 if not (get_wafer_stats or rough_dills_run):
@@ -924,41 +939,40 @@ if rough_export_run:
             do_overlays=_do_overlays, crop_to_grid=_crop_to_grid, zero_outside_grid=_zero_outside,
             save_roi_points=_save_roi_points, start=export_region_beg, stop=export_region_end,
             order_name_str=order_name_str, tissue_masks=tissue_masks, is_excluded=is_excluded,
-            save_masks_in=save_masks_in, xform_control_points=control_points,
-            inv_xform_control_points=inv_control_points, verbose_load=native)
+            save_masks_in=save_masks_in, xform_control_points=control_points, convert_hdf5s=convert_hdf5s,
+            init_locks=init_locks, inv_xform_control_points=inv_control_points, verbose_load=native)
 
 # load the previous fine alignment results for exporting aligned tiffs
 if (fine_run and nfine > 0) or (fine_export_run and not init_locks):
-    assert(nwafer_ids == 1) # no multiple wafer export runs
+    assert(fine_run or nwafer_ids == 1) # no multiple wafer export runs
 
     cwafer.deformations_points = [None]*nfine
     cwafer.imaged_order_deformations_vectors = [[None for x in range(cwafer.nregions)] for y in range(nfine)]
-    for j in range(nfine):
-        with open(fine_dills_fns[j][0], 'rb') as f: fine_dict = dill.load(f)
+    for i in range(cwafer.nregions):
+        for j in range(nfine):
+            with open(fine_dills_fns[j][i], 'rb') as f: fine_dict = dill.load(f)
 
-        cwafer.deformations_points[j] = fine_dict['deformation_points']*to_native_scale
-        # The deformations need to be mapping from dst->src. This is what is required
-        #   by basically all coordinate remapping library functions that apply general warping xforms.
-        if 'imaged_order_forward_deformations' in fine_dict:
-            key_str = 'imaged_order_forward_deformations'; sign = -1.
-        else:
-            key_str = 'imaged_order_reverse_deformations'; sign = 1.
-        dataset = 'imaged_order_deltas'
-        h5fn = fine_dills_fns[j][0] + '.h5'
-        if os.path.isfile(h5fn):
-            shp, dtype = big_img_info(h5fn, dataset=dataset)
-            shp = np.array(shp); shp[0] = 1
-            data = np.empty(shp, dtype=dtype)
-            for i in range(cwafer.nregions):
+            cwafer.deformations_points[j] = fine_dict['deformation_points']*to_native_scale
+            # The deformations need to be mapping from dst->src. This is what is required
+            #   by basically all coordinate remapping library functions that apply general warping xforms.
+            if 'imaged_order_forward_deformations' in fine_dict:
+                key_str = 'imaged_order_forward_deformations'; sign = -1.
+            else:
+                key_str = 'imaged_order_reverse_deformations'; sign = 1.
+            dataset = 'imaged_order_deltas'
+            h5fn = fine_dills_fns[j][i] + '.h5'
+            if os.path.isfile(h5fn):
+                shp, dtype = big_img_info(h5fn, dataset=dataset)
+                shp = np.array(shp); shp[0] = 1
+                data = np.empty(shp, dtype=dtype)
                 ind = cwafer.region_inds[i]-1
                 big_img_load(h5fn, img_blk=data, dataset=dataset, custom_slc=np.s_[ind:ind+1,:,:])
                 cwafer.imaged_order_deformations_vectors[j][i] = sign * data.reshape(-1,2) * to_native_scale
-        else:
-            # legacy mode, before fine reslice implemented, where deltas are also stored in the dill
-            for i in range(cwafer.nregions):
+            else:
+                # legacy mode, before fine reslice implemented, where deltas are also stored in the dill
                 cwafer.imaged_order_deformations_vectors[j][i] = \
                     sign*fine_dict[key_str][cwafer.region_inds[i]-1]*to_native_scale
-            fine_dict = None; del fine_dict # with lots of grid points, this can be quite large
+                fine_dict = None; del fine_dict # with lots of grid points, this can be quite large
 
 if validate_region_grid and (fine_export_run or fine_run):
     cwafer._validate_region_grid(start=0, per_figure=1, use_solved_order=True, bg_fill_type='noise',
@@ -973,6 +987,8 @@ if fine_export_run:
         export_paths = [export_path + '_native']
     else:
         if len(dsexports) == 0: dsexports = [1]
+        if tissue_masks: export_path += '_masks'
+        if save_img_coords: export_path += '_coords'
         export_paths = [export_path + ('_native' if native else '') + ('_custom_crop' if use_custom_crop else '') \
                 + '_ds{}'.format(y) for y in dsexports]
 
@@ -988,10 +1004,12 @@ if fine_export_run:
     _crop_to_grid = (crop_to_grid or use_custom_crop) and enable_crop_and_zero
     _zero_outside = zero_outside and enable_crop_and_zero
 
+    if tissue_masks: cwafer.warping_spline_order_nd = 0
     cwafer.export_regions(export_paths, [img_suffix]*len(export_paths), dssteps=dsexports, init_locks=init_locks,
             use_solved_order=do_export_solved_order, export_solved_order=export_solved_order,
             crop_to_grid=_crop_to_grid, zero_outside_grid=_zero_outside, start=export_region_beg,
-            stop=export_region_end, convert_hdf5s=convert_hdf5s, save_h5=export_h5, verbose_load=True)
+            stop=export_region_end, convert_hdf5s=convert_hdf5s, save_h5=export_h5, save_img_coords=save_img_coords,
+            tissue_masks=tissue_masks, verbose_load=True)
 
 if fine_run:
     direction_str = 'reverse' if invert_order else 'forward'
@@ -999,7 +1017,6 @@ if fine_run:
     #   which is the reason for this ind conditional.
     ind = 1 if nwafer_ids > 1 and invert_order else 0
     dill_fn = os.path.join(use_alignment_folders[ind], delta_dill_fn_str.format(delta_run_str, wafer_ids[ind], iorder))
-    os.makedirs(os.path.dirname(dill_fn), exist_ok=True)
     assert(fine_init_dills or os.path.isfile(dill_fn)) # use fine-export-dills to predump empty dills
 
     if crops_um_ind > 0:
@@ -1011,6 +1028,15 @@ if fine_run:
         print('Rerunning at crop {},{} for {} remaining outliers'.format(crop_um[0], crop_um[1], grid_selects.sum()))
     else:
         grid_selects = None
+
+    if cwafer.run_registration:
+        # only run comparisons even index to next odd index and odd index to previous even index.
+        #   this is then only for iorder even (with both direction strings).
+        # still run all the way into align_regions so that values can be all initialized.
+        # use grid_selects to make it so that no cross-correlations are actually run for odd iorder indices.
+        if (iorder % 2) == 1:
+            assert( grid_selects is None ) # do not use the crop indices along with registration mode
+            grid_selects = np.zeros((grid_locations.shape[0],), dtype=bool)
 
     ## to run delta validation
     #with open(dill_fn, 'rb') as f: d = dill.load(f)
@@ -1040,7 +1066,7 @@ if fine_run:
             #cwafer.export_xcorr_comps_path = # export path
             cwafer.align_regions(grid_selects=grid_selects, doplots=doplots, dosave_path=dosave_path,
                 nworkers=arg_nworkers)
-            d, f1, f2 = dill_lock_and_load(dill_fn, keep_locks=True)
+            d, f1, f2 = dill_lock_and_load(dill_fn, keep_locks=True, lock_same_file=False)
             if subkey in d:
                 sel = np.isfinite(cwafer.wafer_grid_Cvals)
                 d[subkey]['wafer_grid_deltas'][sel,:] = cwafer.wafer_grid_deltas[sel,:]
@@ -1048,7 +1074,7 @@ if fine_run:
             else:
                 d[subkey] = {'wafer_grid_deltas':cwafer.wafer_grid_deltas, 'wafer_grid_Cvals':cwafer.wafer_grid_Cvals,}
             d[subkey]['iblur'] = iblur
-            dill_lock_and_dump(dill_fn, d, f1, f2)
+            dill_lock_and_dump(dill_fn, d, f1, f2, lock_same_file=False)
         else:
             print('--fine-blur-only specified and not a blur comparison, skipping')
     else:
@@ -1058,14 +1084,12 @@ if fine_run:
             dill_fn = os.path.join(use_alignment_folders[ind], delta_dill_fn_str.format(delta_run_str,
                 wafer_ids[ind], i))
             print(dill_fn)
-            assert( not os.path.isfile(dill_fn) ) # safety feature, delete by hand first if you want to start over
-            if not os.path.isfile(dill_fn):
-                d = {'False->True':True}
-                with open(dill_fn, 'wb') as f: dill.dump(d, f)
+            # xxx - overwrite_dills is not frequently used, decided not to expose
+            dill_init(dill_fn, overwrite_dills=False)
 
 
 
 # do not delete this, is used at a minimum for addressing "timed-out" jobs when running on the cluster (to be re-run).
 # can also grep to count how many jobs of a particular run have completed without fatal error.
 print('JOB FINISHED: run_wafer.py')
-print('Twas brillig, and the slithy toves') # with --check-msg swarm reports slurm failure without message
+report_job_completed()

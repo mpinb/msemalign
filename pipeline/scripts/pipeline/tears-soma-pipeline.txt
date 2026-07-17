@@ -1,0 +1,38 @@
+#name       deps             swarm                            part            nproc    ngpu time pack mroll maxr    s
+
+# export downsampled regions for test, only have to run this once
+# NOTE: dsthumbs in pipeline file needs to match tear_annotation_ds in def_common_params
+# NOTE: torn_regions in def_common_params needs to be set to None for this step
+# copy to some input location, define location in warp_dns in pipeline file
+exporttif   ,                run_regions-convert-h5-to-tiff  CPU/GPU/CPU-72c 6/12/8   0     1   0    0
+
+# set torn_regions in def_common_params, show all torn regions with run_tear_convert.py --print-only
+# annotate regions (typically in no-rough) and save to xxx.nml
+# copy the tears annotated in no-rough to the region h5s (wkw env)
+# run_tear_convert.py --run-type xnml-to-xregion --nml-file xxx.nml --all-wafers --tear-annotation-ds 1
+
+# reverse transform the annotation points back into region coordinates
+ixform      ,                run_wafer-xctl_pts_to_ctl       CPU/GPU/CPU-72c 6/12/8    0     1   0    0
+
+# process the tear annotations and export tear annotation dills
+# this step runs in wkw env (conda activate added automatically to swarm)
+process     ixform           run_tear_convert-process        CPU/GPU/CPU-72c 6/12/8    0     1   0    0
+
+# test warping on downsampled images
+# this step runs in wkw env (conda activate added automatically to swarm)
+warp        process          run_tear_convert-warp           CPU/GPU/CPU-72c 1/1/1     0     2   0    0
+
+# tear grid points with density specified by tear_grid_density get mls interpolated across the whole section
+#   in every block process. this is the memory-usage-limiting step, not the dense interpolation.
+# xxx - deal with this somehow, maybe a single process and another intermediary or write it to the alignment dill?
+#   this will be a problem for the same grid density for very large sections.
+istitch     process          run_regions-stitch-tears-init   CPU/GPU/CPU-72c 48/48/72  0     1   0    0
+#stitch      istitch          run_regions-stitch-tears        CPU/GPU/CPU-72c 48/48/72  0     2   1    1728  0   4/4/6
+stitch      istitch          run_regions-stitch-tears        CPU/GPU/CPU-72c 6/12/8    0     2   0    0
+# for large sections approaching 1 mm2
+#stitch      istitch          run_regions-stitch-tears        CPU/GPU/CPU-72c 1/2/1     0     2   0    0
+
+# export downsampled tiffs to verify the stitching
+# NOTE: torn_regions in def_common_params needs to be set to torn sections for this step
+exporttif2  stitch           run_regions-convert-h5-to-tiff  CPU/GPU/CPU-72c 6/12/8   0     1   0    0
+

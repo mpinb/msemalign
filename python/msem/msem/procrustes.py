@@ -3,7 +3,7 @@
 Implements full affine and optimally constrained affine fitting with the
   same interface as required by scikit-learn.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -157,6 +157,14 @@ class RigidRegression(BaseEstimator, RegressorMixin):
         cA = A.mean(axis=0, dtype=np.double); cB = B.mean(axis=0, dtype=np.double)
         AA = A - cA; BB = B - cB
         if tol is None: tol = np.finfo(np.double).eps
+
+        # deal directly with the degenerate case if the points are the same or a translation only
+        if np.isclose(AA, BB).all():
+            Ra = np.identity(ndims + 1)
+            t = cB - cA
+            a, s = 0., np.ones(ndims)
+            Ra[:ndims,ndims] = t
+            return Ra, t, a, s
 
         _B = -2*np.dot(AA.T,BB)
         _C = np.dot(AA.T,AA)

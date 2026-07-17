@@ -1,0 +1,59 @@
+#name       deps      swarm                                  part             nproc     ngpu time pack mroll maxrun  s
+# NOTE: with current methodology of only doing the tile-based balancing in region0,
+#   the export does not need to be rerun. If any slice balancing was done before
+#   the region0 export, then the export has to be rerun here.
+iexport     ,         run_regions-export-init                CPU/GPU/CPU-72c  48/48/72  0     1   0    1750  875
+export      iexport    run_regions-export                    CPU/GPU/CPU-72c  48/48/72  0     2   1    1728  0    4/4/6
+#export      ,          run_regions-export_sham               CPU/GPU/CPU-72c  48/48/72  0     2   0    0
+
+# IMPORTANT: if you are re-exporting and there are torn slices, then you need to rerun tear correction export here
+#   these are copied from tear pipeline file, see comments there for additional information.
+#istitch     export           run_regions-stitch-tears-init   CPU/GPU/CPU-72c 48/48/72  0     1   0    0
+#stitch      istitch          run_regions-stitch-tears        CPU/GPU/CPU-72c 6/12/8    0     2   0    0
+# for large sections approaching 1 mm2
+#stitch      istitch          run_regions-stitch-tears        CPU/GPU/CPU-72c 1/2/1     0     2   0    0
+
+# for normal masks generated for the regions, workflow uses --iterate-ranges-split 128 128 ...
+masks       export    run_regions-save_masks                 CPU/GPU/CPU-72c  48/48/72  0     1   0    0
+#masks       stitch    run_regions-save_masks                 CPU/GPU/CPU-72c  48/48/72  0     1   0    0
+# for edited masks done in the no-rough export
+#masks       export    run_wafer-rough_export_save_masks      CPU/GPU/CPU-72c  48/48/72  0     1   0    1750  875
+# for edited masks done in the no-order export
+#masks       export   run_wafer-acquisition_export_save_masks CPU/GPU/CPU-72c  48/48/72  0     1   0    1750  875
+# for saving the "tile-masks" back to the coords file
+#tmasks      masks     run_regions-tile_masks                 CPU/GPU/CPU-72c  48/48/72  0     1   0    0
+# for upsampling masks to use in fine alignment steps.
+# do this before continuing to fine alignments (do not upsample for tissue masks with sift-based rough alignment)
+#umasks      masks     run_regions-up_masks                   CPU/GPU/CPU-72c  12/24/18  0     1   0    1750  1225
+
+# Decide on using brightness balancing on a dataset-by-dataset basis. For some datasets where they
+#   are not well matched, it can help.
+# NOTE: do NOT recalculate the whole section balancing after the initial 2D alignment iteration.
+#   If used, continue to use the same brightness adjust that was calculated before the -i1 masks were generated.
+# IMPORTANT: even if section brightness adjusts are applied, do not run this step unless the export is rerun above.
+#   If the sections do not need to be re-exported, then the brightness adjusts should have been already applied (-i2).
+#ibright     masks     run_regions-brightness-init            CPU/GPU/CPU-72c  48/48/72  0     1   0    1750  875
+# For some workflows, do the brightness matching after the masks have been generated, but before contrast matching.
+#histos16    masks     run_regions-histos-ds16                CPU/GPU/CPU-72c  8/16/12   0     2   0    1750  875
+#sbalance    histos16  run_regions-slice-balance              CPU/GPU/CPU-72c  1/1/1     0     4   0    0
+#ibright     sbalance  run_regions-brightness-init            CPU/GPU/CPU-72c  48/48/72  0     1   0    1750  875
+# For either workflow apply the brightness adjusts after the init
+#bright      ibright   run_regions-slice-brightness-adjust    CPU/GPU/CPU-72c  4/8/6     0     2   0    1750
+
+# need to adjust either blocking or packing for different section sizes.
+# recommend not defining histos_ranges (so that each job is a single section).
+# NOTE: already tried optimizing and 12/24/16 causes OOMs
+#histos      bright    run_regions-histos                     CPU/GPU/CPU-72c  8/16/12   0     2   0    1750  875
+histos      masks     run_regions-histos                     CPU/GPU/CPU-72c  8/16/12   0     2   0    1750  875
+# for larger sections approaching 1 mm2, better option is to use blocking even for 16 nm
+#histos      masks     run_regions-histos                     CPU/GPU/CPU-72c  3/6/4     0     2   0    1750  #875
+# NOTE: this step needs to be run with logs enabled
+widths      histos    plot_regions-histo-width               CPU/GPU/CPU-72c  10/10/10  0     1   0   0
+
+# IMPORTANT: need to choose template(s) at this point (before running contrast step).
+# look in workflow command file for "save the target histogram" to find the command.
+# NOTE: For the final export, once the templates have been set, consider rerunning the export and histos,
+#   and do the final contrast adjustment without brightness adjustments having been applied.
+icontrast   widths    run_regions-contrast-init              CPU/GPU/CPU-72c  48/48/72  0     1   0    1750  875
+contrast    icontrast  run_regions-slice-contrast-match      CPU/GPU/CPU-72c  16/32/24  0     2   1    1728  0    2/4/3
+

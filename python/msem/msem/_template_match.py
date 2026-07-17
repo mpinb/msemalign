@@ -2,7 +2,7 @@
 
 Implements image template matching using normalized cross corrrelations.
 
-Copyright (C) 2018-2023 Max Planck Institute for Neurobiology of Behavior
+Copyright (C) 2018-2026 Max Planck Institute for Neurobiology of Behavior
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -194,7 +194,10 @@ def normxcorr2_fft_adj(templates, templates_shape, imgs, imgs_shape, adj_matrix,
         assert(False) # bad use_fft specified
 
     if calc_fast_len:
-        poutsize = np.array([fft_module.next_fast_len(x, real=real_fft) for x in toutsize])
+        if use_fft == FFT_types.pyfftw_fft:
+            poutsize = np.array([pyfftw.next_fast_len(x) for x in toutsize])
+        else:
+            poutsize = np.array([fft_module.next_fast_len(x, real=real_fft) for x in toutsize])
         tpoutsize = tuple(poutsize.tolist()) # cupy fails without explicit tuple
     else:
         poutsize = outsize
@@ -205,14 +208,8 @@ def normxcorr2_fft_adj(templates, templates_shape, imgs, imgs_shape, adj_matrix,
         # "The length of the last axis transformed will be s[-1]//2+1,
         #    while the remaining transformed axes will have lengths according to s, or unchanged from the input.""
         fftsize = (poutsize[0], poutsize[1]//2 + 1)
-        if use_fft == FFT_types.pyfftw_fft:
-            f_fft2 = functools.partial(fft_module.rfft2, overwrite_input=True)
-            f_ifft2 = functools.partial(fft_module.irfft2, overwrite_input=True)
-        else:
-            # f_fft2 = functools.partial(fft_module.rfft2, overwrite_x=True)
-            # f_ifft2 = functools.partial(fft_module.irfft2, overwrite_x=True)
-            f_fft2 = fft_module.rfft2
-            f_ifft2 = fft_module.irfft2
+        f_fft2 = fft_module.rfft2
+        f_ifft2 = fft_module.irfft2
     else:
         fftsize = tpoutsize
         if use_fft == FFT_types.pyfftw_fft:
@@ -267,17 +264,22 @@ def normxcorr2_fft_adj(templates, templates_shape, imgs, imgs_shape, adj_matrix,
                 else:
                     Fb[z][x][:] = f_fft2(A, s=tpoutsize)
 
+                # delete all intermediates and flush the cupy memory pool
+                del Ad, local_sum_A2, diff_local_sums
+                if use_fft == FFT_types.cupy_fft:
+                    cp.get_default_memory_pool().free_all_blocks()
+
         if use_fft == FFT_types.pyfftw_fft:
             T = Tntri*[None]; F = Tntri*[None]; fftT = Tntri*[None]; fftF = Tntri*[None]
             for z in range(Tntri):
                 fftT[z] = f_fft2(pyfftw.empty_aligned(T_size, dtype=dtype_fftw, n=pyfftw_aligned),
                                  s=tpoutsize, threads=nthreads, planner_effort=fftw_effort)
                 # input array is resized to output, so take a slice for the input array assignment
-                _T = fftT.input_array; _T[:] = zero_fftw; T[z] = _T[:T_size[0],:T_size[1]]
+                _T = fftT[z].input_array; _T[:] = zero_fftw; T[z] = _T[:T_size[0],:T_size[1]]
 
                 fftF[z] = f_ifft2(pyfftw.empty_aligned(fftsize, dtype=dtype_cfftw, n=pyfftw_aligned),
                                   s=tpoutsize, threads=nthreads, planner_effort=fftw_effort)
-                F = fftF[z].input_array
+                F[z] = fftF[z].input_array
         else:
             T = [xp.empty(T_size, dtype=_dtype_fft) for x in range(Tntri)]
             F = [xp.empty(fftsize, dtype=_dtype_cfft) for x in range(Tntri)]
@@ -309,6 +311,11 @@ def normxcorr2_fft_adj(templates, templates_shape, imgs, imgs_shape, adj_matrix,
             Td = templates[z][x].astype(_dtype_fft)
             denom_T[z] = np.sqrt(mn-1)*Td.std(dtype=_dtype_fft)
             Tdsum_mn[z] = Td.sum(dtype=_dtype_fft)/mn
+
+            # delete all intermediates and flush the cupy memory pool
+            del Td
+            if use_fft == FFT_types.cupy_fft:
+                cp.get_default_memory_pool().free_all_blocks()
 
         for y in comps:
             istriu = (x < y)
@@ -381,6 +388,11 @@ def normxcorr2_fft_adj(templates, templates_shape, imgs, imgs_shape, adj_matrix,
                 D_export[ccomp,:] = deltaC
                 C_export[ccomp] = C[x,y]
                 ccomp += 1
+
+            # delete all intermediates and flush the cupy memory pool
+            del xcorr_TA, cxcorr_TA, denom, numerator, mCi, Ci, ind
+            if use_fft == FFT_types.cupy_fft:
+                cp.get_default_memory_pool().free_all_blocks()
 
     if return_comps:
         comps_dict = {'comps':comps_export, 'Cmax':C_export, 'Camax':D_export, 'C':Ci_export}
@@ -475,7 +487,10 @@ def normxcorr2_fft(template, imgs, imgs_shape=None, crp=np.array([0,0]),
         assert(False) # bad use_fft specified
 
     if calc_fast_len:
-        poutsize = np.array([fft_module.next_fast_len(x, real=real_fft) for x in toutsize])
+        if use_fft == FFT_types.pyfftw_fft:
+            poutsize = np.array([pyfftw.next_fast_len(x) for x in toutsize])
+        else:
+            poutsize = np.array([fft_module.next_fast_len(x, real=real_fft) for x in toutsize])
         tpoutsize = tuple(poutsize.tolist()) # cupy fails without explicit tuple
     else:
         poutsize = outsize
@@ -486,14 +501,8 @@ def normxcorr2_fft(template, imgs, imgs_shape=None, crp=np.array([0,0]),
         # "The length of the last axis transformed will be s[-1]//2+1,
         #    while the remaining transformed axes will have lengths according to s, or unchanged from the input.""
         fftsize = (poutsize[0], poutsize[1]//2 + 1)
-        if use_fft == FFT_types.pyfftw_fft:
-            f_fft2 = functools.partial(fft_module.rfft2, overwrite_input=True)
-            f_ifft2 = functools.partial(fft_module.irfft2, overwrite_input=True)
-        else:
-            # f_fft2 = functools.partial(fft_module.rfft2, overwrite_x=True)
-            # f_ifft2 = functools.partial(fft_module.irfft2, overwrite_x=True)
-            f_fft2 = fft_module.rfft2
-            f_ifft2 = fft_module.irfft2
+        f_fft2 = fft_module.rfft2
+        f_ifft2 = fft_module.irfft2
     else:
         fftsize = tpoutsize
         if use_fft == FFT_types.pyfftw_fft:
@@ -718,6 +727,9 @@ def template_match_rotate_images(templates, imgs, rotation_step, rotation_range,
     rotations = np.arange(rotation_range[0],rotation_range[1] + rotation_step/2,rotation_step)
     nrotations = len(rotations)
 
+    # special case to avoid padding if template is not to be rotated
+    no_rotations = ((nrotations == 1) and rotations[0] == 0)
+
     # iterate templates and template rotations and run template matching
     if use_fft == FFT_types.rcc_xcorr:
         natemplates = ntemplates*nrotations
@@ -729,41 +741,48 @@ def template_match_rotate_images(templates, imgs, rotation_step, rotation_range,
         if verbose:
             print('Matching template %d' % (j,)); t = time.time()
 
-        # resize image here because the rotation with expand=True and scipy interpolate rotate are very slow
-        #   and could not find a way to pad with nonzero value in PIL rotate.
-        # pad by twice the diag of the original template, so that when the middle is cropped out the non-zero
-        #   pad remains in any rotation.
-        # NOTE: just so this comment is clear, without cropping out the result, the zero-padded rotation area will
-        #   be visible around the edges in the rotated templates (do not want any PIL-padding in the result).
-        sz = np.array(templates[j].shape)
-        # calculate the diagonal and half-diagonal (used to crop the output of the PIL-rotation).
-        diag = np.ceil(np.sqrt((sz*sz).sum())).astype(np.int64); diag += (diag % 2); hdiag = diag//2
-        # now calculate the "double-diagonal" to use for padding the image before rotation.
-        diag2 = diag*2; pad = (diag2 + ((diag2 - sz) % 2) - sz)//2
-        template_shape = sz + 2*pad - diag; template_size = template_shape[::-1]
-        # if the padding causes the template to get bigger than the image, then skip this template.
-        if (imgs_shape < template_shape).any(): continue
-        # xxx - issue of how best to pad to avoid spurious correlations
-        # noise padding:
-        #img_pad = 2*np.random.random(sz + 2*pad)-1; img_pad[pad[0]:-pad[0], pad[1]:-pad[1]] = templates[j]
-        # constant:
-        # NOTE: this is the best appraoch, but images MUST be zero mean, use normalize==True in template_match_preproc
-        img_pad = np.pad(templates[j], ((pad[0],pad[0]),(pad[1],pad[1])), 'constant', constant_values=0.)
-        # checkerboard:
-        #img_pad = np.empty(sz + 2*pad, dtype=imgs_dtype); img_pad.fill(-1.)
-        #img_pad[1::2, ::2] = 1.; img_pad[::2, 1::2] = 1.; img_pad[pad[0]:-pad[0], pad[1]:-pad[1]] = templates[j]
-
-        img_template = Image.fromarray(img_pad)
-
-        crp = np.array([hdiag, hdiag]) # crop out the half diagonal to avoid spurious edge correlations
+        if not no_rotations:
+            # resize image here because the rotation with expand=True and scipy interpolate rotate are very slow
+            #   and could not find a way to pad with nonzero value in PIL rotate.
+            # pad by twice the diag of the original template, so that when the middle is cropped out the non-zero
+            #   pad remains in any rotation.
+            # NOTE: just so this comment is clear, without cropping out the result, the zero-padded rotation area will
+            #   be visible around the edges in the rotated templates (do not want any PIL-padding in the result).
+            sz = np.array(templates[j].shape)
+            # calculate the diagonal and half-diagonal (used to crop the output of the PIL-rotation).
+            diag = np.ceil(np.sqrt((sz*sz).sum())).astype(np.int64); diag += (diag % 2); hdiag = diag//2
+            # now calculate the "double-diagonal" to use for padding the image before rotation.
+            diag2 = diag*2; pad = (diag2 + ((diag2 - sz) % 2) - sz)//2
+            template_shape = sz + 2*pad - diag
+            # if the padding causes the template to get bigger than the image, then skip this template.
+            if (imgs_shape < template_shape).any(): continue
+            # xxx - issue of how best to pad to avoid spurious correlations
+            # noise padding:
+            #img_pad = 2*np.random.random(sz + 2*pad)-1; img_pad[pad[0]:-pad[0], pad[1]:-pad[1]] = templates[j]
+            # constant:
+            # NOTE: this is the best appraoch, but images MUST be zero mean,
+            #   use normalize==True in template_match_preproc
+            img_pad = np.pad(templates[j], ((pad[0],pad[0]),(pad[1],pad[1])), 'constant', constant_values=0.)
+            # checkerboard:
+            #img_pad = np.empty(sz + 2*pad, dtype=imgs_dtype); img_pad.fill(-1.)
+            #img_pad[1::2, ::2] = 1.; img_pad[::2, 1::2] = 1.; img_pad[pad[0]:-pad[0], pad[1]:-pad[1]] = templates[j]
+            # convert to PIL for rotation and define the cropping that is applied to the xcorr output
+            img_template = Image.fromarray(img_pad)
+            crp = np.array([hdiag, hdiag]) # crop out the half diagonal to avoid spurious edge correlations
+        else:
+            template_shape = np.array(templates[j].shape)
+            crp = np.array([0,0])
+            ctemplate0 = templates[j]
+        template_size = template_shape[::-1]
 
         for a,cnt in zip(rotations, range(nrotations)):
             degrees = a/np.pi*180
             if verbose and cnt % print_xcorr_every == 0:
                 print('\tnormxcorr against template angle %.4f degrees' % (degrees,)); t = time.time()
-            # PIL rotate with expand=True and scipy interpolation.rotate are very slow
-            ctemplate0 = np.asarray(img_template.rotate(degrees, expand=False,
-                resample=interp_type))[hdiag:-hdiag,hdiag:-hdiag]
+            if not no_rotations:
+                # PIL rotate with expand=True and scipy interpolation.rotate are very slow
+                ctemplate0 = np.asarray(img_template.rotate(degrees, expand=False,
+                    resample=interp_type))[hdiag:-hdiag,hdiag:-hdiag]
 
             assert( (np.array(ctemplate0.shape) == template_shape).all() )
             # xxx - this method suffers from spurious matches right at the very edge of the full correlation output.
@@ -774,9 +793,6 @@ def template_match_rotate_images(templates, imgs, rotation_step, rotation_range,
             else: # if use_fft == FFT_types.rcc_xcorr:
                 ctx_managers = create_scipy_fft_context_manager(use_gpu, use_fft, use_fft_backend,
                         _template_match_nthreads)
-                # xxx - setting the threads at least for mkl broke, was working, after some updates broken
-                #   it will use all the cores on the node if packing. it will only use the cores allocated
-                #   if not packing. this is the only workaround for now.
                 with ExitStack() as stack:
                     for mgr in ctx_managers: stack.enter_context(mgr)
 
@@ -829,7 +845,11 @@ def template_match_rotate_images(templates, imgs, rotation_step, rotation_range,
     D = np.take_along_axis(D, Ca[:,:,None,None], axis=2)[:,:,0,:]
 
     # return the rotation invariant delta between the centers (not corners).
-    D += (template_size/2 - imgs_size/2)[None,None,::-1]
+    # this was only fixed 20241021 but did not matter for emalign
+    #   because square templates and images were always used.
+    # the deltas are already xy coordinates so size should not be xy-flipped.
+    #D += (template_size/2 - imgs_size/2)[None,None,::-1]
+    D += (template_size/2 - imgs_size/2)[None,None,:]
 
     if not return_ctemplate0: ctemplate0 = None
     return Ct, Ca, D, ctemplate0
